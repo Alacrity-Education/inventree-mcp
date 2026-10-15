@@ -104,6 +104,7 @@ Well-known advertisement (`WellKnownMixin.get_well_known_urls`): `mcp-server-car
 | `MEMBERSHIP_GRACE_HOURS` | int / 4 | [2] |
 | `RELOGIN_INTERVAL_HOURS` | int / 24 | degraded mode without upstream refresh token [2] |
 | `MEMBERSHIP_ENFORCED` | bool / True | master switch for re-checks and blocking [2] |
+| `MCP_REQUIRED_GROUPS` | str / `` | InvenTree group names, comma separated; when set a user must be in at least one to use MCP (`policy.in_required_groups`) [2] |
 | `MCP_SUPERUSER_FULL_ACCESS` | bool / False | superusers bypass the MCP ruleset [3] |
 | `MCP_ALLOW_BASIC_AUTH` | bool / False | Basic auth on the MCP endpoint [3] |
 
