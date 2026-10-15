@@ -151,6 +151,8 @@ function GroupPane({ api, group }: Readonly<{ api: Api; group: number }>) {
   // bumped to reload the Members table (effective access, connection counts)
   const [membersKey, setMembersKey] = useState(0);
   const refreshMembers = useCallback(() => setMembersKey((k) => k + 1), []);
+  // a queued revocation runs in the background: reloading now would show the old counts
+  const [revocationPending, setRevocationPending] = useState(false);
 
   const saveCore = useCallback(
     async (rows: RuleSet[]) => {
@@ -176,7 +178,8 @@ function GroupPane({ api, group }: Readonly<{ api: Api; group: number }>) {
           ? `Revocation queued for ${r.users} members`
           : `Revoked ${r.tokens} token(s) of ${r.users} user(s)`
       );
-      refreshMembers();
+      if (r.queued) setRevocationPending(true);
+      else refreshMembers();
     } catch (error) {
       notifyError('Revoking MCP tokens failed', error);
     }
@@ -228,6 +231,13 @@ function GroupPane({ api, group }: Readonly<{ api: Api; group: number }>) {
             <Title order={5}>Members</Title>
           </Accordion.Control>
           <Accordion.Panel>
+            {revocationPending && (
+              <Text c='orange' size='sm' mb='xs'>
+                Revocation pending: it runs in the background, so the connection
+                counts below may still include revoked tokens. Reload the page
+                later to see the result.
+              </Text>
+            )}
             <MembersTable key={membersKey} api={api} members={g.users} />
           </Accordion.Panel>
         </Accordion.Item>

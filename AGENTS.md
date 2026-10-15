@@ -143,13 +143,16 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   `invalid_grant`) block; a `no_mcp_permission` from `policy.may_connect()` only revokes the MCP
   tokens (`Outcome.NO_MCP_PERMISSION`). The grace and re-login predicates (`within_grace()`,
   `within_relogin()`) are shared by `refresh_grant_allowed()` and `long_lived_credential_allowed()`.
-  Every outbound call has a 5 s timeout, a provider is left alone for 60 s after a timeout /
+  Every outbound call has a 5 s timeout per socket operation and a 15 s total deadline (the body is
+  streamed), a provider is left alone for 60 s after a timeout /
   connection error / 5xx. Re-checks are serialised by a lease, not by a lock held across the
   network: a short `select_for_update` transaction takes `MCPUserState.recheck_lease_until`
-  (60 s) and commits; discovery, redeem, `_store_tokens()` (the rotated upstream token is durable
+  (120 s) and commits; discovery, the lease re-check (`_assert_lease()`: lost means
+  `_Unreachable("lease_lost")`, nothing redeemed), redeem, `_store_tokens()` (the rotated upstream token is durable
   at once), verification and userinfo run in autocommit; a second short transaction does the group
   sync, the classification, the stamp and the block / revocation; the lease is released in
-  `finally`. A re-check finding a live lease returns `NOT_DUE` without calling out. Never move an
+  `finally`. A re-check finding a live lease returns `NOT_DUE` without calling out (internally
+  `_LEASE_HELD`, so that `refresh_grant_allowed()` applies the grace / re-login windows to it). Never move an
   outbound call back inside a transaction.
 - `auth/signals.py` - allauth `user_logged_in`: SSO logins stamp `membership_checked_at` and lift a
   block only when the user is active and in `MCP_REQUIRED_GROUPS`, other logins record

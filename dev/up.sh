@@ -60,6 +60,10 @@ FRONTEND_TEST="inventree_mcp.tests.test_ui.UiFeatureMethodsTest.test_bundles_are
 frontend_warning() {
     echo "WARNING: $1; the plugin pages will not be available, and $FRONTEND_TEST will fail (dev/test.sh)" >&2
 }
+# A rebuild on a running stack needs a restart: the server collects the bundles only when it starts (the manifest
+# would otherwise name hashed files that are not collected yet).
+server_was_running="$(dc ps -q --status running inventree-server)"
+bundles_built=0
 if [[ -d "$FRONTEND_DIR" ]]; then
     stale=0
     if [[ ! -f "$BUNDLE" ]]; then
@@ -75,8 +79,10 @@ if [[ -d "$FRONTEND_DIR" ]]; then
         else
             log "building the plugin frontend"
             build_ok=1
-            # npm ci only when node_modules is missing or older than the lock file (a full network reinstall)
-            if [[ ! -d "$FRONTEND_DIR/node_modules" || "$FRONTEND_DIR/package-lock.json" -nt "$FRONTEND_DIR/node_modules" ]]; then
+            # npm ci only when the installed tree is missing or older than the lock file (a full network reinstall);
+            # npm rewrites node_modules/.package-lock.json on every install, the directory mtime misses in-place updates
+            if [[ ! -f "$FRONTEND_DIR/node_modules/.package-lock.json" \
+                    || "$FRONTEND_DIR/package-lock.json" -nt "$FRONTEND_DIR/node_modules/.package-lock.json" ]]; then
                 (cd "$FRONTEND_DIR" && npm ci) || build_ok=0
             fi
             if [[ "$build_ok" == 1 ]]; then
@@ -84,6 +90,8 @@ if [[ -d "$FRONTEND_DIR" ]]; then
             fi
             if [[ "$build_ok" == 0 ]]; then
                 frontend_warning "the frontend build failed (output above)"
+            else
+                bundles_built=1
             fi
         fi
     fi
@@ -102,7 +110,6 @@ AUTHENTIK_URL="http://127.0.0.1:19000" AUTHENTIK_PUBLIC_URL="$PUBLIC_URL" \
 [[ -s authentik/.bootstrap.json ]] || die "authentik/.bootstrap.json was not written"
 
 need_restart=0
-server_was_running="$(dc ps -q --status running inventree-server)"
 python3 - <<'PY'
 import json, pathlib
 b = json.loads(pathlib.Path("authentik/.bootstrap.json").read_text())
@@ -128,6 +135,7 @@ restart_inventree() {
 log "starting InvenTree server, worker and proxy (first run runs migrations, takes a few minutes)"
 dc up -d --wait --wait-timeout 1200 inventree-server inventree-worker proxy
 [[ -n "$server_was_running" && "$config_changed" == 1 ]] && need_restart=1
+[[ -n "$server_was_running" && "$bundles_built" == 1 ]] && need_restart=1
 
 # --- 5. demo data (once), configuration (every time) -----------------------------------------------------
 if [[ ! -f data/.demo-loaded ]]; then
@@ -159,7 +167,7 @@ dcx inventree-server python src/backend/InvenTree/manage.py shell < configure_in
 grep -q '^configure_inventree: done' data/configure.log || die "configure_inventree.py failed (see output above)"
 grep -q '^SETTINGS_CHANGED' data/configure.log && need_restart=1
 if [[ "$need_restart" == 1 ]]; then
-    restart_inventree "config.yaml or settings changed, so every gunicorn worker serves the plugin URLs and the SSO config"
+    restart_inventree "config.yaml, settings or the frontend bundles changed, so every gunicorn worker serves the plugin URLs, the SSO config and the collected bundles"
 fi
 
 # the OIDC issuer must resolve inside the container too (network alias on authentik-server)

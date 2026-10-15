@@ -133,6 +133,7 @@ describe('Groups page save paths', () => {
     expect(show.mock.calls[0][0].message).toBe(
       'Revocation queued for 25 members'
     );
+    expect(await screen.findByText(/Revocation pending/)).toBeTruthy();
   });
 
   it('reports a synchronous revocation with the token count', async () => {

@@ -171,6 +171,7 @@ class MCPUserState(models.Model):          # WP2
     revoked_reason = CharField(max_length=64, blank=True)
     last_recheck_error = CharField(max_length=255, blank=True)
     last_login_at = DateTimeField(null=True)
+    recheck_lease_until = DateTimeField(null=True, blank=True)   # WP5, migration 0003: the re-check lease
 class MCPRuleSet(models.Model):            # WP3, mirrors users.RuleSet
     group = ForeignKey(Group, related_name="mcp_rule_sets", on_delete=CASCADE)
     name = CharField(max_length=50, choices=users.ruleset.RULESET_CHOICES)
@@ -185,6 +186,7 @@ class MCPRuleSet(models.Model):            # WP3, mirrors users.RuleSet
 - **An SSO login lifts a block only when the identity checks pass** (`is_active`, `in_required_groups`); it always stamps `membership_checked_at` and `last_login_at`.
 - **`effective_scopes(user)` is empty when the user is not in `MCP_REQUIRED_GROUPS`**, so authorize, refresh narrowing and the transport agree without separate checks.
 - **The MCP endpoint calls `policy.may_connect(user)` for every credential type**: `blocked` → 401 with the challenge, `inactive`/`no_mcp_permission` → 403 JSON-RPC "No MCP permission".
+- **The re-check lease (WP5 review findings 1, 2)**: one re-check per user calls out at a time, serialised by `MCPUserState.recheck_lease_until` (120 s), never by a lock held across the network; a refresh grant of an overdue user finding another process's live lease never waits, and is allowed only within the windows of the last recorded outcome (`within_relogin` when `last_recheck_error` is a no-token code, otherwise `within_grace`), else `invalid_grant`, the lease left alone. The signal is private (`_LEASE_HELD` from `_take_lease`; public `recheck()` still reports `Outcome.NOT_DUE`, the `Outcome` enum is unchanged). The holder re-reads its lease right before the redeem and stops with `last_recheck_error = "lease_lost"` (UNREACHABLE, nothing redeemed) when it was taken over; every outbound call has a 15 s total deadline.
 - **Never query through the plugin's reverse relations from core models** (`User.objects.filter(mcp_state__…)`, `Group.objects.filter(mcp_rule_sets__…)`) — InvenTree registers plugin apps after core relations are built and the query raises `FieldError` in running processes while the test runner hides it. Use `MCPUserState.objects.filter(user=…)`, `MCPRuleSet.objects.filter(group__in=…)` or `Exists`.
 
 ## Definition of done (every WP)

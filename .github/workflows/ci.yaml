@@ -46,7 +46,7 @@ jobs:
           ruff check --preview inventree_mcp
           ruff format --preview --check inventree_mcp
           ruff check --preview --isolated inventree_mcp/tests
-          ruff check --isolated dev/*.py dev/authentik/*.py
+          ruff check --isolated dev/*.py dev/authentik/*.py dev/e2e/*.py
       - name: Frontend (lint, test, build)
         working-directory: frontend
         run: |
@@ -60,6 +60,8 @@ jobs:
         with:
           name: frontend-bundles
           path: inventree_mcp/static
+          # .vite/manifest.json (hashed bundle names) is a hidden file
+          include-hidden-files: true
           if-no-files-found: error
       - name: Build Plugin
         run: |

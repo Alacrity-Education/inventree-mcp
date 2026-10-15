@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import io
 import json
 import time
 import unittest
@@ -76,13 +77,14 @@ OIDC_INSTALLED = apps.is_installed("allauth.socialaccount.providers.openid_conne
 
 
 def _response(status: int, body) -> requests.Response:
+    """An unread response, as requests returns it (the body comes from ``raw``)."""
     response = requests.Response()
     response.status_code = status
     if isinstance(body, (dict, list)):
-        response._content = json.dumps(body).encode()
+        response.raw = io.BytesIO(json.dumps(body).encode())
         response.headers["Content-Type"] = "application/json"
     else:
-        response._content = str(body).encode()
+        response.raw = io.BytesIO(str(body).encode())
         response.headers["Content-Type"] = "text/plain"
     return response
 
@@ -445,6 +447,77 @@ class LeaseTest(MembershipTestCase):
         self.assertEqual(self.idp.calls, [])
         # The other re-check's lease is left alone.
         self.assertIsNotNone(self.state().recheck_lease_until)
+
+    def test_refresh_during_a_live_lease_follows_the_windows(self):
+        """WP5 F1: never waits, but an overdue user gets the grace / re-login windows."""
+        cases = (
+            # (hours since the last check, last_recheck_error, last login hours ago, allowed)
+            (2, "", None, True),  # inside MEMBERSHIP_GRACE_HOURS (4)
+            (5, "", None, False),  # past it
+            (5, "timeout", None, False),
+            (30, "no_token", 1, True),  # inside RELOGIN_INTERVAL_HOURS (24)
+            (30, "no_token", 30, False),  # past it
+        )
+        for hours, error, login_hours, allowed in cases:
+            with self.subTest(hours=hours, error=error, login_hours=login_hours):
+                lease = timezone.now() + datetime.timedelta(seconds=30)
+                login = (
+                    None
+                    if login_hours is None
+                    else timezone.now() - datetime.timedelta(hours=login_hours)
+                )
+                User.objects.filter(pk=self.user.pk).update(last_login=login)
+                self.user.refresh_from_db()
+                self.set_checked(
+                    hours_ago=hours,
+                    recheck_lease_until=lease,
+                    last_recheck_error=error,
+                    last_login_at=login,
+                )
+
+                self.assertEqual(
+                    membership.refresh_grant_allowed(self.user),
+                    (True, "") if allowed else (False, "invalid_grant"),
+                )
+                # recheck() itself still reports "in progress" as NOT_DUE.
+                self.assertEqual(membership.recheck(self.user), Outcome.NOT_DUE)
+                self.assertEqual(self.idp.calls, [])
+                state = self.state()
+                self.assertEqual(state.recheck_lease_until, lease)  # left alone
+                self.assertEqual(state.last_recheck_error, error)
+                self.assertFalse(membership.is_blocked(self.user))
+
+    def test_lease_lost_before_the_redeem_redeems_nothing(self):
+        """WP5 F2: a lease taken over during discovery stops the re-check before the redeem."""
+        self.set_checked(hours_ago=2)
+        other = timezone.now() + datetime.timedelta(seconds=90)
+
+        def take_over(method, url):
+            if url == DISCOVERY_URL:
+                MCPUserState.objects.filter(user=self.user).update(
+                    recheck_lease_until=other
+                )
+
+        self.idp.on_call = take_over
+        self.assertEqual(membership.recheck(self.user), Outcome.UNREACHABLE)
+
+        self.assertEqual(self.idp.token_calls, 0)
+        self.assertEqual(self.idp.redeemed, [])
+        state = self.state()
+        self.assertEqual(state.last_recheck_error, "lease_lost")
+        self.assertEqual(state.recheck_lease_until, other)  # the new holder's lease
+        self.assertIsNone(state.access_revoked_at)
+        self.assertEqual(self.upstream_token().token_secret, "upstream-rt-0")
+        # No provider back-off: the provider did nothing wrong.
+        self.assertIsNone(cache.get(membership._backoff_key("authentik")))
+
+    def test_outbound_call_has_a_total_deadline(self):
+        """WP5 F2: a body that keeps arriving past HTTP_DEADLINE_SECONDS is a timeout."""
+        self.set_checked(hours_ago=2)
+        with patch.object(membership, "HTTP_DEADLINE_SECONDS", -1):
+            self.assertEqual(membership.recheck(self.user), Outcome.UNREACHABLE)
+        self.assertEqual(self.state().last_recheck_error, "timeout")
+        self.assertEqual(self.idp.token_calls, 0)
 
     def test_expired_lease_is_taken_over(self):
         """A lease left behind by a killed process does not stop later re-checks."""

@@ -45,6 +45,7 @@ response bodies. Logged: user id, provider id, issuer host, reason code.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 from enum import Enum
 from hashlib import sha256
@@ -60,6 +61,9 @@ logger = logging.getLogger("inventree")
 
 #: Seconds for every outbound call (connect and read each).
 HTTP_TIMEOUT_SECONDS = 5
+#: Wall-clock limit of one outbound call, body included: HTTP_TIMEOUT_SECONDS
+#: bounds each socket operation, not a response that trickles in.
+HTTP_DEADLINE_SECONDS = 15
 DISCOVERY_CACHE_SECONDS = 600
 #: The "no upstream token" warning is logged at most once per user and this many seconds.
 NO_TOKEN_WARNING_SECONDS = 3600
@@ -69,10 +73,11 @@ NO_TOKEN_WARNING_SECONDS = 3600
 PROVIDER_BACKOFF_SECONDS = 60
 #: The transport's per-user "re-check queued" marker after an ordinary queueing.
 RECHECK_QUEUED_SECONDS = 60
-#: Lifetime of a re-check's lease (MCPUserState.recheck_lease_until). A re-check
-#: makes at most four outbound calls with HTTP_TIMEOUT_SECONDS each; a lease left
-#: behind by a killed process expires after this.
-RECHECK_LEASE_SECONDS = 60
+#: Lifetime of a re-check's lease (MCPUserState.recheck_lease_until). The lease is
+#: re-asserted right before the redeem (the discovery call before it takes at most
+#: HTTP_DEADLINE_SECONDS), so the redeem and the store always finish well inside
+#: it; a lease left behind by a killed process expires after this.
+RECHECK_LEASE_SECONDS = 120
 
 #: Reason codes stored in MCPUserState.revoked_reason by a failed re-check.
 REVOKED_UPSTREAM = "invalid_grant"
@@ -93,6 +98,12 @@ class Outcome(str, Enum):
     NO_UPSTREAM_TOKEN = "no_upstream_token"
     NOT_DUE = "not_due"
     DISABLED = "disabled"
+
+
+#: Private result of _take_lease(): another process holds a live lease (its
+#: re-check is in flight). recheck() reports it as Outcome.NOT_DUE;
+#: refresh_grant_allowed() applies the grace / re-login windows to it.
+_LEASE_HELD = object()
 
 
 class _Unreachable(Exception):
@@ -314,7 +325,7 @@ def refresh_grant_allowed(user) -> tuple[bool, str]:
         return True, ""
 
     try:
-        outcome = recheck(user)
+        outcome = _recheck(user)
     except Exception as exc:  # noqa: BLE001 - e.g. the lock failed: grace decides
         logger.warning(
             "inventree-mcp: membership re-check for user id %s failed (%s)",
@@ -328,6 +339,25 @@ def refresh_grant_allowed(user) -> tuple[bool, str]:
         return False, "invalid_grant"
 
     state = _state(user)
+
+    if outcome is _LEASE_HELD:
+        # Overdue, and another process's re-check is in flight: never wait for
+        # it, but hold the refresh to the windows of the last recorded outcome
+        # (as for an unreachable provider). The lease is left alone.
+        error = state.last_recheck_error if state else ""
+        if error in NO_TOKEN_CODES:
+            allowed = within_relogin(user, state)
+        else:
+            allowed = within_grace(state)
+        if allowed:
+            return True, ""
+        logger.info(
+            "inventree-mcp: refresh refused for user id %s: re-check in progress "
+            "elsewhere and the %s window has passed",
+            user.pk,
+            "re-login" if error in NO_TOKEN_CODES else "grace",
+        )
+        return False, "invalid_grant"
 
     if outcome is Outcome.UNREACHABLE:
         if within_grace(state):
@@ -372,22 +402,29 @@ def recheck(user, *, force: bool = False) -> Outcome:
     The lease is released in ``finally``; one left by a killed process expires
     on its own. A login (signals.py) only ever waits for steps 1 and 3.
     """
+    outcome = _recheck(user, force=force)
+    return Outcome.NOT_DUE if outcome is _LEASE_HELD else outcome
+
+
+def _recheck(user, *, force: bool = False):
+    """recheck(), but a live lease of another process gives _LEASE_HELD."""
     if not enforced():
         return Outcome.DISABLED
     if not force and not recheck_due(user):
         return Outcome.NOT_DUE
 
     lease = _take_lease(user, force=force)
-    if isinstance(lease, Outcome):
+    if lease is _LEASE_HELD or isinstance(lease, Outcome):
         return lease
     try:
-        return _recheck_under_lease(user)
+        return _recheck_under_lease(user, lease)
     finally:
         _release_lease(user, lease)
 
 
 def _take_lease(user, *, force: bool):
-    """Step 1 of recheck(): the lease's expiry, or the Outcome when there is nothing to do."""
+    """Step 1 of recheck(): the lease's expiry, an Outcome when there is nothing to do,
+    or _LEASE_HELD when another re-check holds a live lease."""
     with transaction.atomic():
         state = _locked_state(user)
         if state.access_revoked_at is not None:
@@ -399,7 +436,7 @@ def _take_lease(user, *, force: bool):
             logger.debug(
                 "inventree-mcp: membership re-check for user id %s in progress", user.pk
             )
-            return Outcome.NOT_DUE
+            return _LEASE_HELD
         state.recheck_lease_until = now + timedelta(seconds=RECHECK_LEASE_SECONDS)
         state.save(update_fields=["recheck_lease_until"])
         return state.recheck_lease_until
@@ -421,11 +458,11 @@ def _release_lease(user, lease) -> None:
         )
 
 
-def _recheck_under_lease(user) -> Outcome:
-    """Steps 2 and 3 of recheck(), with the lease held."""
+def _recheck_under_lease(user, lease) -> Outcome:
+    """Steps 2 and 3 of recheck(), with the lease (its expiry *lease*) held."""
     from django.contrib.auth import get_user_model
 
-    context = {"issuer_host": "unknown"}
+    context = {"issuer_host": "unknown", "user_id": user.pk, "lease": lease}
     try:
         account, groups = _check_upstream(user, context)
     except _NoUpstreamToken as exc:
@@ -577,14 +614,14 @@ def _check_upstream(user, context: dict) -> tuple:
     if code := cache.get(backoff_key):
         raise _Unreachable(code)
     try:
-        return account, _redeem_and_verify(app, provider_id, account, token)
+        return account, _redeem_and_verify(app, provider_id, account, token, context)
     except _Unreachable as exc:
         if _starts_backoff(exc.code):
             cache.set(backoff_key, exc.code, PROVIDER_BACKOFF_SECONDS)
         raise
 
 
-def _redeem_and_verify(app, provider_id, account, token) -> list[str]:
+def _redeem_and_verify(app, provider_id, account, token, context: dict) -> list[str]:
     """The outbound calls: discovery, redeem, store, verify, userinfo. Returns the groups claim.
 
     Runs outside any transaction of recheck(), so _store_tokens() commits on
@@ -595,6 +632,7 @@ def _redeem_and_verify(app, provider_id, account, token) -> list[str]:
     with get_adapter().get_requests_session() as session:
         config = _discovery(session, app)
         adapter = _adapter_class()(provider_id, config)
+        _assert_lease(context)
         data = _redeem(session, app, adapter, token.token_secret)
         # The old upstream refresh token is spent now: store the rotated one
         # first, so no later failure (or a killed process) loses it.
@@ -605,6 +643,24 @@ def _redeem_and_verify(app, provider_id, account, token) -> list[str]:
         if claims is not None and str(claims.get(subject_field)) != account.uid:
             raise _Unreachable("subject_mismatch")
         return _groups_claim(session, adapter, data, claims, subject_field, account)
+
+
+def _assert_lease(context: dict) -> None:
+    """Right before the redeem: this re-check still holds its lease, or nothing is redeemed.
+
+    A lease that expired while an earlier call was slow may have been taken
+    over; redeeming then would spend the upstream refresh token twice.
+    """
+    from ..models import MCPUserState
+
+    current = (
+        MCPUserState.objects
+        .filter(user_id=context["user_id"])
+        .values_list("recheck_lease_until", flat=True)
+        .first()
+    )
+    if current is None or current != context["lease"]:
+        raise _Unreachable("lease_lost")
 
 
 def _classify(fresh) -> tuple[_Verdict, str]:
@@ -633,11 +689,28 @@ def _social_token(account, app):
 
 
 def _http(session, method: str, url: str, **kwargs):
-    """One outbound call with the fixed timeout; network errors become _Unreachable."""
+    """One outbound call; network errors become _Unreachable.
+
+    HTTP_TIMEOUT_SECONDS bounds connect and every read; the body is streamed
+    so the whole call, body included, also ends after HTTP_DEADLINE_SECONDS.
+    """
     import requests
 
+    deadline = time.monotonic() + HTTP_DEADLINE_SECONDS
     try:
-        return session.request(method, url, timeout=HTTP_TIMEOUT_SECONDS, **kwargs)
+        response = session.request(
+            method, url, timeout=HTTP_TIMEOUT_SECONDS, stream=True, **kwargs
+        )
+        try:
+            body = []
+            for chunk in response.iter_content(8192):
+                if time.monotonic() > deadline:
+                    raise _Unreachable("timeout")
+                body.append(chunk)
+        finally:
+            response.close()
+        response._content = b"".join(body)  # what requests does without stream=True
+        return response
     except requests.Timeout as exc:
         raise _Unreachable("timeout") from exc
     except requests.RequestException as exc:

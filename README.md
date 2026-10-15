@@ -425,10 +425,15 @@ take up to about 20 seconds when the provider is slow. The sweep therefore start
 after 60 seconds and queues the remaining users as a continuation task. Raising
 `background.timeout` gives it more room; lowering it below about 85 seconds risks a sweep being killed
 in the middle of a re-check. A re-check holds no database lock while it talks to the provider. It takes a
-60-second lease on the user's `MCPUserState` row (`recheck_lease_until`), stores the rotated upstream refresh
-token the moment it arrives, and applies the outcome in a second short transaction. A second re-check of the same
-user while the lease is held returns at once without calling the provider. A lease left by a killed worker expires
-after 60 seconds. Logins never wait for a re-check.
+120-second lease on the user's `MCPUserState` row (`recheck_lease_until`), checks right before redeeming the upstream
+refresh token that the lease is still its own (otherwise it stops with `lease_lost` and redeems nothing), stores the
+rotated upstream refresh token the moment it arrives, and applies the outcome in a second short transaction. Every
+outbound call ends after 15 seconds at most, body included. A second re-check of the same user while the lease is
+held returns at once without calling the provider. A refresh grant of an overdue user arriving while another
+re-check holds the lease does not wait for it either: it proceeds only within the windows of the last recorded
+outcome (`MEMBERSHIP_GRACE_HOURS` since the last successful check, or `RELOGIN_INTERVAL_HOURS` since the last
+login when there is no upstream token), otherwise it gets `invalid_grant`. A lease left by a killed worker expires
+after 120 seconds. Logins never wait for a re-check.
 
 The plugin keeps short-lived markers in Django's cache: the provider back-off, the "re-check queued"
 marker of each user, the "no upstream token" warning marker and the provider's discovery document.

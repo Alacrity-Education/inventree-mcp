@@ -1068,7 +1068,9 @@ class Restore:
             name: bootstrap.user_groups(ctx.authentik, name) for name in bootstrap.USERS
         }
         self.settings = read_settings()
-        self.was_blocked = membership.state()["blocked"]
+        before = membership.state()
+        self.was_blocked = before["blocked"]
+        self.block_reason = before["reason"]
         admin = ctx.admin
         self.rules = mcp_rules(admin, permissions.group_pk(admin))
 
@@ -1108,8 +1110,18 @@ class Restore:
                 bootstrap.set_user_groups(self.ctx.authentik, name, groups)
 
     def _block(self) -> None:
-        if membership.state()["blocked"] and not self.was_blocked:
+        blocked = membership.state()["blocked"]
+        if blocked and not self.was_blocked:
             membership.unblock()
+        elif self.was_blocked and not blocked:  # scenario 3's SSO login lifted it
+            membership.shell(
+                membership.PRELUDE
+                + f"""
+from inventree_mcp.auth.membership import block_user
+block_user(user, {self.block_reason!r})
+print('E2E {{}}')
+"""
+            )
 
 
 def run_scenario(ctx: Context, number: str, name: str, function) -> str:

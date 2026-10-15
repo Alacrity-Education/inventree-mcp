@@ -14,8 +14,9 @@ The scratch group (with its rulesets) and the admin API token the script created
 The token is revoked through DELETE /api/user/tokens/<id>/ (InvenTree keeps the row, flagged revoked).
 Screenshots are written to docs/plans/screenshots/ only with --screenshots (they overwrite the committed ones).
 
-Step 2 and 3 need an InvenTree with plugin routes (1.6 or later, e.g. INVENTREE_TAG=latest). On 1.5.x the script
-runs step 1, reports that the pages are not offered and exits with status 3.
+Step 2 and 3 need an InvenTree with plugin routes (1.6 or later, e.g. INVENTREE_TAG=latest) and "Enable interface
+integration" (ENABLE_PLUGINS_INTERFACE). When the pages are not offered the script runs step 1 and then exits with
+status 1 if that setting is off (a misconfiguration), or with status 3 (skipped) if it is on (no plugin routes, 1.5.x).
 
 membership_e2e.create_api_token / delete_api_tokens are not used: they create and delete the *e2e-member* token named
 "membership-e2e" (not an admin), and deleting it would break a concurrent e2e run.
@@ -80,6 +81,11 @@ class Api:
         """True when the host offers the plugin's navigation items (InvenTree with plugin routes)."""
         return "inventree-mcp" in json.dumps(self.call("GET", "/api/plugins/ui/features/navigation/"))
 
+    def interface_integration_on(self) -> bool:
+        """The global setting ENABLE_PLUGINS_INTERFACE: without it no plugin offers UI features on any version."""
+        value = self.call("GET", "/api/settings/global/ENABLE_PLUGINS_INTERFACE/")["value"]
+        return str(value).strip().lower() in {"true", "1"}
+
 
 def login(page, base: str, user: str, password: str):
     page.goto(f"{base}/web/login")
@@ -119,7 +125,8 @@ def browser_steps(base: str, args, group_name: str, pk: int, api: Api, before: b
 
             after = api.flag(pk)
             print(f"after save in the browser: {ROLE_LABEL} delete = {after}")
-            assert after != before, "the toggled flag was not persisted"
+            if after == before:
+                raise SystemExit("FAILED: the toggled flag was not persisted")
 
             page.goto(f"{base}/web/plugin/inventree-mcp/connections")
             expect(page.get_by_text("MCP OAuth")).to_be_visible(timeout=30_000)
@@ -151,7 +158,16 @@ def main() -> int:
         print(f"scratch group {group_name!r} pk={pk}: {ROLE_LABEL} delete = {before}")
 
         if not api.pages_offered():
-            print("SKIPPED browser steps: this InvenTree does not offer the plugin pages (needs 1.6 or later)")
+            if not api.interface_integration_on():
+                print(
+                    "FAILED: the plugin pages are not offered because interface integration is off "
+                    "(global setting ENABLE_PLUGINS_INTERFACE); turn it on and re-run"
+                )
+                return 1
+            print(
+                "SKIPPED browser steps: interface integration is on, but this InvenTree has no plugin routes "
+                "(needs 1.6 or later, e.g. INVENTREE_TAG=latest)"
+            )
             return SKIPPED
         browser_steps(base, args, group_name, pk, api, before)
         print("ui_smoke: ok")
@@ -163,12 +179,19 @@ def main() -> int:
                 print(f"deleted scratch group pk={pk}")
             except OSError as error:  # report, but still revoke the token
                 print(f"WARNING: could not delete scratch group pk={pk}: {error}", file=sys.stderr)
-        if api.token_id is not None:
-            try:
-                api.call("DELETE", f"/api/user/tokens/{api.token_id}/")
-                print("revoked the script's API token")
-            except OSError as error:
-                print(f"WARNING: could not revoke API token {api.token_id}: {error}", file=sys.stderr)
+        try:
+            if api.token_id is None:  # the lookup at the start failed: try again
+                api.find_token_id()
+            if api.token_id is None:
+                raise OSError("not found in /api/user/tokens/")
+            api.call("DELETE", f"/api/user/tokens/{api.token_id}/")
+            print("revoked the script's API token")
+        except (OSError, ValueError, KeyError) as error:
+            print(
+                f"WARNING: could not revoke the script's API token {api.name!r} (id {api.token_id}): {error}; "
+                "revoke it under Settings > Account > Access Tokens",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":
