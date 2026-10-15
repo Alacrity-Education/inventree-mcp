@@ -70,7 +70,7 @@ On the OAuth2/OpenID provider InvenTree signs in with:
 | Global cache | Redis (`INVENTREE_CACHE_*`) recommended | the provider back-off, the "re-check queued" markers and the cached discovery document are shared by all processes; without it each process keeps its own |
 | CORS | `cors.whitelist` / `INVENTREE_CORS_ORIGIN_WHITELIST` containing `https://claude.ai,https://claude.com` | browser preflights to `/plugin/` are answered by InvenTree's CORS middleware before any plugin view runs |
 | Public origin | `SITE_URL` (`INVENTREE_SITE_URL`) set to the public URL; `INVENTREE_USE_X_FORWARDED_HOST`/`_PROTO` (and `_PORT` if needed) on; the proxy sends `X-Forwarded-Proto` and `X-Forwarded-Host` | every advertised URL (issuer, endpoints, `resource_metadata`, pagination links of tool results) uses the public origin; InvenTree derives `ALLOWED_HOSTS` from `SITE_URL` |
-| Client IP | the proxy **replaces** `X-Forwarded-For` (Caddy does by default; nginx: `proxy_set_header X-Forwarded-For $remote_addr;`), gunicorn not reachable directly | the registration rate limit is per client IP, and InvenTree takes the first `X-Forwarded-For` entry |
+| Client IP | the proxy **replaces** `X-Forwarded-For` (Caddy does by default; nginx: `proxy_set_header X-Forwarded-For $remote_addr;`), gunicorn not reachable directly | the registration and token rate limits are per client IP, and InvenTree takes the first `X-Forwarded-For` entry |
 | 1.5.x discovery | the proxy rewrites of the README ("InvenTree 1.5.x: reverse-proxy rewrites for discovery") | 1.5.x cannot let plugins serve `/.well-known/`; without the rewrite Claude Code gets InvenTree's HTML login page and stops with a JSON parse error |
 | 1.5.x first SSO login | InvenTree 1.5.x (checked on 1.5.7): the first SSO login of a new user ends in a 500 (`AssertionError` in allauth's `setup_user_email`, `CustomSocialAccountAdapter.save_user` marks the SocialLogin instead of the User). User, groups and token are saved, the session is not. Fixed on master by InvenTree PR #12842, in no released 1.5.x tag | every user's first MCP sign-in on 1.5.x ends on this 500; starting the connection again signs in normally, because the account exists by then (expected from the cause, not verified on a production instance). The dev stack patches the line (`dev/entrypoint.sh`, `DEV_PATCH_SSO_SIGNUP`) |
 | DOT lifetimes | none to set; know that they are instance-wide | while `OAUTH_ENABLED` is on the plugin injects its lifetimes (access 1 h, refresh 30 d, code 10 min), refresh token rotation with reuse protection and a 120 s grace period into DOT. That applies to **every** OAuth2 application on the instance, including ones registered in InvenTree's admin and served by core's `/o/`. Turning `OAUTH_ENABLED` off, or deactivating the plugin, restores InvenTree's values |
@@ -97,6 +97,7 @@ workers), no restart needed.
 | `AUTH_CODE_LIFETIME_SECONDS` | `600` | `600` | |
 | `ALLOW_LOCALHOST_LOOPBACK` | `True` | `True` | Claude Code redirects to `http://localhost:<port>` |
 | `REGISTER_RATE_LIMIT_PER_MINUTE` | `30` | `30` | per client IP; `429` with `Retry-After` |
+| `TOKEN_RATE_LIMIT_PER_MINUTE` | `60` | `60` | authorization code exchanges at the token endpoint per client IP (`0` disables); refresh grants are not limited; `429` with `Retry-After` |
 | `UNUSED_CLIENT_RETENTION_DAYS` | `90` | `90` | Claude registers a new client per connection; unused ones are deleted daily |
 | `OAUTH_FORCE_SSO` | `True` | `True` | the login bridge goes straight to the provider |
 | `SSO_PROVIDER_ID` | empty | empty, or the provider id when InvenTree has several OIDC apps | with several apps and no id, the bridge falls back to manual mode and re-checks find no provider |
@@ -143,6 +144,7 @@ Other lines worth knowing:
 | `DOT settings injected: …` | per process, at start and after a settings change (INFO) |
 | `OAuth sign-in is on, but this InvenTree version cannot serve /.well-known/oauth-authorization-server/…` | 1.5.x without the proxy rewrites (WARNING, once per process) |
 | `MEMBERSHIP_ENFORCED is on, but app integration …`, `cannot read MCP user state (run invoke migrate)`, `app integration (ENABLE_PLUGINS_APP) is off …` | missing app integration or migration: re-checks disabled / MCP closed (fail closed) |
+| `inventree-mcp: this InvenTree has no plugin routes, no navigation items` (INFO), the missing-frontend-bundle warning (WARNING) | once per process, not per page load |
 
 Where to look: the plugin API `GET /plugin/inventree-mcp/api/status/?user=<pk>` (staff admins: `membership.checked_at`,
 `blocked`, `reason`, `may_connect`), `GET api/effective/<pk>/` and `GET api/connections/?user=<pk>`; the *MCP Access*
@@ -205,7 +207,7 @@ deleted by the cleanup has to reconnect.
 **`403` "No MCP permission".** The user is active and not blocked but none of their groups grants an MCP role (or they
 are outside `MCP_REQUIRED_GROUPS`); grant MCP roles to one of their groups. Check with `GET api/effective/<pk>/`.
 
-**`429` on registration.** More than `REGISTER_RATE_LIMIT_PER_MINUTE` registrations from one IP in a minute; behind a
+**`429` on registration or the code exchange.** More than `REGISTER_RATE_LIMIT_PER_MINUTE` registrations or `TOKEN_RATE_LIMIT_PER_MINUTE` authorization code exchanges from one IP in a minute; behind a
 proxy that appends to `X-Forwarded-For` every client shares the proxy's address. Fix the proxy (see §3).
 
 **Intermittent 403/404 on `/plugin/...` after changing plugin integration settings.** Restart the web and worker

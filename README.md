@@ -214,14 +214,15 @@ InvenTree:
   `https://claude.com` (browser preflights to `/plugin/` are answered by InvenTree's CORS middleware).
 - Plugin settings: **Enable OAuth Sign-in** (`OAUTH_ENABLED`) on; URL integration, schedule
   integration and app integration (`ENABLE_PLUGINS_APP`, needed for the plugin's `MCPUserState`
-  and `MCPRuleSet` models; run `invoke migrate` after installing or upgrading) enabled for plugins. With
+  and `MCPRuleSet` models; run `invoke migrate` after installing or upgrading: migrations `0001` to `0003` exist,
+  `0003` adds `MCPUserState.recheck_lease_until`) enabled for plugins. With
   `MEMBERSHIP_ENFORCED` on and app integration off, the plugin logs a warning at start-up: re-checks
   and blocks are then disabled. While the migration is missing, reads of the MCP user state fail
   safe (logged once) instead of failing requests.
 - A reverse proxy that **replaces** `X-Forwarded-For` with the client address instead of appending
   to it, and gunicorn not reachable directly. InvenTree takes the client IP from the *first*
-  `X-Forwarded-For` entry, which a client can set itself when the proxy appends; the registration
-  rate limit (`REGISTER_RATE_LIMIT_PER_MINUTE`) is per client IP. Caddy replaces the header by
+  `X-Forwarded-For` entry, which a client can set itself when the proxy appends; the registration and token
+  rate limits (`REGISTER_RATE_LIMIT_PER_MINUTE`, `TOKEN_RATE_LIMIT_PER_MINUTE`) are per client IP. Caddy replaces the header by
   default (as long as `trusted_proxies` is not configured); with nginx use
   `proxy_set_header X-Forwarded-For $remote_addr;`, not `$proxy_add_x_forwarded_for`.
 - On InvenTree 1.5.x, the [reverse-proxy rewrites for discovery](#inventree-15x-reverse-proxy-rewrites-for-discovery).
@@ -281,7 +282,8 @@ OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
 | `REFRESH_TOKEN_LIFETIME_DAYS` | `30` | Refresh token idle lifetime (rotated on every use). |
 | `AUTH_CODE_LIFETIME_SECONDS` | `600` | Authorization code lifetime. |
 | `ALLOW_LOCALHOST_LOOPBACK` | `True` | Accept `http://localhost` redirect URIs on any port, like `127.0.0.1`. |
-| `REGISTER_RATE_LIMIT_PER_MINUTE` | `30` | Client registrations per minute and IP (`0` disables). |
+| `REGISTER_RATE_LIMIT_PER_MINUTE` | `30` | Client registrations per minute and IP (`0` disables); `429` with `Retry-After`. |
+| `TOKEN_RATE_LIMIT_PER_MINUTE` | `60` | Authorization code exchanges per minute and client IP at the OAuth token endpoint (`0` disables); refresh grants are not limited; `429` with `Retry-After`. |
 | `UNUSED_CLIENT_RETENTION_DAYS` | `90` | Daily cleanup of registered clients without a live token. |
 | `OAUTH_FORCE_SSO` | `True` | Send the browser straight to the SSO provider when it has no InvenTree session. |
 | `SSO_PROVIDER_ID` | empty | allauth provider id to sign in with and to re-check membership at; empty selects the single configured `openid_connect` provider. |
@@ -367,10 +369,10 @@ the plugin's admin pages):
 | `POST api/rulesets/copy/` `{"group": pk}` | same | MCP roles := the group's interactive roles |
 | `POST api/rulesets/clear/` `{"group": pk}` | same | every MCP flag off (revokes the members) |
 | `POST api/rulesets/revoke/` `{"group": pk}` | same | revoke the members' MCP tokens: `{"users": n, "tokens": m, "queued": bool}` |
-| `GET api/effective/<user_pk>/` | the user; staff admins for anybody | `roles` (interactive), `mcp_roles`, `effective` (both; what MCP can do), each `{role: {label, view, add, change, delete}}`, plus `scopes`, `may_connect`, `reason`, `note` (how to read `effective` for tables shared by several roles) |
+| `GET api/effective/<user_pk>/` | the user; staff admins for anybody | `roles` (interactive), `mcp_roles`, `effective` (both; what MCP can do), each `{role: {label, view, add, change, delete}}`, plus `scopes` (empty whenever `may_connect` is false, e.g. for a blocked user), `may_connect`, `reason`, `note` (how to read `effective` for tables shared by several roles) |
 | `GET api/connections/[?user=<pk>]` | the user; staff admins with `?user=` | live MCP connections (façade refresh tokens): `pk`, `client_name`, `client_host`, `client_trusted`, `created`, `expires`, `access_expires`, `scopes` |
 | `DELETE api/connections/<pk>/` | the owner; staff admins | revoke the connection |
-| `GET api/status/[?user=<pk>]` | the user; staff admins with `?user=` | `oauth_enabled`, `mcp_url`, `membership` (`checked_at`, `blocked`, `reason`), `scopes`, `may_connect`, `reason` |
+| `GET api/status/[?user=<pk>]` | the user; staff admins with `?user=` | `oauth_enabled`, `mcp_url`, `membership` (`checked_at`, `blocked`, `reason`), `scopes` (empty whenever `may_connect` is false, e.g. for a blocked user), `may_connect`, `reason` |
 
 OAuth tokens are refused on the plugin API by InvenTree's middleware (`401`; it accepts sessions
 and API tokens only); the views additionally require `a:staff` for the staff endpoints, which MCP
@@ -422,8 +424,11 @@ The hourly sweep runs as one background task. django-q kills a task after InvenT
 take up to about 20 seconds when the provider is slow. The sweep therefore starts no new re-check
 after 60 seconds and queues the remaining users as a continuation task. Raising
 `background.timeout` gives it more room; lowering it below about 85 seconds risks a sweep being killed
-in the middle of a re-check. A re-check holds a database row lock for the user while it talks to the
-provider; replacing that with a short lease is planned hardening.
+in the middle of a re-check. A re-check holds no database lock while it talks to the provider. It takes a
+60-second lease on the user's `MCPUserState` row (`recheck_lease_until`), stores the rotated upstream refresh
+token the moment it arrives, and applies the outcome in a second short transaction. A second re-check of the same
+user while the lease is held returns at once without calling the provider. A lease left by a killed worker expires
+after 60 seconds. Logins never wait for a re-check.
 
 The plugin keeps short-lived markers in Django's cache: the provider back-off, the "re-check queued"
 marker of each user, the "no upstream token" warning marker and the provider's discovery document.
@@ -447,7 +452,8 @@ The plugin adds two pages to the InvenTree web interface. They need InvenTree 1.
 #12900; not yet released, the `latest` image) and the global setting *Enable interface integration*
 (`ENABLE_PLUGINS_INTERFACE`); on 1.5.7 the plugin offers no pages and no navigation entries, everything else works.
 
-- **MCP Access** (`/web/plugin/inventree-mcp/groups`, staff only): pick a group on the left. Accordions show the
+- **MCP Access** (`/web/plugin/inventree-mcp/groups`, staff with the *admin* role's change permission, the condition of the plugin's
+  staff API; staff without it see neither the page, its navigation entry nor the *MCP Roles* group panel): pick a group on the left. Accordions show the
   group's interactive roles (the same grid as the core group drawer, saved to core), its **MCP Roles** (what MCP
   clients may do for its members; saved through the plugin API, "Copy from roles" and "Clear" buttons, a warning mark
   on an MCP flag whose group grants no interactive access for it: the flag only takes effect for members who hold
@@ -482,8 +488,8 @@ build is logged as a warning and the pages are left out. See `dev/README.md` for
 | API token gets `401` "MCP access suspended …" | provider unreachable past `MEMBERSHIP_GRACE_HOURS`, or no upstream token and no login within `RELOGIN_INTERVAL_HOURS` (service accounts: see OPERATIONS §6) |
 | `500` at the first SSO login on InvenTree 1.5.x | core bug fixed by InvenTree PR #12842, see OPERATIONS §3 |
 | Intermittent `403`/`404` on `/plugin/...` | restart InvenTree after switching plugin integration settings |
-| `429` on registration | `REGISTER_RATE_LIMIT_PER_MINUTE` per client IP; check that the proxy replaces `X-Forwarded-For` |
-| No *MCP* / *MCP Access* pages | InvenTree before 1.6.0 has no plugin pages, *Enable interface integration* is off, or the frontend bundles were not built |
+| `429` on registration or the code exchange | `REGISTER_RATE_LIMIT_PER_MINUTE` / `TOKEN_RATE_LIMIT_PER_MINUTE` per client IP; check that the proxy replaces `X-Forwarded-For` |
+| No *MCP* / *MCP Access* pages | InvenTree before 1.6.0 has no plugin pages, *Enable interface integration* is off, the frontend bundles were not built or (*MCP Access* only) the user lacks the admin role's change permission |
 
 More in [`docs/OPERATIONS.md`](docs/OPERATIONS.md) §6 (failure modes) and §8 (things that went wrong once).
 

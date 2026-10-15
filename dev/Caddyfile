@@ -36,6 +36,10 @@
 				delete code
 				delete state
 			}
+			resp_headers>Location query {
+				delete code
+				delete state
+			}
 		}
 	}
 
