@@ -1,0 +1,74 @@
+# On a published release: build the frontend bundles and the Python package, attach the wheel and the sdist to the
+# release, and (upstream repository only) publish to PyPI with Trusted Publishing (OIDC, no API token secret).
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build and attach the package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # release assets
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build the frontend bundles
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          npm run check:bundles
+      - name: Build the package
+        run: |
+          pip install --upgrade build
+          python -m build
+          # The wheel must ship the templates and the built bundles
+          python - <<'PY'
+          import glob, sys, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          for needle in ("inventree_mcp/templates/inventree_mcp/consent.html", "inventree_mcp/static/Groups.js"):
+              if needle not in names:
+                  sys.exit(f"missing from wheel: {needle}")
+          print("wheel contents OK")
+          PY
+      - name: Attach the package to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"
+      - name: Keep the package for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    # Only the upstream project publishes the "inventree-mcp" package; forks attach the assets above
+    if: github.repository == 'inventree/inventree-mcp'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # required for trusted publishing (OIDC)
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

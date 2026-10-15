@@ -35,10 +35,12 @@ membership at the identity provider is re-checked while a connection lives
 
 ## Install
 
-Install via the InvenTree plugin manager, or via pip:
+This fork is not on PyPI. Install the wheel attached to the latest release on
+<https://github.com/Alacrity-Education/inventree-mcp/releases>: add its URL to InvenTree's `plugins.txt`, or
+`pip install` it into the InvenTree environment:
 
 ```bash
-pip install inventree-mcp
+pip install https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.0/inventree_mcp-0.4.0-py3-none-any.whl
 ```
 
 Then enable the plugin under **Admin > Plugins**, switch on URL, app, schedule and interface integration for plugins
