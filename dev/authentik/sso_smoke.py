@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 # the shared constants
 sys.path.insert(0, str(Path(__file__).resolve().parent))
