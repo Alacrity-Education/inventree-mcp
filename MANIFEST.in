@@ -1,1 +1,2 @@
 recursive-include inventree_mcp/static *
+recursive-include inventree_mcp/templates *

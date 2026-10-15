@@ -48,6 +48,7 @@ exclude = [
     "__pycache__",
     "test.py",
     "tests",
+    "migrations",
     "venv",
     "env",
     ".venv",

@@ -1,0 +1,166 @@
+From f826ba0044f623a2957014eef5a9f64dfa5ebd04 Mon Sep 17 00:00:00 2001
+From: lucaci32u4 <lucaci32u4@gmail.com>
+Date: Thu, 15 Oct 2026 07:19:22 +0300
+Subject: [PATCH 1/4] Allow OAUTH2_PROVIDER options to be set via config.yaml /
+ environment
+
+Merge a dict from config key 'oauth2_provider' or the env variable
+INVENTREE_OAUTH2_PROVIDER (JSON) into OAUTH2_PROVIDER, so deployments can
+set django-oauth-toolkit options (DCR_ENABLED, CIMD_ENABLED, token
+lifetimes, ALLOW_LOCALHOST_LOOPBACK, ...). Only the names of overridden
+keys are logged.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ docs/docs/start/config.md                   |  9 +++++++
+ src/backend/InvenTree/InvenTree/config.py   | 22 ++++++++++++++++
+ src/backend/InvenTree/InvenTree/settings.py | 14 +++++++++-
+ src/backend/InvenTree/InvenTree/tests.py    | 29 +++++++++++++++++++++
+ src/backend/InvenTree/config_template.yaml  |  6 +++++
+ 5 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/docs/docs/start/config.md b/docs/docs/start/config.md
+index de4ec4a3e..5f4f63bd4 100644
+--- a/docs/docs/start/config.md
++++ b/docs/docs/start/config.md
+@@ -245,6 +245,15 @@ If not specified via environment variables, the fallback files (automatically ge
+ {{ configsetting("INVENTREE_OIDC_PRIVATE_KEY") }} Raw private key value |
+ {{ configsetting("INVENTREE_OIDC_PRIVATE_KEY_FILE", default="oidc.pem") }} File containing private key value in PEM format |
+ 
++## OAuth2 Provider Options
++
++InvenTree acts as an OAuth2 / OpenID Connect provider using [django-oauth-toolkit](https://django-oauth-toolkit.readthedocs.io/en/latest/settings.html). Additional options for the toolkit (for example token lifetimes, `DCR_ENABLED`, `CIMD_ENABLED` or `ALLOW_LOCALHOST_LOOPBACK`) can be supplied as a dictionary, which is merged into the `OAUTH2_PROVIDER` setting. Keys provided here take precedence over the InvenTree defaults (`SCOPES`, `OIDC_ENABLED`, `OIDC_RSA_PRIVATE_KEY`, `PKCE_REQUIRED`), so override those with care.
++
++The environment variable must contain a valid JSON object, e.g. `INVENTREE_OAUTH2_PROVIDER='{"ACCESS_TOKEN_EXPIRE_SECONDS": 3600}'`. The names (not the values) of overridden keys are written to the log at startup.
++
++{{ configtable() }}
++{{ configsetting("INVENTREE_OAUTH2_PROVIDER") }} Dictionary of django-oauth-toolkit options |
++
+ ## Database Options
+ 
+ InvenTree provides support for multiple database backends - any backend supported natively by Django can be used.
+diff --git a/src/backend/InvenTree/InvenTree/config.py b/src/backend/InvenTree/InvenTree/config.py
+index facd3b987..94ee515db 100644
+--- a/src/backend/InvenTree/InvenTree/config.py
++++ b/src/backend/InvenTree/InvenTree/config.py
+@@ -252,6 +252,28 @@ def do_typecast(value, type, var_name=None):
+     return value
+ 
+ 
++def merge_oauth2_provider_settings(base: dict, overrides: Optional[dict]) -> dict:
++    """Merge user-supplied django-oauth-toolkit options into the core defaults.
++
++    Arguments:
++        base: The OAUTH2_PROVIDER dict defined by InvenTree
++        overrides: User-supplied options (from config.yaml or the environment)
++
++    Returns:
++        A new dict; keys in 'overrides' replace those in 'base'.
++        Only the names of overridden keys are logged, never the values.
++    """
++    result = dict(base)
++
++    if overrides and isinstance(overrides, dict):
++        logger.info(
++            'Overriding OAUTH2_PROVIDER settings: %s', ', '.join(sorted(overrides))
++        )
++        result.update(overrides)
++
++    return result
++
++
+ def get_config_value(config_key: str) -> Optional[Any]:
+     """Helper function to retrieve a configuration value from the config file."""
+     cfg_data = load_config_data()
+diff --git a/src/backend/InvenTree/InvenTree/settings.py b/src/backend/InvenTree/InvenTree/settings.py
+index fef5fb819..fd33761cd 100644
+--- a/src/backend/InvenTree/InvenTree/settings.py
++++ b/src/backend/InvenTree/InvenTree/settings.py
+@@ -25,7 +25,12 @@ from corsheaders.defaults import default_headers as default_cors_headers
+ 
+ import InvenTree.backup
+ from InvenTree.cache import get_cache_config, is_global_cache_enabled
+-from InvenTree.config import get_boolean_setting, get_oidc_private_key, get_setting
++from InvenTree.config import (
++    get_boolean_setting,
++    get_oidc_private_key,
++    get_setting,
++    merge_oauth2_provider_settings,
++)
+ from InvenTree.ready import isInMainThread, isRunningBackup
+ from InvenTree.sentry import default_sentry_dsn, init_sentry
+ from InvenTree.validators import invalid_site_url_hint
+@@ -1201,6 +1206,13 @@ OAUTH2_PROVIDER = {
+     'OIDC_RSA_PRIVATE_KEY': get_oidc_private_key(),
+     'PKCE_REQUIRED': True,
+ }
++
++# Allow django-oauth-toolkit options to be set via config.yaml / environment
++# e.g. DCR_ENABLED, CIMD_ENABLED, token lifetimes, ALLOW_LOCALHOST_LOOPBACK
++OAUTH2_PROVIDER = merge_oauth2_provider_settings(
++    OAUTH2_PROVIDER,
++    get_setting('INVENTREE_OAUTH2_PROVIDER', 'oauth2_provider', None, typecast=dict),
++)
+ OAUTH2_CHECK_EXCLUDED = [  # This setting mutes schema checks for these rule/method combinations
+     '/api/email/generate/:post',
+     '/api/webhook/{endpoint}/:post',
+diff --git a/src/backend/InvenTree/InvenTree/tests.py b/src/backend/InvenTree/InvenTree/tests.py
+index 7d0ee8350..7c5454f93 100644
+--- a/src/backend/InvenTree/InvenTree/tests.py
++++ b/src/backend/InvenTree/InvenTree/tests.py
+@@ -1469,6 +1469,35 @@ class TestSettings(InvenTreeTestCase):
+         with in_env_context({TEST_ENV_NAME: "{'a': 1}"}):
+             self.assertEqual(config.get_setting(TEST_ENV_NAME, None, typecast=dict), {})
+ 
++    def test_oauth2_provider_override(self):
++        """Test merging of user supplied OAUTH2_PROVIDER options."""
++        base = {'SCOPES': {'a': 'A'}, 'OIDC_ENABLED': True}
++
++        # No overrides: unchanged copy
++        self.assertEqual(config.merge_oauth2_provider_settings(base, None), base)
++        self.assertEqual(config.merge_oauth2_provider_settings(base, {}), base)
++
++        # Core keys are kept unless explicitly overridden
++        with self.assertLogs('inventree', level='INFO') as cm:
++            result = config.merge_oauth2_provider_settings(
++                base, {'DCR_ENABLED': True, 'OIDC_ENABLED': False}
++            )
++        self.assertEqual(
++            result, {'SCOPES': {'a': 'A'}, 'OIDC_ENABLED': False, 'DCR_ENABLED': True}
++        )
++        self.assertIn('DCR_ENABLED, OIDC_ENABLED', ''.join(cm.output))
++        self.assertNotIn('True', ''.join(cm.output))
++
++        # Base dict is not mutated
++        self.assertTrue(base['OIDC_ENABLED'])
++
++        # Values come through get_setting from the environment as JSON
++        with in_env_context({'INVENTREE_OAUTH2_PROVIDER': '{"DCR_ENABLED": true}'}):
++            overrides = config.get_setting(
++                'INVENTREE_OAUTH2_PROVIDER', 'oauth2_provider', None, typecast=dict
++            )
++        self.assertEqual(overrides, {'DCR_ENABLED': True})
++
+     def test_instance_id(self):
+         """Test get_instance_id."""
+         val = get_global_setting('INVENTREE_INSTANCE_ID')
+diff --git a/src/backend/InvenTree/config_template.yaml b/src/backend/InvenTree/config_template.yaml
+index 16981c89f..74d125528 100644
+--- a/src/backend/InvenTree/config_template.yaml
++++ b/src/backend/InvenTree/config_template.yaml
+@@ -222,6 +222,12 @@ remote_login_header: HTTP_REMOTE_USER
+ #   github:
+ #     VERIFIED_EMAIL: true
+ 
++# Override django-oauth-toolkit options (merged into OAUTH2_PROVIDER)
++# Ref: https://django-oauth-toolkit.readthedocs.io/en/latest/settings.html
++# oauth2_provider:
++#   ACCESS_TOKEN_EXPIRE_SECONDS: 3600
++#   ALLOW_LOCALHOST_LOOPBACK: true
++
+ # Add LDAP support (refer to the documentation for available options)
+ # Ref: https://docs.inventree.org/en/stable/start/advanced/#ldap
+ ldap:
+-- 
+2.56.0
+

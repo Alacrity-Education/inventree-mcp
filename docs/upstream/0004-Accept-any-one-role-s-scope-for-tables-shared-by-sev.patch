@@ -1,0 +1,185 @@
+From f6be100035b7cde79aa06232445a9f80789afd2e Mon Sep 17 00:00:00 2001
+From: lucaci32u4 <lucaci32u4@gmail.com>
+Date: Thu, 15 Oct 2026 08:50:27 +0300
+Subject: [PATCH 4/4] Accept any one role's scope for tables shared by several
+ rulesets
+
+map_scope(roles=...) returned a single alternative holding every role's
+scope, so an OAuth2 token needed the scopes of all rulesets a table belongs
+to (part_part: part AND build; company_company: purchase, sales AND return
+order). The role check for the same request
+(users.permissions.check_user_permission) accepts any one of the roles, so a
+token issued with exactly the scopes a role grants could not use that
+role's tables.
+
+Return one alternative per role instead, which TokenMatchesOASRequirements
+treats as OR.
+
+map_scope(roles=...) has three callers, all affected:
+- InvenTreeRoleScopeMixin (every endpoint of a multi-role table);
+- DataImporterPermission (the data importer endpoints: writes needed the
+  r:change scope of all eleven roles, now any one of them; reads keep
+  g:read);
+- ContentTypePermission (GenericMetadataView, the generic metadata
+  endpoints: every method needed the scope of all eleven roles, now any
+  one of them).
+The object-level checks of the last two are unchanged.
+
+The OpenAPI security requirements of these endpoints change (one
+requirement per role), so bump the API version to 558.
+
+Add unit tests for map_scope, the scope check on a multi-role table
+(PartList), ContentTypePermission and DataImporterPermission.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../InvenTree/InvenTree/api_version.py        |  6 +-
+ .../InvenTree/InvenTree/permissions.py        |  5 +-
+ src/backend/InvenTree/InvenTree/tests.py      | 90 +++++++++++++++++++
+ 3 files changed, 98 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/InvenTree/InvenTree/api_version.py b/src/backend/InvenTree/InvenTree/api_version.py
+index 2177d7b84..249dc6e66 100644
+--- a/src/backend/InvenTree/InvenTree/api_version.py
++++ b/src/backend/InvenTree/InvenTree/api_version.py
+@@ -1,11 +1,15 @@
+ """InvenTree API version information."""
+ 
+ # InvenTree API version
+-INVENTREE_API_VERSION = 557
++INVENTREE_API_VERSION = 558
+ """Increment this API version number whenever there is a significant change to the API that any clients need to know about."""
+ 
+ INVENTREE_API_TEXT = """
+ 
++v558 -> 2026-10-15 : https://github.com/inventree/InvenTree/pull/XXXXX
++    - OAuth2 scope requirements of endpoints whose model belongs to several rulesets list one alternative per role (any one role's scope suffices, as for the role check)
++    - The same applies to the data importer endpoints (writes) and the generic metadata endpoints, which previously required the scopes of all roles
++
+ v557 -> 2026-10-15 : https://github.com/inventree/InvenTree/pull/12978
+     - Adds tips endpoints
+ 
+diff --git a/src/backend/InvenTree/InvenTree/permissions.py b/src/backend/InvenTree/InvenTree/permissions.py
+index 807117c21..5e46c44c1 100644
+--- a/src/backend/InvenTree/InvenTree/permissions.py
++++ b/src/backend/InvenTree/InvenTree/permissions.py
+@@ -52,7 +52,7 @@ def map_scope(
+     """Generate the required scopes for OAS permission views.
+ 
+     Args:
+-        roles (Optional[list[str]]): A list of roles or tables to generate granular scopes for.
++        roles (Optional[list[str]]): A list of roles to generate granular scopes for. Any one of them suffices: a table that belongs to several rulesets is accessible with the scope of any of them, as the role check (users.permissions.check_user_permission) accepts any of the roles.
+         only_read (bool): If True, only the read scope will be returned for all actions.
+         read_name (str): The read scope name to use when `only_read` is True.
+         map_read (Optional[list[str]]): A list of HTTP methods that should map to the default read scope (use if some actions requirea differing role).
+@@ -68,7 +68,8 @@ def map_scope(
+         if only_read:
+             return [[read_name]]
+         if roles:
+-            return [[get_granular_scope(action, table) for table in roles]]
++            # One alternative per role (OR), not one alternative with every role (AND)
++            return [[get_granular_scope(action, role)] for role in roles]
+         return [[action]]
+ 
+     def get_scope(method, action):
+diff --git a/src/backend/InvenTree/InvenTree/tests.py b/src/backend/InvenTree/InvenTree/tests.py
+index 7c5454f93..660f9a466 100644
+--- a/src/backend/InvenTree/InvenTree/tests.py
++++ b/src/backend/InvenTree/InvenTree/tests.py
+@@ -2078,3 +2078,93 @@ class InvenTreeAppConfigTests(TestCase):
+ 
+             self.assertEqual(raised.exception.code, 1)
+             self.assertFalse(apps.PRE_1_0_0_CHECK_DONE)
++
++
++class OAuth2ScopeMapTest(TestCase):
++    """Scopes required for tables that belong to several rulesets."""
++
++    @staticmethod
++    def token_passes(scope, method, required):
++        """Whether DOT's TokenMatchesOASRequirements passes a token with *scope*."""
++        from oauth2_provider.contrib.rest_framework import TokenMatchesOASRequirements
++        from oauth2_provider.models import AccessToken
++
++        class Request:
++            def __init__(self):
++                self.method = method
++                self.auth = AccessToken(
++                    scope=scope, expires=timezone.now() + timedelta(hours=1)
++                )
++
++        class View:
++            required_alternate_scopes = required
++
++        return TokenMatchesOASRequirements().has_permission(Request(), View())
++
++    def test_map_scope_any_role(self):
++        """map_scope(roles=...) gives one alternative per role."""
++        from InvenTree.permissions import map_scope
++
++        scopes = map_scope(roles=['part', 'build'])
++        self.assertEqual(scopes['GET'], [['r:view:part'], ['r:view:build']])
++        self.assertEqual(scopes['POST'], [['r:add:part'], ['r:add:build']])
++        self.assertEqual(scopes['PATCH'], [['r:change:part'], ['r:change:build']])
++        self.assertEqual(scopes['DELETE'], [['r:delete:part'], ['r:delete:build']])
++        self.assertEqual(scopes['OPTIONS'], [['g:read']])
++
++        # A single role is unchanged
++        self.assertEqual(map_scope(roles=['stock'])['GET'], [['r:view:stock']])
++
++    def test_multi_role_table_accepts_any_role_scope(self):
++        """A token with the scope of one of the table's roles passes the scope check."""
++        from InvenTree.permissions import InvenTreeRoleScopeMixin, precalculated_roles
++        from part.api import PartList
++
++        # part_part belongs to the 'part' and the 'build' rulesets
++        self.assertEqual(sorted(precalculated_roles['part_part']), ['build', 'part'])
++
++        required = InvenTreeRoleScopeMixin().get_required_alternate_scopes(
++            None, PartList()
++        )
++        self.assertIn(['r:view:part'], required['GET'])
++        self.assertIn(['r:view:build'], required['GET'])
++
++        self.assertTrue(self.token_passes('r:view:part', 'GET', required))
++        self.assertTrue(self.token_passes('r:view:build', 'GET', required))
++        self.assertFalse(self.token_passes('r:view:stock', 'GET', required))
++
++    def test_content_type_permission_accepts_any_role_scope(self):
++        """ContentTypePermission (GenericMetadataView): any one role's scope passes.
++
++        Before, a token needed the scope of all roles. The object-level check
++        (has_object_permission) still applies to the user.
++        """
++        from InvenTree.permissions import ContentTypePermission
++        from users.oauth2_scopes import _roles
++
++        required = ContentTypePermission().get_required_alternate_scopes(None, None)
++        self.assertEqual(required['GET'], [[f'r:view:{role}'] for role in _roles])
++        self.assertEqual(required['PATCH'], [[f'r:change:{role}'] for role in _roles])
++
++        self.assertTrue(self.token_passes('r:view:stock', 'GET', required))
++        self.assertTrue(self.token_passes('r:change:part', 'PATCH', required))
++        self.assertFalse(self.token_passes('g:read', 'GET', required))
++        self.assertFalse(self.token_passes('r:view:part', 'PATCH', required))
++
++    def test_data_importer_permission_accepts_any_role_scope(self):
++        """DataImporterPermission: reads need g:read, writes any one role's change scope."""
++        from InvenTree.permissions import DataImporterPermission
++        from users.oauth2_scopes import _roles
++
++        required = DataImporterPermission().get_required_alternate_scopes(None, None)
++        self.assertEqual(required['GET'], [['g:read']])
++        for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
++            self.assertEqual(
++                required[method], [[f'r:change:{role}'] for role in _roles]
++            )
++
++        self.assertTrue(self.token_passes('g:read', 'GET', required))
++        self.assertTrue(self.token_passes('r:change:part', 'POST', required))
++        self.assertTrue(self.token_passes('r:change:sales_order', 'DELETE', required))
++        self.assertFalse(self.token_passes('r:add:part', 'POST', required))
++        self.assertFalse(self.token_passes('g:read', 'PATCH', required))
+-- 
+2.56.0
+

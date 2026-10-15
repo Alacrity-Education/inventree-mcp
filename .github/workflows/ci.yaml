@@ -1,5 +1,6 @@
 # Ensure that the plugin meets the required style guidelines
-# Ensure that the plugin builds correctly
+# Ensure that the frontend builds and its tests pass
+# Ensure that the plugin builds correctly (with the built frontend bundles)
 # Ensure that the plugin's test suite passes against a real InvenTree instance
 
 name: CI Checks
@@ -16,30 +17,70 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Keep in sync with .pre-commit-config.yaml
+  RUFF_VERSION: "0.16.0"
+
 jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.11
+          python-version: "3.11"
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
       - name: Install Deps
         run: |
-          pip install -U ruff
+          pip install -U "ruff==${RUFF_VERSION}"
           pip install -U wheel setuptools twine build
       - name: Style Checks
         run: |
-          ruff check
+          ruff check --preview inventree_mcp
+          ruff format --preview --check inventree_mcp
+          ruff check --preview --isolated inventree_mcp/tests
+          ruff check --isolated dev/*.py dev/authentik/*.py dev/e2e/*.py
+      - name: Frontend (lint, test, build)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          npm run build
+          npm run check:bundles
+      - name: Upload frontend bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-bundles
+          path: inventree_mcp/static
+          # .vite/manifest.json (hashed bundle names) is a hidden file
+          include-hidden-files: true
+          if-no-files-found: error
       - name: Build Plugin
         run: |
           python -m build
+          # The wheel must ship the templates and the built bundles
+          python - <<'EOF'
+          import glob, sys, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          for needle in ("inventree_mcp/templates/inventree_mcp/consent.html", "inventree_mcp/static/Groups.js"):
+              if needle not in names:
+                  sys.exit(f"missing from wheel: {needle}")
+          print("wheel contents OK")
+          EOF
 
   integration-tests:
     name: "Integration tests (${{ matrix.inventree-tag }})"
     runs-on: ubuntu-latest
+    needs: ci
 
     strategy:
       fail-fast: false
@@ -61,6 +102,8 @@ jobs:
         INVENTREE_PLUGIN_TESTING: True
         INVENTREE_PLUGIN_TESTING_SETUP: True
         INVENTREE_SITE_URL: http://localhost:8000
+        # The membership re-check tests need allauth's OpenID Connect provider installed
+        INVENTREE_SOCIAL_BACKENDS: openid_connect
 
     services:
       db:
@@ -74,7 +117,13 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+
+      - name: Download frontend bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-bundles
+          path: inventree_mcp/static
 
       - name: Setup InvenTree
         run: |
@@ -94,7 +143,7 @@ jobs:
       - name: Run Tests
         run: |
           cd /home/inventree/src/backend
-          HOME=/root python -m coverage run --rcfile="$GITHUB_WORKSPACE/pyproject.toml" InvenTree/manage.py test inventree_mcp.test_mcp
+          HOME=/root python -m coverage run --rcfile="$GITHUB_WORKSPACE/pyproject.toml" InvenTree/manage.py test inventree_mcp
           HOME=/root python -m coverage xml -i --rcfile="$GITHUB_WORKSPACE/pyproject.toml" -o "$GITHUB_WORKSPACE/coverage.xml"
 
       - name: Upload coverage reports to Codecov

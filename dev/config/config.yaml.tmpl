@@ -1,0 +1,16 @@
+# Rendered to dev/data/config.yaml by dev/up.sh with the Authentik client from authentik/bootstrap.py
+# server_url has no trailing slash: allauth appends "/.well-known/openid-configuration" itself
+# allauth provider apps to install (without this, social_providers below is ignored)
+social_backends:
+  - allauth.socialaccount.providers.openid_connect
+
+social_providers:
+  openid_connect:
+    SCOPE: [openid, profile, email, offline_access]
+    APPS:
+      - provider_id: authentik
+        name: Authentik
+        client_id: "@CLIENT_ID@"
+        secret: "@CLIENT_SECRET@"
+        settings:
+          server_url: "@ISSUER@"

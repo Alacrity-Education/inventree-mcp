@@ -9,7 +9,11 @@ mixin that simply advertises nothing when the real one isn't available.
 
 try:
     from plugin.mixins import WellKnownMixin
+
+    #: True when core serves /.well-known/<name>[/...] redirects for plugins.
+    NATIVE_WELL_KNOWN = True
 except ImportError:  # pragma: no cover - only hit on InvenTree < #12698
+    NATIVE_WELL_KNOWN = False
 
     class WellKnownMixin:
         """Blank fallback used when the running InvenTree doesn't provide WellKnownMixin."""
@@ -19,4 +23,4 @@ except ImportError:  # pragma: no cover - only hit on InvenTree < #12698
             return []
 
 
-__all__ = ["WellKnownMixin"]
+__all__ = ["NATIVE_WELL_KNOWN", "WellKnownMixin"]

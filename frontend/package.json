@@ -1,0 +1,38 @@
+{
+  "name": "inventree-mcp-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "lint": "biome check ./src",
+    "lint:fix": "biome check ./src --fix",
+    "test": "vitest run",
+    "build": "tsc -b && vite build --emptyOutDir",
+    "check:bundles": "node scripts/check-bundles.mjs"
+  },
+  "dependencies": {
+    "@inventreedb/ui": "~1.5.0",
+    "@mantine/core": "^9.2.1",
+    "@mantine/hooks": "^9.2.1",
+    "@mantine/notifications": "^9.2.1",
+    "@tabler/icons-react": "^3.44.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.0.0",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/react": "^16.3.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "jsdom": "^26.1.0",
+    "typescript": "~5.6.2",
+    "vite": "^7.0.0",
+    "vite-plugin-externals": "^0.6.2",
+    "vitest": "^3.2.0"
+  },
+  "overrides": {
+    "vite": "^7.0.0"
+  }
+}

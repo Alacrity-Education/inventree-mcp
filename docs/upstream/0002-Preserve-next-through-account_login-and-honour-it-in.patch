@@ -1,0 +1,328 @@
+From 234dcef862683c24b74b3c34e804856bd65cd345 Mon Sep 17 00:00:00 2001
+From: lucaci32u4 <lucaci32u4@gmail.com>
+Date: Thu, 15 Oct 2026 07:22:32 +0300
+Subject: [PATCH] Preserve 'next' through account_login and honour it in the
+ React login flow
+
+Anything built on LoginRequiredMixin (django-oauth-toolkit's authorize view,
+for example) sends anonymous browsers to /accounts/login/?next=... .
+InvenTree redirects that route to the frontend and drops the query string,
+and the React login only honours router state, so such a flow cannot resume
+after the user signs in.
+
+Backend: AccountLoginRedirectView forwards a same-origin 'next' to the
+frontend (url_has_allowed_host_and_scheme) and drops every other parameter,
+in particular the legacy ?login=&password= arguments, which must not end up
+in the frontend URL.
+
+Frontend: sanitizeNextPath() accepts same-origin paths only; getNextPath()
+reads 'next' from the current URL or the router state; followRedirect()
+prefers a valid 'next' (paths under the web base go through the router,
+anything else through window.location.assign); keepNextState() carries
+'next' between /logged-in, /login and /provider-signup; ProviderLogin()
+makes the SSO callback_url /web/logged-in?next=... for the login process.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/backend/InvenTree/InvenTree/test_auth.py  | 26 ++++++
+ src/backend/InvenTree/InvenTree/test_views.py |  3 +-
+ src/backend/InvenTree/InvenTree/urls.py       |  4 +-
+ src/backend/InvenTree/InvenTree/views.py      | 31 +++++++
+ .../src/components/buttons/SSOButton.tsx      |  5 +-
+ src/frontend/src/functions/auth.tsx           | 90 +++++++++++++++++--
+ src/frontend/src/pages/Auth/LoggedIn.tsx      |  4 +-
+ 7 files changed, 151 insertions(+), 12 deletions(-)
+
+diff --git a/src/backend/InvenTree/InvenTree/test_auth.py b/src/backend/InvenTree/InvenTree/test_auth.py
+index 162c5f1a0..29d14cdf2 100644
+--- a/src/backend/InvenTree/InvenTree/test_auth.py
++++ b/src/backend/InvenTree/InvenTree/test_auth.py
+@@ -201,6 +201,32 @@ class TestAuth(InvenTreeAPITestCase):
+     login_url = '/api/auth/v1/auth/login'
+     test_email = 'tester@example.com'
+ 
++    def test_account_login_preserves_next(self):
++        """The legacy account_login redirect forwards a same-origin 'next', nothing else."""
++        self.logout()
++        base = f'/{django_settings.FRONTEND_URL_BASE}'
++
++        response = self.client.get(reverse('account_login'))
++        self.assertEqual(response.status_code, 302)
++        self.assertEqual(response.url, base)
++
++        response = self.client.get(
++            reverse('account_login'), {'next': '/o/authorize/?client_id=abc&state=x'}
++        )
++        self.assertEqual(response.status_code, 302)
++        self.assertTrue(response.url.startswith(f'{base}?next='))
++        self.assertIn('client_id%3Dabc', response.url)
++
++        # Other parameters are dropped, an off-site 'next' is ignored
++        response = self.client.get(
++            reverse('account_login'),
++            {'next': '/api/', 'login': 'someone', 'password': 'secret'},
++        )
++        self.assertEqual(response.url, f'{base}?next=%2Fapi%2F')
++        for unsafe in ('https://evil.example/', '//evil.example/', 'javascript:x'):
++            response = self.client.get(reverse('account_login'), {'next': unsafe})
++            self.assertEqual(response.url, base, unsafe)
++
+     def test_buildin_token(self):
+         """Test the built-in token authentication."""
+         self.logout()
+diff --git a/src/backend/InvenTree/InvenTree/test_views.py b/src/backend/InvenTree/InvenTree/test_views.py
+index d135a57e5..2e9f3aeeb 100644
+--- a/src/backend/InvenTree/InvenTree/test_views.py
++++ b/src/backend/InvenTree/InvenTree/test_views.py
+@@ -53,4 +53,5 @@ class ViewTests(InvenTreeTestCase):
+             f'/accounts/login/?next=/&login={self.username}&password={self.password}'
+         )
+         self.assertEqual(response.status_code, 302)
+-        self.assertEqual(response.url, '/web')
++        # 'next' is forwarded to the frontend, the credentials are not
++        self.assertEqual(response.url, '/web?next=%2F')
+diff --git a/src/backend/InvenTree/InvenTree/urls.py b/src/backend/InvenTree/InvenTree/urls.py
+index 02f0f5110..d54b0db79 100644
+--- a/src/backend/InvenTree/InvenTree/urls.py
++++ b/src/backend/InvenTree/InvenTree/urls.py
+@@ -43,7 +43,7 @@ from .api import (
+ )
+ from .config import get_setting
+ from .magic_login import GetSimpleLoginView
+-from .views import auth_request
++from .views import AccountLoginRedirectView, auth_request
+ 
+ # Set admin header from config or use default
+ admin.site.site_header = get_setting(
+@@ -142,7 +142,7 @@ backendpatterns = [
+     path('scim/v2/', include(scim.api)),
+     path(
+         'accounts/login/',
+-        RedirectView.as_view(url=f'/{settings.FRONTEND_URL_BASE}', permanent=False),
++        AccountLoginRedirectView.as_view(),  # forwards a same-origin 'next' only
+         name='account_login',
+     ),  # Add a redirect for login views
+     path('anymail/', include('anymail.urls')),  # Emails
+diff --git a/src/backend/InvenTree/InvenTree/views.py b/src/backend/InvenTree/InvenTree/views.py
+index 116404222..918f16669 100644
+--- a/src/backend/InvenTree/InvenTree/views.py
++++ b/src/backend/InvenTree/InvenTree/views.py
+@@ -4,7 +4,38 @@ In particular these views provide base functionality for rendering Django forms
+ as JSON objects and passing them to modal forms (using jQuery / bootstrap).
+ """
+ 
++from urllib.parse import urlencode
++
++from django.conf import settings
+ from django.http import HttpResponse
++from django.utils.http import url_has_allowed_host_and_scheme
++from django.views.generic.base import RedirectView
++
++
++class AccountLoginRedirectView(RedirectView):
++    """Redirect the legacy 'accounts/login/' URL to the frontend login.
++
++    Anything built on LoginRequiredMixin (the OAuth2 authorize view, for
++    example) sends anonymous browsers here with a 'next' parameter. Only a
++    same-origin 'next' is forwarded; every other parameter (such as the
++    legacy ?login=&password= arguments) is dropped.
++    """
++
++    permanent = False
++
++    def get_redirect_url(self, *args, **kwargs):
++        """The frontend base URL, with a validated 'next' when one was given."""
++        url = f'/{settings.FRONTEND_URL_BASE}'
++        next_url = self.request.GET.get('next')
++
++        if next_url and url_has_allowed_host_and_scheme(
++            next_url,
++            allowed_hosts={self.request.get_host()},
++            require_https=self.request.is_secure(),
++        ):
++            url = f'{url}?{urlencode({"next": next_url})}'
++
++        return url
+ 
+ 
+ def auth_request(request):
+diff --git a/src/frontend/src/components/buttons/SSOButton.tsx b/src/frontend/src/components/buttons/SSOButton.tsx
+index aaa7c983c..5d1438ad9 100644
+--- a/src/frontend/src/components/buttons/SSOButton.tsx
++++ b/src/frontend/src/components/buttons/SSOButton.tsx
+@@ -19,6 +19,7 @@ import { t } from '@lingui/core/macro';
+ import { ProviderLogin } from '../../functions/auth';
+ 
+ import type { JSX } from 'react';
++import { useLocation } from 'react-router-dom';
+ 
+ const brandIcons: { [key: string]: JSX.Element } = {
+   google: <IconBrandGoogle />,
+@@ -39,6 +40,8 @@ function getBrandIcon(provider: AuthProvider) {
+ }
+ 
+ export function SsoButton({ provider }: Readonly<{ provider: AuthProvider }>) {
++  const location = useLocation();
++
+   return (
+     <Tooltip
+       label={t`You will be redirected to the provider for further actions.`}
+@@ -46,7 +49,7 @@ export function SsoButton({ provider }: Readonly<{ provider: AuthProvider }>) {
+       <Button
+         leftSection={getBrandIcon(provider)}
+         radius='xl'
+-        onClick={() => ProviderLogin(provider)}
++        onClick={() => ProviderLogin(provider, 'login', location?.state)}
+       >
+         {provider.name}
+       </Button>
+diff --git a/src/frontend/src/functions/auth.tsx b/src/frontend/src/functions/auth.tsx
+index c9ef72dec..886344713 100644
+--- a/src/frontend/src/functions/auth.tsx
++++ b/src/frontend/src/functions/auth.tsx
+@@ -15,7 +15,80 @@ import { fetchGlobalStates, resetGlobalStatesFetched } from '../states/states';
+ import { showLoginNotification } from './notifications';
+ import { generateUrl } from './urls';
+ 
++/**
++ * Validate a user-supplied 'next' target.
++ *
++ * Only same-origin paths are accepted: the value must start with a single '/'
++ * (no '//' or '/\\' prefix, which browsers treat as a different host) and must
++ * still resolve to this origin once parsed. Returns the normalized
++ * path (including query and hash), or null if the value is not acceptable.
++ */
++export function sanitizeNextPath(value: unknown): string | null {
++  if (typeof value !== 'string' || !value.startsWith('/')) return null;
++  if (value.startsWith('//') || value.startsWith('/\\')) return null;
++
++  try {
++    const parsed = new URL(value, window.location.origin);
++    if (parsed.origin !== window.location.origin) return null;
++
++    // Normalization (e.g. '/..//host') can produce a protocol-relative path
++    const result = `${parsed.pathname}${parsed.search}${parsed.hash}`;
++    if (result.startsWith('//') || result.startsWith('/\\')) return null;
++    return result;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * Find a 'next' target for the post-login redirect.
++ *
++ * It may be present in the current URL (e.g. /web/login?next=..., or
++ * /web/logged-in?next=... after SSO), or have been carried through the router
++ * state as 'queryParams' (e.g. /accounts/login/?next=... redirects to /web/?next=...,
++ * which ProtectedRoute forwards to the login flow).
++ */
++export function getNextPath(redirect?: any): string | null {
++  const sources = [window.location.search, redirect?.queryParams ?? ''];
++
++  for (const source of sources) {
++    try {
++      const next = sanitizeNextPath(new URLSearchParams(source).get('next'));
++      if (next) return next;
++    } catch {
++      // ignore malformed query parameters
++    }
++  }
++
++  return null;
++}
++
++/**
++ * Return router state which keeps any 'next' target, for navigating between login pages
++ */
++export function keepNextState(redirect?: any) {
++  const next = getNextPath(redirect);
++  if (!next) return redirect;
++  return { ...redirect, queryParams: { next } };
++}
++
+ export function followRedirect(navigate: NavigateFunction, redirect: any) {
++  // A 'next' target (e.g. from the OAuth2 authorize view) takes precedence
++  const next = getNextPath(redirect);
++
++  if (next) {
++    const base = `/${getBaseUrl()}`;
++
++    if (next === base || next.startsWith(`${base}/`)) {
++      // Inside the React app: use the router
++      navigate(next.slice(base.length) || '/');
++    } else {
++      // Outside the React app (server rendered page): leave the SPA
++      window.location.assign(next);
++    }
++    return;
++  }
++
+   let url = redirect?.redirectUrl ?? '/home';
+ 
+   if (redirect?.queryParams) {
+@@ -488,7 +561,7 @@ export const checkLoginState = async (
+     );
+ 
+     navigate(providerSignupPending ? '/provider-signup' : '/login', {
+-      state: redirect
++      state: keepNextState(redirect)
+     });
+   }
+   setLoginChecked(true);
+@@ -549,9 +622,17 @@ export function clearCsrfCookie() {
+ 
+ export async function ProviderLogin(
+   provider: AuthProvider,
+-  process: 'login' | 'connect' = 'login'
++  process: 'login' | 'connect' = 'login',
++  redirect?: any
+ ) {
+   await ensureCsrf();
++
++  // Carry any 'next' target through the provider round trip
++  const next = process === 'login' ? getNextPath(redirect) : null;
++  const callback = `/${getBaseUrl()}/logged-in${
++    next ? `?${new URLSearchParams({ next }).toString()}` : ''
++  }`;
++
+   post(generateUrl(apiUrl(ApiEndpoints.auth_provider_redirect)), {
+     provider: provider.id,
+     // Return to wherever this page is actually being served from, not the
+@@ -561,10 +642,7 @@ export async function ProviderLogin(
+     // back in server-side by Django's compatibility redirect for bare
+     // (non-API-host) paths, which only exists on the Django side - so add
+     // it explicitly rather than relying on that.
+-    callback_url: generateUrl(
+-      `/${getBaseUrl()}/logged-in`,
+-      window.location.origin
+-    ),
++    callback_url: generateUrl(callback, window.location.origin),
+     process: process,
+     csrfmiddlewaretoken: getCsrfCookie()
+   });
+diff --git a/src/frontend/src/pages/Auth/LoggedIn.tsx b/src/frontend/src/pages/Auth/LoggedIn.tsx
+index 8bae4d78a..6235f5b42 100644
+--- a/src/frontend/src/pages/Auth/LoggedIn.tsx
++++ b/src/frontend/src/pages/Auth/LoggedIn.tsx
+@@ -2,7 +2,7 @@ import { t } from '@lingui/core/macro';
+ import { useEffect } from 'react';
+ import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+ 
+-import { checkLoginState } from '../../functions/auth';
++import { checkLoginState, keepNextState } from '../../functions/auth';
+ import { showLoginNotification } from '../../functions/notifications';
+ import { Wrapper } from './Layout';
+ 
+@@ -41,7 +41,7 @@ export default function Logged_In() {
+         message: ssoErrorMessage(error),
+         success: false
+       });
+-      navigate('/login', { state: location?.state });
++      navigate('/login', { state: keepNextState(location?.state) });
+       return;
+     }
+ 
+-- 
+2.56.0
+

@@ -9,9 +9,12 @@ doesn't include plugin URLs - an OAuth2 bearer token would otherwise never
 even reach this view (verified: /api/part/ accepts it, this endpoint 401s
 before dispatch() runs at all). We gate on REQUIRE_AUTH ourselves, then bind
 the authenticated identity into the MCP request context (see context.py) so
-tools can act as that user - and, for OAuth2 requests, under that token's
-actual granted scopes, not just the user's role permissions - via
-proxy.call_view(). This is what makes per-tool permission enforcement
+tools can act as that user - and under the user's current MCP scopes
+(policy.connect_scopes()), not just the user's role permissions - via
+proxy.call_view(): an OAuth2 token is bound cut to its granted scopes ∩ those
+scopes (narrowed_oauth_token()), an API token or Basic credential as an
+unsaved token carrying them (scoped_token_for()). The request's resolved host,
+scheme and client address go along (request_meta()) for the proxied requests. This is what makes per-tool permission enforcement
 possible, instead of trusting "authenticated = allowed to do anything" as a
 single plugin-wide bypass.
 
@@ -31,20 +34,27 @@ SessionAuthentication.authenticate() ran, purely from that middleware.
 from __future__ import annotations
 
 import asyncio
+import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from asgiref.sync import async_to_sync
+from django.core.cache import cache
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.urls import path
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from InvenTree.permissions import auth_exempt
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from oauth2_provider.contrib.rest_framework.authentication import OAuth2Authentication
+from oauth2_provider.models import get_access_token_model
 from rest_framework import exceptions
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.views import APIView
 from users.authentication import ApiTokenAuthentication, ExtendedOAuth2Authentication
 
+from .auth import membership, policy
+from .auth.discovery import REALM, challenge_header
 from .context import reset_current_user, set_current_user
 from .mcp_server import mcp
 from .settings import get_plugin_setting
@@ -54,7 +64,14 @@ if TYPE_CHECKING:
 
     from starlette.types import Scope
 
+logger = logging.getLogger("inventree")
+
 _REQUEST_TIMEOUT_SECONDS = 60.0
+
+#: Lifetime of the synthetic scoped token of an API-token / Basic request. It is
+#: never saved and lives only for the one request; the value only has to
+#: outlast it (DOT's is_expired() is part of the scope check).
+_SCOPED_TOKEN_LIFETIME = timedelta(days=1)
 
 # Hop-by-hop headers (RFC 7230 6.1) that must never be forwarded from the
 # ASGI response onto the Django HttpResponse - WSGI servers (e.g. the stdlib
@@ -156,6 +173,137 @@ def _error_response(status: int, message: str) -> JsonResponse:
     )
 
 
+def _auth_error_response(
+    request: HttpRequest, status: int, message: str
+) -> JsonResponse:
+    """_error_response() plus, for a 401, the RFC 6750 / RFC 9728 Bearer challenge.
+
+    The challenge's resource_metadata is how an MCP client discovers the OAuth
+    façade (see auth/discovery.py); error="invalid_token" marks a request that
+    presented a credential.
+    """
+    response = _error_response(status, message)
+    if status == 401:
+        response["WWW-Authenticate"] = challenge_header(
+            request, invalid_token=bool(request.META.get("HTTP_AUTHORIZATION"))
+        )
+    return response
+
+
+#: Messages of the long-lived credential refusals (membership.long_lived_credential_allowed()).
+_LONG_LIVED_REFUSALS = {
+    "unreachable_past_grace": (
+        "MCP access suspended: group membership could not be confirmed with the "
+        "identity provider for too long. Try again later or sign in to InvenTree again."
+    ),
+    "relogin_required": (
+        "MCP access suspended: sign in to InvenTree again to keep using this credential."
+    ),
+}
+
+
+def _long_lived_refusal(reason: str) -> JsonResponse:
+    """401 for an API token / Basic credential past the grace or re-login window.
+
+    The challenge is the bare realm: the credential itself is valid (no
+    error="invalid_token") and an OAuth flow is not what fixes it.
+    """
+    response = _error_response(
+        401, _LONG_LIVED_REFUSALS.get(reason, "MCP access suspended.")
+    )
+    response["WWW-Authenticate"] = f'Bearer realm="{REALM}"'
+    return response
+
+
+def _queue_membership_recheck(user) -> None:
+    """Queue a background membership re-check for a long-lived credential (ApiToken, Basic).
+
+    OAuth access tokens are short-lived and re-checked at refresh; ApiTokens
+    and passwords are not, so their requests queue tasks.recheck_user when the
+    last check is stale. Never makes the request wait; a short cache marker
+    keeps a burst of requests from queueing (and de-duplicating) repeatedly.
+    After a NO_UPSTREAM_TOKEN outcome membership.recheck() holds the same
+    marker for the whole re-check interval. Without InvenTree's global cache
+    (Redis) the marker is per process.
+    """
+    try:
+        if not membership.recheck_due(user):
+            return
+        if not cache.add(
+            membership.recheck_queued_key(user.pk),
+            True,
+            membership.RECHECK_QUEUED_SECONDS,
+        ):
+            return
+        from InvenTree.tasks import offload_task
+
+        offload_task(
+            "inventree_mcp.auth.tasks.recheck_user",
+            user.pk,
+            force_async=True,
+            check_duplicates=True,
+        )
+    except Exception:  # a re-check must never fail an MCP request (logged below)
+        logger.warning(
+            "inventree-mcp: could not queue a membership re-check for user id %s",
+            user.pk,
+            exc_info=True,
+        )
+
+
+def scoped_token_for(user, scopes=None):
+    """An unsaved DOT AccessToken carrying *user*'s MCP scopes (policy.narrow(None, user)).
+
+    Bound as the identity's oauth2_token for API-token and Basic requests, so
+    proxied views enforce the MCP rulesets exactly as for an OAuth token.
+    Never saved: no token value, no application, nothing to revoke or leak.
+    *scopes* (policy.connect_scopes()'s list) saves recomputing them.
+    """
+    if scopes is None:
+        scopes = policy.narrow(None, user)
+    return get_access_token_model()(
+        user=user,
+        scope=" ".join(scopes),
+        expires=timezone.now() + _SCOPED_TOKEN_LIFETIME,
+    )
+
+
+def narrowed_oauth_token(token, user, scopes):
+    """An unsaved AccessToken: the presented OAuth *token*'s scopes ∩ *scopes*, same expiry.
+
+    Every OAuth token on /mcp is cut to the user's current MCP scopes, not
+    only the façade's (narrowed at authorize and refresh): core's /o/
+    endpoints issue tokens of any application with any scope, and a group
+    membership or ruleset change since issue takes effect at the next
+    request. An empty intersection leaves an empty scope (the caller answers
+    403). Like scoped_token_for(), never saved.
+    """
+    allowed = set(scopes)
+    return get_access_token_model()(
+        user=user,
+        scope=" ".join(s for s in (token.scope or "").split() if s in allowed),
+        expires=token.expires,
+    )
+
+
+def request_meta(request: HttpRequest) -> dict[str, str]:
+    """The WSGI environ entries proxied requests inherit (context._Identity.request_meta).
+
+    Resolved values: get_host() has validated the host against ALLOWED_HOSTS
+    and applied USE_X_FORWARDED_HOST, is_secure() SECURE_PROXY_SSL_HEADER;
+    the raw X-Forwarded-* headers are not passed on. No credentials, cookies
+    or CSRF headers (the bridge supplies authentication).
+    """
+    meta = {
+        "HTTP_HOST": request.get_host(),
+        "wsgi.url_scheme": "https" if request.is_secure() else "http",
+        "REMOTE_ADDR": request.META.get("REMOTE_ADDR", "127.0.0.1"),
+    }
+    if request.META.get("HTTP_ACCEPT_LANGUAGE"):
+        meta["HTTP_ACCEPT_LANGUAGE"] = request.META["HTTP_ACCEPT_LANGUAGE"]
+    return meta
+
+
 class MCPView(APIView):
     """DRF view handling MCP Streamable HTTP transport requests.
 
@@ -173,6 +321,15 @@ class MCPView(APIView):
     ]
     permission_classes: ClassVar[list] = []
 
+    def get_authenticators(self):
+        """The authenticators above; BasicAuthentication only with MCP_ALLOW_BASIC_AUTH."""
+        allow_basic = get_plugin_setting("MCP_ALLOW_BASIC_AUTH", False)
+        return [
+            auth()
+            for auth in self.authentication_classes
+            if allow_basic or auth is not BasicAuthentication
+        ]
+
     def dispatch(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
         # Force Django to cache the raw body now, before initialize_request()
         # wraps it in a DRF Request - DRF's own body/stream handling during
@@ -188,12 +345,15 @@ class MCPView(APIView):
         try:
             self.perform_authentication(drf_request)
         except exceptions.APIException as exc:
-            return _error_response(getattr(exc, "status_code", 401), str(exc))
+            return _auth_error_response(
+                request, getattr(exc, "status_code", 401), str(exc)
+            )
 
         user = drf_request.user
 
         if get_plugin_setting("REQUIRE_AUTH") and not (user and user.is_authenticated):
-            return _error_response(
+            return _auth_error_response(
+                request,
                 401,
                 "Authentication required. Provide a valid Token, Bearer, or Basic credential.",
             )
@@ -201,7 +361,39 @@ class MCPView(APIView):
         is_oauth2 = isinstance(
             drf_request.successful_authenticator, OAuth2Authentication
         )
-        token = set_current_user(user, drf_request.auth if is_oauth2 else None)
+
+        oauth2_token = None
+        if user is not None and user.is_authenticated:
+            # may_connect() and the user's MCP scopes in one pass.
+            ok, reason, scopes = policy.connect_scopes(user)
+            if not ok:
+                if reason == "blocked":
+                    return _auth_error_response(
+                        request, 401, "Access revoked, sign in to InvenTree again."
+                    )
+                # inactive / no_mcp_permission: the credential itself is valid.
+                return _error_response(403, "No MCP permission")
+            if is_oauth2:
+                oauth2_token = narrowed_oauth_token(drf_request.auth, user, scopes)
+            else:
+                # Queued before the window check: once the provider is back, the
+                # background re-check is what lets this credential in again.
+                _queue_membership_recheck(user)
+                allowed, why = membership.long_lived_credential_allowed(user)
+                if not allowed:
+                    logger.info(
+                        "inventree-mcp: long-lived credential refused (%s) for user id %s",
+                        why,
+                        user.pk,
+                    )
+                    return _long_lived_refusal(why)
+                # API token / Basic: narrowed like an OAuth token (module docstring).
+                oauth2_token = scoped_token_for(user, scopes)
+            if not oauth2_token.scope:
+                # An OAuth token holding none of the user's MCP scopes.
+                return _error_response(403, "No MCP permission")
+
+        token = set_current_user(user, oauth2_token, request_meta(request))
         try:
             # async_to_sync (rather than a hand-rolled event loop) is what lets
             # proxy.call_view()'s sync_to_async(thread_sensitive=True) route
@@ -217,6 +409,12 @@ class MCPView(APIView):
             reset_current_user(token)
 
 
+_mcp_view = csrf_exempt(auth_exempt(MCPView.as_view()))
+
 urlpatterns = [
-    path("mcp/", csrf_exempt(auth_exempt(MCPView.as_view())), name="mcp-endpoint")
+    path("mcp/", _mcp_view, name="mcp-endpoint"),
+    # Some MCP clients (Claude Code) drop the trailing slash of the configured
+    # URL; without this alias their POST misses the view (no APPEND_SLASH
+    # redirect for POST) and gets InvenTree's bare 401 without the OAuth challenge.
+    path("mcp", _mcp_view, name="mcp-endpoint-noslash"),
 ]
