@@ -38,7 +38,7 @@ Each applies cleanly (`git apply --check` and `git am`) on a fresh checkout of `
 **Motivation.** django-oauth-toolkit's authorize view (and anything using `LoginRequiredMixin`) sends anonymous browsers to `/accounts/login/?next=...`. InvenTree maps that route (`account_login`) to a `RedirectView` that drops the query string, and the React login only honours router state, so the OAuth flow cannot resume after login.
 
 **What it changes.**
-- `InvenTree/urls.py`: `RedirectView.as_view(..., query_string=True)` on `account_login`. Test `test_auth.py::TestAuth::test_account_login_preserves_next`.
+- `InvenTree/views.py`: `AccountLoginRedirectView` replaces the plain `RedirectView` on `account_login` (`InvenTree/urls.py`): a same-origin `next` (`url_has_allowed_host_and_scheme`) is forwarded as `/<web>?next=...`, every other parameter is dropped, in particular the legacy `?login=&password=` arguments (a first version forwarded the whole query string and broke core's `test_views.py::test_url_login`, which now expects `/web?next=%2F`). Tests: `test_auth.py::TestAuth::test_account_login_preserves_next` (forwarded, dropped, off-site `next` ignored).
 - `src/frontend/src/functions/auth.tsx`:
   - `sanitizeNextPath()`: accepts only same-origin paths; rejects absolute URLs to other hosts, `//` and `/\` prefixes, scheme URLs, and values that normalize to a protocol-relative path (e.g. `/..//evil.com`).
   - `getNextPath(redirect)`: reads `next` from the current URL (`/web/login?next=`, `/web/logged-in?next=`) or from the router state's `queryParams` (the `/accounts/login/?next=` -> `/web/?next=` -> `ProtectedRoute` -> `/logged-in` path already carries the query string there).
@@ -123,7 +123,7 @@ one alternative holding every role's scope (an AND; the loop variable was even n
 
 **Plugin side.** `auth/signals.py` no longer relies on the cascade at all: the Group and User `pre_delete` receivers delete the plugin's rows themselves (`tests/test_policy.py::DeletionCleanupTest` hides the relation the way the stale cache does). The plugin's test package also disables the purge for the test run (`tests/__init__.py`), because every `unittest.mock.patch` target misses once the test modules and the code under test hold different module objects; that is a test-ergonomics concern worth raising with the PR (core's own regression test for #13007 relies on the purge, so a plain `PLUGIN_TESTING` gate is not the answer).
 
-**Verification performed.** The regression test and `plugin.test_plugin` were run in the `inventree/inventree:latest` image (`dev/test-image.sh`), with the fix (pass) and without (the new test fails). Also NOT run: the rest of core's suite; the fork's QC workflow runs it on the stacked branch.
+**Verification performed.** In the `inventree/inventree:latest` image (`dev/test-image.sh`): the regression test fails without the fix (`'relation_test_notes' not found in [...]`) and passes with it; `plugin.test_plugin` passes apart from the two mandatory-plugin counts, which the image's extra `inventree-mcp` plugin shifts by one. The temp plugin imports its models from the plugin module, as this plugin does through its API views: that is what moves the model registration to collect time after a purge. The fork's QC workflow runs the rest of core's suite on the stacked branch.
 
 ---
 

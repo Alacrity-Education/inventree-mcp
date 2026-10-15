@@ -6,7 +6,7 @@ Anything built on `LoginRequiredMixin`, including django-oauth-toolkit's authori
 
 ## Changes
 
-- `InvenTree/urls.py`: `RedirectView.as_view(..., query_string=True)` on `account_login`.
+- `InvenTree/views.py`: `AccountLoginRedirectView` on `account_login` (`InvenTree/urls.py`) forwards a same-origin `next` (`url_has_allowed_host_and_scheme`) as `/<web>?next=...` and drops every other parameter, in particular the legacy `?login=&password=` arguments.
 - `src/frontend/src/functions/auth.tsx`:
   - `sanitizeNextPath()`: accepts same-origin paths only; rejects absolute URLs to other hosts, `//` and `/\` prefixes, scheme URLs and values that normalise to a protocol-relative path (`/..//evil.com`).
   - `getNextPath(redirect)`: reads `next` from the current URL (`/web/login?next=`, `/web/logged-in?next=`) or from the router state's `queryParams`.
@@ -17,7 +17,8 @@ Anything built on `LoginRequiredMixin`, including django-oauth-toolkit's authori
 
 ## Tests
 
-- `InvenTree/test_auth.py::TestAuth::test_account_login_preserves_next`.
+- `InvenTree/test_auth.py::TestAuth::test_account_login_preserves_next`: forwarded, other parameters dropped, off-site `next` ignored.
+- `InvenTree/test_views.py::test_url_login` now expects `/web?next=%2F` (the credentials are no longer part of the redirect, `next` is).
 - The sanitiser was exercised against `//evil.com`, `/\evil.com`, `https://evil.com`, `javascript:`, `/..//evil.com`, tab-injected and normal paths.
 - CI on the fork (`Alacrity-Education/InvenTree`, branch `upstream-patches`): see the PR checks.
 - Not yet included: a Playwright test for the `next` flow. Happy to add one if you want it in this PR.

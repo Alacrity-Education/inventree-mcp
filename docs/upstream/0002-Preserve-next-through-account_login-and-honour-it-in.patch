@@ -1,35 +1,48 @@
-From ef30e25691ae19c8e388f5d0bcc77f957940bb58 Mon Sep 17 00:00:00 2001
+From 234dcef862683c24b74b3c34e804856bd65cd345 Mon Sep 17 00:00:00 2001
 From: lucaci32u4 <lucaci32u4@gmail.com>
 Date: Thu, 15 Oct 2026 07:22:32 +0300
-Subject: [PATCH 2/4] Preserve 'next' through account_login and honour it in
- the React login flow
+Subject: [PATCH] Preserve 'next' through account_login and honour it in the
+ React login flow
 
-The legacy account_login route redirected to the frontend and dropped the
-query string, so views using LoginRequiredMixin (e.g. the django-oauth-toolkit
-authorize view) lost their 'next' target. Pass the query string through and
-make the login flow (password, SSO, already-logged-in) follow a same-origin
-'next' path: via the router when inside the React app, via
-window.location.assign otherwise.
+Anything built on LoginRequiredMixin (django-oauth-toolkit's authorize view,
+for example) sends anonymous browsers to /accounts/login/?next=... .
+InvenTree redirects that route to the frontend and drops the query string,
+and the React login only honours router state, so such a flow cannot resume
+after the user signs in.
 
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Backend: AccountLoginRedirectView forwards a same-origin 'next' to the
+frontend (url_has_allowed_host_and_scheme) and drops every other parameter,
+in particular the legacy ?login=&password= arguments, which must not end up
+in the frontend URL.
+
+Frontend: sanitizeNextPath() accepts same-origin paths only; getNextPath()
+reads 'next' from the current URL or the router state; followRedirect()
+prefers a valid 'next' (paths under the web base go through the router,
+anything else through window.location.assign); keepNextState() carries
+'next' between /logged-in, /login and /provider-signup; ProviderLogin()
+makes the SSO callback_url /web/logged-in?next=... for the login process.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
- src/backend/InvenTree/InvenTree/test_auth.py  | 16 ++++
- src/backend/InvenTree/InvenTree/urls.py       |  6 +-
+ src/backend/InvenTree/InvenTree/test_auth.py  | 26 ++++++
+ src/backend/InvenTree/InvenTree/test_views.py |  3 +-
+ src/backend/InvenTree/InvenTree/urls.py       |  4 +-
+ src/backend/InvenTree/InvenTree/views.py      | 31 +++++++
  .../src/components/buttons/SSOButton.tsx      |  5 +-
  src/frontend/src/functions/auth.tsx           | 90 +++++++++++++++++--
  src/frontend/src/pages/Auth/LoggedIn.tsx      |  4 +-
- 5 files changed, 111 insertions(+), 10 deletions(-)
+ 7 files changed, 151 insertions(+), 12 deletions(-)
 
 diff --git a/src/backend/InvenTree/InvenTree/test_auth.py b/src/backend/InvenTree/InvenTree/test_auth.py
-index 162c5f1a0..865933495 100644
+index 162c5f1a0..29d14cdf2 100644
 --- a/src/backend/InvenTree/InvenTree/test_auth.py
 +++ b/src/backend/InvenTree/InvenTree/test_auth.py
-@@ -201,6 +201,22 @@ class TestAuth(InvenTreeAPITestCase):
+@@ -201,6 +201,32 @@ class TestAuth(InvenTreeAPITestCase):
      login_url = '/api/auth/v1/auth/login'
      test_email = 'tester@example.com'
  
 +    def test_account_login_preserves_next(self):
-+        """The legacy account_login redirect must keep the query string ('next')."""
++        """The legacy account_login redirect forwards a same-origin 'next', nothing else."""
 +        self.logout()
 +        base = f'/{django_settings.FRONTEND_URL_BASE}'
 +
@@ -44,26 +57,95 @@ index 162c5f1a0..865933495 100644
 +        self.assertTrue(response.url.startswith(f'{base}?next='))
 +        self.assertIn('client_id%3Dabc', response.url)
 +
++        # Other parameters are dropped, an off-site 'next' is ignored
++        response = self.client.get(
++            reverse('account_login'),
++            {'next': '/api/', 'login': 'someone', 'password': 'secret'},
++        )
++        self.assertEqual(response.url, f'{base}?next=%2Fapi%2F')
++        for unsafe in ('https://evil.example/', '//evil.example/', 'javascript:x'):
++            response = self.client.get(reverse('account_login'), {'next': unsafe})
++            self.assertEqual(response.url, base, unsafe)
++
      def test_buildin_token(self):
          """Test the built-in token authentication."""
          self.logout()
+diff --git a/src/backend/InvenTree/InvenTree/test_views.py b/src/backend/InvenTree/InvenTree/test_views.py
+index d135a57e5..2e9f3aeeb 100644
+--- a/src/backend/InvenTree/InvenTree/test_views.py
++++ b/src/backend/InvenTree/InvenTree/test_views.py
+@@ -53,4 +53,5 @@ class ViewTests(InvenTreeTestCase):
+             f'/accounts/login/?next=/&login={self.username}&password={self.password}'
+         )
+         self.assertEqual(response.status_code, 302)
+-        self.assertEqual(response.url, '/web')
++        # 'next' is forwarded to the frontend, the credentials are not
++        self.assertEqual(response.url, '/web?next=%2F')
 diff --git a/src/backend/InvenTree/InvenTree/urls.py b/src/backend/InvenTree/InvenTree/urls.py
-index 02f0f5110..a68b0bb23 100644
+index 02f0f5110..d54b0db79 100644
 --- a/src/backend/InvenTree/InvenTree/urls.py
 +++ b/src/backend/InvenTree/InvenTree/urls.py
-@@ -142,7 +142,11 @@ backendpatterns = [
+@@ -43,7 +43,7 @@ from .api import (
+ )
+ from .config import get_setting
+ from .magic_login import GetSimpleLoginView
+-from .views import auth_request
++from .views import AccountLoginRedirectView, auth_request
+ 
+ # Set admin header from config or use default
+ admin.site.site_header = get_setting(
+@@ -142,7 +142,7 @@ backendpatterns = [
      path('scim/v2/', include(scim.api)),
      path(
          'accounts/login/',
 -        RedirectView.as_view(url=f'/{settings.FRONTEND_URL_BASE}', permanent=False),
-+        RedirectView.as_view(
-+            url=f'/{settings.FRONTEND_URL_BASE}',
-+            permanent=False,
-+            query_string=True,  # preserve 'next' (e.g. for the OAuth2 authorize view)
-+        ),
++        AccountLoginRedirectView.as_view(),  # forwards a same-origin 'next' only
          name='account_login',
      ),  # Add a redirect for login views
      path('anymail/', include('anymail.urls')),  # Emails
+diff --git a/src/backend/InvenTree/InvenTree/views.py b/src/backend/InvenTree/InvenTree/views.py
+index 116404222..918f16669 100644
+--- a/src/backend/InvenTree/InvenTree/views.py
++++ b/src/backend/InvenTree/InvenTree/views.py
+@@ -4,7 +4,38 @@ In particular these views provide base functionality for rendering Django forms
+ as JSON objects and passing them to modal forms (using jQuery / bootstrap).
+ """
+ 
++from urllib.parse import urlencode
++
++from django.conf import settings
+ from django.http import HttpResponse
++from django.utils.http import url_has_allowed_host_and_scheme
++from django.views.generic.base import RedirectView
++
++
++class AccountLoginRedirectView(RedirectView):
++    """Redirect the legacy 'accounts/login/' URL to the frontend login.
++
++    Anything built on LoginRequiredMixin (the OAuth2 authorize view, for
++    example) sends anonymous browsers here with a 'next' parameter. Only a
++    same-origin 'next' is forwarded; every other parameter (such as the
++    legacy ?login=&password= arguments) is dropped.
++    """
++
++    permanent = False
++
++    def get_redirect_url(self, *args, **kwargs):
++        """The frontend base URL, with a validated 'next' when one was given."""
++        url = f'/{settings.FRONTEND_URL_BASE}'
++        next_url = self.request.GET.get('next')
++
++        if next_url and url_has_allowed_host_and_scheme(
++            next_url,
++            allowed_hosts={self.request.get_host()},
++            require_https=self.request.is_secure(),
++        ):
++            url = f'{url}?{urlencode({"next": next_url})}'
++
++        return url
+ 
+ 
+ def auth_request(request):
 diff --git a/src/frontend/src/components/buttons/SSOButton.tsx b/src/frontend/src/components/buttons/SSOButton.tsx
 index aaa7c983c..5d1438ad9 100644
 --- a/src/frontend/src/components/buttons/SSOButton.tsx
