@@ -1,0 +1,296 @@
+"""The façade's token and revocation endpoints, and membership.revoke_all_mcp_tokens()."""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+from typing import ClassVar
+from unittest.mock import patch
+
+from django.test import Client, RequestFactory, override_settings
+from django.utils import timezone
+from InvenTree.unit_test import InvenTreeTestCase
+from oauth2_provider.models import (
+    AccessToken,
+    RefreshToken,
+    get_application_model,
+)
+
+from ..auth import membership, policy
+from ..auth.token import MCPTokenView
+from .oauth_helpers import OAuthFacadeTestMixin, url
+
+Application = get_application_model()
+
+
+@override_settings(PLUGIN_TESTING_SETUP=True)
+class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
+    """POST /plugin/inventree-mcp/oauth/token/ and /oauth/revoke/."""
+
+    roles: ClassVar[list[str]] = ["part.view", "part_category.view"]
+
+    def setUp(self):
+        super().setUp()
+        self.client_id = self.register_public_client()
+        self.browser = Client()
+        self.browser.force_login(self.user)
+
+    def _tokens(self, scope: str | None = None) -> dict:
+        code, verifier = self.obtain_code(self.browser, self.client_id, scope=scope)
+        response = self.exchange_code(self.client_id, code, verifier)
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()
+
+    def test_code_exchange_issues_tokens_with_configured_lifetime(self):
+        self.set_setting("ACCESS_TOKEN_LIFETIME_SECONDS", 1800)
+
+        tokens = self._tokens()
+
+        self.assertEqual(tokens["token_type"], "Bearer")
+        self.assertEqual(tokens["expires_in"], 1800)
+        self.assertTrue(tokens["access_token"])
+        self.assertTrue(tokens["refresh_token"])
+        self.assertEqual(
+            set(tokens["scope"].split()), set(policy.mcp_scopes_available())
+        )
+
+    def test_access_token_works_on_mcp_and_the_rest_api(self):
+        tokens = self._tokens()
+
+        response = self.mcp_call(tokens["access_token"])
+        self.assertEqual(response.status_code, 200, response.content)
+        tools = response.json()["result"]["tools"]
+        self.assertTrue(tools)
+        self.assertIn("list_parts", {tool["name"] for tool in tools})
+
+        response = Client().get(
+            "/api/part/", HTTP_AUTHORIZATION=f"Bearer {tokens['access_token']}"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+    def test_wrong_verifier_is_rejected(self):
+        code, _verifier = self.obtain_code(self.browser, self.client_id)
+        response = self.exchange_code(self.client_id, code, "x" * 50)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+
+    def test_blocked_user_cannot_exchange_a_code(self):
+        code, verifier = self.obtain_code(self.browser, self.client_id)
+        with patch(
+            "inventree_mcp.auth.membership.token_grant_allowed",
+            return_value=(False, "invalid_grant"),
+        ):
+            response = self.exchange_code(self.client_id, code, verifier)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+
+    def test_refresh_rotates_and_old_token_is_rejected(self):
+        tokens = self._tokens()
+
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 200, response.content)
+        rotated = response.json()
+        self.assertNotEqual(rotated["refresh_token"], tokens["refresh_token"])
+        self.assertNotEqual(rotated["access_token"], tokens["access_token"])
+        self.assertEqual(self.mcp_call(rotated["access_token"]).status_code, 200)
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
+        # Past DOT's grace period (REFRESH_TOKEN_GRACE_PERIOD_SECONDS=120) the old
+        # refresh token is rejected, and reuse protection revokes the whole family.
+        self._expire_grace_period()
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+
+        self._expire_grace_period()
+        self.assertEqual(
+            self.refresh(self.client_id, rotated["refresh_token"]).status_code, 400
+        )
+
+    @staticmethod
+    def _expire_grace_period():
+        RefreshToken.objects.filter(revoked__isnull=False).update(
+            revoked=timezone.now() - datetime.timedelta(minutes=5)
+        )
+
+    def test_refresh_re_applies_narrowed_scope(self):
+        tokens = self._tokens(scope="g:read r:view:part r:view:stock")
+
+        with patch(
+            "inventree_mcp.auth.policy.effective_scopes",
+            return_value={"g:read", "r:view:part"},
+        ):
+            response = self.refresh(self.client_id, tokens["refresh_token"])
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["scope"], "g:read r:view:part")
+        checksum = hashlib.sha256(response.json()["access_token"].encode()).hexdigest()
+        token = AccessToken.objects.get(token_checksum=checksum)
+        self.assertEqual(token.scope, "g:read r:view:part")
+
+    def test_refresh_without_any_mcp_scope_left_revokes(self):
+        tokens = self._tokens()
+
+        with patch("inventree_mcp.auth.policy.effective_scopes", return_value=set()):
+            response = self.refresh(self.client_id, tokens["refresh_token"])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
+    def test_refresh_refused_by_membership(self):
+        tokens = self._tokens()
+
+        with patch(
+            "inventree_mcp.auth.membership.refresh_grant_allowed",
+            return_value=(False, "invalid_grant"),
+        ):
+            response = self.refresh(self.client_id, tokens["refresh_token"])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+        # Refused before DOT ran: nothing was rotated.
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 200)
+
+    def test_unsupported_grant_type(self):
+        response = Client().post(
+            url("oauth-token"),
+            data={"grant_type": "client_credentials", "client_id": self.client_id},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "unsupported_grant_type")
+
+    def test_revoke_endpoint_revokes(self):
+        tokens = self._tokens()
+
+        response = Client().post(
+            url("oauth-revoke"),
+            data={
+                "token": tokens["refresh_token"],
+                "token_type_hint": "refresh_token",
+                "client_id": self.client_id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+        # DOT keeps accepting a revoked refresh token for
+        # REFRESH_TOKEN_GRACE_PERIOD_SECONDS (120 s); after that it is refused.
+        self._expire_grace_period()
+        self.assertEqual(
+            self.refresh(self.client_id, tokens["refresh_token"]).status_code, 400
+        )
+
+    def test_cors_for_trusted_origin_only(self):
+        """TrustedOriginCORSMixin, called on the view directly.
+
+        Through the full middleware stack, InvenTree's CORS middleware
+        (django-cors-headers, which covers /plugin/) answers real browser
+        preflights itself and rewrites the CORS headers of responses for the
+        origins it is configured with; the mixin covers TRUSTED_CLIENT_ORIGINS
+        independently of that configuration.
+        """
+        view = MCPTokenView.as_view()
+        factory = RequestFactory()
+
+        trusted = view(factory.options("/", HTTP_ORIGIN="https://claude.ai"))
+        self.assertEqual(trusted.status_code, 204)
+        self.assertEqual(trusted["Access-Control-Allow-Origin"], "https://claude.ai")
+        self.assertIn("POST", trusted["Access-Control-Allow-Methods"])
+        self.assertEqual(
+            trusted["Access-Control-Allow-Headers"], "Authorization, Content-Type"
+        )
+        self.assertEqual(trusted["Access-Control-Max-Age"], "3600")
+
+        untrusted = view(factory.options("/", HTTP_ORIGIN="https://evil.example"))
+        self.assertNotIn("Access-Control-Allow-Origin", untrusted)
+
+        code, verifier = self.obtain_code(self.browser, self.client_id)
+        request = factory.post(
+            "/",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "https://client.example/callback",
+                "client_id": self.client_id,
+                "code_verifier": verifier,
+            },
+            HTTP_ORIGIN="https://claude.ai",
+        )
+        response = view(request)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response["Access-Control-Allow-Origin"], "https://claude.ai")
+
+        response = view(
+            factory.post(
+                "/",
+                data={"grant_type": "refresh_token", "refresh_token": "unknown"},
+                HTTP_ORIGIN="https://evil.example",
+            )
+        )
+        self.assertEqual(response.status_code, 401)  # invalid_client: no client_id
+        self.assertNotIn("Access-Control-Allow-Origin", response)
+
+    def test_disabled_facade_answers_404(self):
+        self.set_setting("OAUTH_ENABLED", False)
+        for name in ("oauth-token", "oauth-revoke"):
+            with self.subTest(name=name):
+                self.assertEqual(Client().post(url(name)).status_code, 404)
+
+
+@override_settings(PLUGIN_TESTING_SETUP=True)
+class RevokeAllMcpTokensTest(OAuthFacadeTestMixin, InvenTreeTestCase):
+    """membership.revoke_all_mcp_tokens() touches only façade applications."""
+
+    def _pair(self, app, suffix: str):
+        access = AccessToken.objects.create(
+            user=self.user,
+            application=app,
+            token=f"at-{suffix}",
+            expires=timezone.now() + datetime.timedelta(hours=1),
+            scope="g:read",
+        )
+        refresh = RefreshToken.objects.create(
+            user=self.user, application=app, token=f"rt-{suffix}", access_token=access
+        )
+        return access, refresh
+
+    def test_only_facade_tokens_are_revoked(self):
+        dcr = Application.objects.create(
+            name="dcr",
+            client_type=Application.CLIENT_PUBLIC,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://client.example/callback",
+            registration_source=Application.RegistrationSource.DCR,
+        )
+        cimd = self.create_cimd_application()
+        manual = Application.objects.create(
+            name="manual",
+            client_type=Application.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://client.example/callback",
+        )
+        dcr_access, dcr_refresh = self._pair(dcr, "dcr")
+        cimd_access, cimd_refresh = self._pair(cimd, "cimd")
+        manual_access, manual_refresh = self._pair(manual, "manual")
+        lone_access = AccessToken.objects.create(
+            user=self.user,
+            application=dcr,
+            token="at-lone",
+            expires=timezone.now() + datetime.timedelta(hours=1),
+        )
+
+        count = membership.revoke_all_mcp_tokens(self.user)
+
+        self.assertEqual(
+            count, 3
+        )  # two refresh tokens (+ their access tokens), one lone access token
+        for refresh in (dcr_refresh, cimd_refresh):
+            refresh.refresh_from_db()
+            self.assertIsNotNone(refresh.revoked)
+        for access in (dcr_access, cimd_access, lone_access):
+            self.assertFalse(AccessToken.objects.filter(pk=access.pk).exists())
+
+        manual_refresh.refresh_from_db()
+        self.assertIsNone(manual_refresh.revoked)
+        self.assertTrue(AccessToken.objects.filter(pk=manual_access.pk).exists())

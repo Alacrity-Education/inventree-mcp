@@ -1,0 +1,25 @@
+{% extends "inventree_mcp/base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+  {% if mode == "sso" %}
+    <h1>Signing you in…</h1>
+    <p>An MCP client wants to connect to InvenTree. Continue with {{ provider_name }} to sign in.</p>
+    <form id="sso-form" method="post" action="{{ redirect_url }}">
+      {% csrf_token %}
+      <input type="hidden" name="provider" value="{{ provider_id }}">
+      <input type="hidden" name="process" value="login">
+      <input type="hidden" name="callback_url" value="{{ callback_url }}">
+      <div class="actions">
+        <button type="submit" class="primary">Continue with {{ provider_name }}</button>
+      </div>
+    </form>
+    <script>document.getElementById("sso-form").submit();</script>
+  {% else %}
+    <h1>Sign in to InvenTree first</h1>
+    <p>An MCP client wants to connect to InvenTree, but you are not signed in.</p>
+    <p>Sign in to InvenTree, then return to your MCP client and connect again.</p>
+    <div class="actions">
+      <a class="button primary" href="{{ login_url }}">Sign in to InvenTree</a>
+    </div>
+  {% endif %}
+{% endblock %}

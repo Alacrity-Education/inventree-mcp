@@ -1,0 +1,11 @@
+{% extends "inventree_mcp/base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+  <h1>{{ title }}</h1>
+  <p>{{ sentence }}</p>
+  {% if detail %}<p class="muted">{{ detail }}</p>{% endif %}
+  <p class="muted">Reason: <code class="error-code">{{ reason }}</code></p>
+  <div class="actions">
+    <a class="button" href="/">Back to InvenTree</a>
+  </div>
+{% endblock %}

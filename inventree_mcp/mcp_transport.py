@@ -45,6 +45,7 @@ from rest_framework.authentication import BasicAuthentication
 from rest_framework.views import APIView
 from users.authentication import ApiTokenAuthentication, ExtendedOAuth2Authentication
 
+from .auth.discovery import challenge_header
 from .context import reset_current_user, set_current_user
 from .mcp_server import mcp
 from .settings import get_plugin_setting
@@ -156,6 +157,23 @@ def _error_response(status: int, message: str) -> JsonResponse:
     )
 
 
+def _auth_error_response(
+    request: HttpRequest, status: int, message: str
+) -> JsonResponse:
+    """_error_response() plus, for a 401, the RFC 6750 / RFC 9728 Bearer challenge.
+
+    The challenge's resource_metadata is how an MCP client discovers the OAuth
+    façade (see auth/discovery.py); error="invalid_token" marks a request that
+    presented a credential.
+    """
+    response = _error_response(status, message)
+    if status == 401:
+        response["WWW-Authenticate"] = challenge_header(
+            request, invalid_token=bool(request.META.get("HTTP_AUTHORIZATION"))
+        )
+    return response
+
+
 class MCPView(APIView):
     """DRF view handling MCP Streamable HTTP transport requests.
 
@@ -188,12 +206,15 @@ class MCPView(APIView):
         try:
             self.perform_authentication(drf_request)
         except exceptions.APIException as exc:
-            return _error_response(getattr(exc, "status_code", 401), str(exc))
+            return _auth_error_response(
+                request, getattr(exc, "status_code", 401), str(exc)
+            )
 
         user = drf_request.user
 
         if get_plugin_setting("REQUIRE_AUTH") and not (user and user.is_authenticated):
-            return _error_response(
+            return _auth_error_response(
+                request,
                 401,
                 "Authentication required. Provide a valid Token, Bearer, or Basic credential.",
             )
@@ -217,6 +238,12 @@ class MCPView(APIView):
             reset_current_user(token)
 
 
+_mcp_view = csrf_exempt(auth_exempt(MCPView.as_view()))
+
 urlpatterns = [
-    path("mcp/", csrf_exempt(auth_exempt(MCPView.as_view())), name="mcp-endpoint")
+    path("mcp/", _mcp_view, name="mcp-endpoint"),
+    # Some MCP clients (Claude Code) drop the trailing slash of the configured
+    # URL; without this alias their POST misses the view (no APPEND_SLASH
+    # redirect for POST) and gets InvenTree's bare 401 without the OAuth challenge.
+    path("mcp", _mcp_view, name="mcp-endpoint-noslash"),
 ]

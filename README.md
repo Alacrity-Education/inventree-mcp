@@ -40,9 +40,11 @@ pip install inventree-mcp
 Then enable the plugin under **Admin > Plugins**, and configure its settings (see
 Configuration below).
 
-### 2. Create a token for your MCP client
+### 2. Connect: OAuth sign-in (recommended) or an API token
 
-Create an InvenTree API token for your MCP client.
+With **Enable OAuth Sign-in** turned on (see [Connect with OAuth](#connect-with-oauth)), MCP clients
+such as Claude connect by signing in through the browser and need no token at all. Otherwise,
+create an InvenTree API token for your MCP client and configure it as below.
 
 ### 3. Configure your MCP client
 
@@ -99,6 +101,56 @@ In a setup where the server is running a self-signed certificate, you may need t
 }
 ```
 
+## Connect with OAuth
+
+The plugin can act as an OAuth 2.1 authorization server for its MCP endpoint, so a user connects
+Claude (claude.ai, Claude Desktop, Claude Code) by signing in to InvenTree in the browser. Tokens
+are issued and renewed automatically; nothing is copied by hand.
+
+**Connect from Claude:**
+
+- claude.ai / Claude Desktop: *Settings > Connectors > Add custom connector*, URL
+  `https://<your-inventree-server>/plugin/inventree-mcp/mcp/`.
+- Claude Code: `claude mcp add --transport http inventree https://<your-inventree-server>/plugin/inventree-mcp/mcp/`,
+  then run `/mcp` inside Claude Code and choose *Authenticate*.
+
+**What the user sees:** the browser opens InvenTree. Without a session it goes straight to the
+single sign-on provider (e.g. Authentik) and comes back. Claude's web clients from trusted hosts are
+approved without a consent page; other clients, and every client that receives the result on a
+local port (Claude Code), show a consent page with the client, the signed-in user, the permissions
+and the token lifetimes. Access is the user's InvenTree permissions, limited to the OAuth scopes
+granted (read-only scopes while **Read Only** is on).
+
+**Prerequisites:**
+
+- InvenTree >= 1.5 (django-oauth-toolkit >= 3.4); older versions keep working without the OAuth
+  endpoints.
+- Single sign-on configured in InvenTree (an `openid_connect` social provider, *Enable SSO* on), or
+  users sign in to InvenTree first and then reconnect.
+- `SITE_URL` set and the reverse proxy forwarding `X-Forwarded-Proto` / `X-Forwarded-Host`, so the
+  advertised URLs use the public origin.
+- InvenTree's CORS whitelist (`cors.whitelist`) containing `https://claude.ai` and
+  `https://claude.com` (browser preflights to `/plugin/` are answered by InvenTree's CORS middleware).
+- Plugin settings: **Enable OAuth Sign-in** (`OAUTH_ENABLED`) on; URL integration and schedule
+  integration enabled for plugins.
+- InvenTree 1.5.x only: clients look up the authorization-server metadata at the RFC 8414 location
+  `/.well-known/oauth-authorization-server/plugin/inventree-mcp`, which 1.5.x does not let plugins
+  serve (newer InvenTree redirects it to the plugin automatically). Add a reverse-proxy rewrite,
+  e.g. for Caddy:
+
+  ```
+  rewrite /.well-known/oauth-authorization-server/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/oauth-authorization-server
+  rewrite /.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp* /plugin/inventree-mcp/.well-known/oauth-protected-resource
+  ```
+
+**How it works:** a `401` from the MCP endpoint carries `WWW-Authenticate: Bearer
+resource_metadata="…"`. The protected-resource metadata names the issuer
+`https://<server>/plugin/inventree-mcp`, whose metadata lists the authorize, token, registration and
+revocation endpoints under `/plugin/inventree-mcp/oauth/`. These are thin subclasses of
+django-oauth-toolkit's own views; clients register dynamically (RFC 7591) or identify with a client ID
+metadata document URL from a trusted host. Tokens are ordinary InvenTree OAuth2 tokens (visible in
+the admin under *Django OAuth Toolkit*). InvenTree's own `/o/` endpoints are not changed.
+
 ## Configuration
 
 Under **Settings > Plugin Settings**:
@@ -107,6 +159,28 @@ Under **Settings > Plugin Settings**:
   Only disable for local testing.
 - **Read Only** (`MCP_READ_ONLY`, default `True`): block all write actions via MCP, regardless of
   the calling user's permissions. A plugin-wide kill switch, independent of per-user roles.
+- **Log Tool Calls** (`MCP_LOG_TOOL_CALLS`, default `False`): log every tool call for debugging.
+
+OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `OAUTH_ENABLED` | `False` | Serve OAuth discovery and the OAuth endpoints. Off: the endpoints answer 404 and the 401 challenge carries no `resource_metadata`. |
+| `TRUSTED_CLIENT_HOSTS` | `claude.ai,claude.com,.anthropic.com` | Hosts whose client ID metadata documents (`https` client IDs) are accepted, Django `ALLOWED_HOSTS` syntax. |
+| `TRUSTED_CLIENT_ORIGINS` | `https://claude.ai,https://claude.com` | Browser origins allowed to call register / token / revoke (CORS). |
+| `AUTO_APPROVE_TRUSTED_CLIENTS` | `True` | Skip consent for trusted-host clients, never for loopback redirect URIs. |
+| `ACCESS_TOKEN_LIFETIME_SECONDS` | `3600` | Access token lifetime. |
+| `REFRESH_TOKEN_LIFETIME_DAYS` | `30` | Refresh token idle lifetime (rotated on every use). |
+| `AUTH_CODE_LIFETIME_SECONDS` | `600` | Authorization code lifetime. |
+| `ALLOW_LOCALHOST_LOOPBACK` | `True` | Accept `http://localhost` redirect URIs on any port, like `127.0.0.1`. |
+| `REGISTER_RATE_LIMIT_PER_MINUTE` | `30` | Client registrations per minute and IP (`0` disables). |
+| `UNUSED_CLIENT_RETENTION_DAYS` | `90` | Daily cleanup of registered clients without a live token. |
+| `OAUTH_FORCE_SSO` | `True` | Send the browser straight to the SSO provider when it has no InvenTree session. |
+| `SSO_PROVIDER_ID` | empty | allauth provider id to sign in with; empty selects the single configured `openid_connect` provider. |
+
+The lifetime settings are injected into django-oauth-toolkit at runtime and therefore apply to
+**every** OAuth2 application on the instance while `OAUTH_ENABLED` is on (InvenTree has no
+configuration hook for them). Turning `OAUTH_ENABLED` off restores InvenTree's defaults.
 
 ## Authentication
 
@@ -114,8 +188,9 @@ Access follows the calling user's normal InvenTree role assignments. Supported a
 
 - An InvenTree API token: `Authorization: Token <token>`.
 - Basic auth (username/password).
-- An OAuth2 bearer token: `Authorization: Bearer <token>`. A scoped token (e.g. `r:view:part`)
-  narrows access *below* the underlying user's roles - useful for issuing an agent a tightly-scoped
-  token without creating a separate low-privilege user.
+- An OAuth2 bearer token: `Authorization: Bearer <token>`, from the OAuth sign-in above or any other
+  InvenTree OAuth2 application. A scoped token (e.g. `r:view:part`) narrows access *below* the
+  underlying user's roles - useful for issuing an agent a tightly-scoped token without creating a
+  separate low-privilege user.
 
 Session/cookie auth is not supported (not meaningful for a machine client).

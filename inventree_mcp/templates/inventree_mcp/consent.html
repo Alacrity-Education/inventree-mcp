@@ -1,0 +1,43 @@
+{% extends "inventree_mcp/base.html" %}
+{% block title %}Connect {{ application.name|default:"MCP client" }}{% endblock %}
+{% block content %}
+  <h1>Connect {{ application.name|default:"MCP client" }} to InvenTree?</h1>
+
+  {% if client_host %}
+    <p>
+      Client from <strong>{{ client_host }}</strong>
+      {% if client_trusted %}<span class="badge ok">trusted</span>{% else %}<span class="badge warn">not verified</span>{% endif %}
+    </p>
+  {% endif %}
+
+  {% if loopback_redirect %}
+    <p class="notice">
+      This client receives the sign-in result on your own computer ({{ redirect_uri }}).
+      Any local program can claim a client name, so approve only if you started this connection yourself.
+    </p>
+  {% endif %}
+
+  <form id="authorizationForm" method="post">
+    {% csrf_token %}
+    {% for field in form %}{% if field.is_hidden %}{{ field }}{% endif %}{% endfor %}
+
+    <dl>
+      <dt>Signed in as</dt><dd>{{ inventree_user }}</dd>
+      <dt>Access token</dt><dd>valid for {{ access_token_lifetime }}, renewed automatically</dd>
+      <dt>Stays connected</dt><dd>{{ refresh_token_lifetime }} without use</dd>
+    </dl>
+
+    <p>It will be able to act as you in InvenTree, limited to:</p>
+    <ul>
+      {% for label in scope_labels %}<li>{{ label }}</li>{% endfor %}
+    </ul>
+    <p class="muted">Your own InvenTree permissions still apply on top of these.</p>
+
+    {{ form.non_field_errors }}
+
+    <div class="actions">
+      <button type="submit">Deny</button>
+      <button type="submit" class="primary" name="allow" value="Authorize">Approve</button>
+    </div>
+  </form>
+{% endblock %}
