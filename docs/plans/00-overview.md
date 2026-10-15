@@ -127,7 +127,11 @@ def narrow(requested, user) -> list[str]
 `auth/membership.py` (WP1 ships stubs, WP2 the real thing):
 
 ```python
-class Outcome(str, Enum): MEMBER, NOT_MEMBER, UNREACHABLE, NO_UPSTREAM_TOKEN, NOT_DUE, DISABLED
+class Outcome(str, Enum): MEMBER, NOT_MEMBER, NO_MCP_PERMISSION, UNREACHABLE, NO_UPSTREAM_TOKEN, NOT_DUE, DISABLED
+    # NO_MCP_PERMISSION (added after the WP2 review): identity confirmed but the user's groups grant no MCP access.
+    # Effect: revoke the user's MCP tokens, keep the upstream token, stamp membership_checked_at, no block;
+    # refresh_grant_allowed maps it to (False, "invalid_grant"). Only identity-level refusals block:
+    # inactive user, not in MCP_REQUIRED_GROUPS (revoked_reason "not_in_required_groups"), upstream invalid_grant.
 def is_blocked(user) -> bool                      # stub: False
 def token_grant_allowed(user) -> tuple[bool, str] # for authorization_code grants; stub: (not blocked, "")
 def refresh_grant_allowed(user) -> tuple[bool, str]
@@ -172,6 +176,15 @@ class MCPRuleSet(models.Model):            # WP3, mirrors users.RuleSet
     can_view = can_add = can_change = can_delete = BooleanField(default=False)
     unique_together = (group, name)
 ```
+
+## Decisions recorded after reviews
+
+- **Blocks are honoured while `MEMBERSHIP_ENFORCED` is off** (KINA DESIGN §7.1): "off" means no re-checks and no new blocks; `is_blocked` keeps returning True for a blocked user until an SSO login that passes the identity checks, or `unblock_user`.
+- **Long-lived credentials (API token, Basic) on the MCP endpoint follow the same windows as refresh grants**: denied with 401 when the last re-check found the provider unreachable and `membership_checked_at` is older than the grace period, or when there is no upstream token and the last SSO login is older than the re-login interval. One set of predicates in `membership.py`, used by both `refresh_grant_allowed` and the transport. The interactive `/api/` is never affected.
+- **An SSO login lifts a block only when the identity checks pass** (`is_active`, `in_required_groups`); it always stamps `membership_checked_at` and `last_login_at`.
+- **`effective_scopes(user)` is empty when the user is not in `MCP_REQUIRED_GROUPS`**, so authorize, refresh narrowing and the transport agree without separate checks.
+- **The MCP endpoint calls `policy.may_connect(user)` for every credential type**: `blocked` → 401 with the challenge, `inactive`/`no_mcp_permission` → 403 JSON-RPC "No MCP permission".
+- **Never query through the plugin's reverse relations from core models** (`User.objects.filter(mcp_state__…)`, `Group.objects.filter(mcp_rule_sets__…)`) — InvenTree registers plugin apps after core relations are built and the query raises `FieldError` in running processes while the test runner hides it. Use `MCPUserState.objects.filter(user=…)`, `MCPRuleSet.objects.filter(group__in=…)` or `Exists`.
 
 ## Definition of done (every WP)
 
