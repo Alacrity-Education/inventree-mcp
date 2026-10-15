@@ -277,3 +277,110 @@ Other live checks after the final restart:
 - **Models and migrations:** `0001_initial` exists; WP3 adds `0002_…` with `dev/manage.sh makemigrations inventree_mcp`. `migrations/` is excluded from ruff. Models need app integration (`ENABLE_PLUGINS_APP`); `membership.models_available()` guards the code paths that run without it.
 - **API for WP3/WP4:** `membership.is_blocked`, `recheck_due`, `block_user`, `unblock_user` and `MCPUserState`'s fields are what an admin "connections / status" endpoint needs. `unblock_user` is the admin's manual unblock. `check_user_permission` gives staff full access and the owner read access when the row is passed.
 - **Test fixtures:** `tests/test_membership.py` provides `FakeIdP`, `PROVIDERS` and the `MembershipTestCase` base (SSO account, upstream token, group map, `MCP_REQUIRED_GROUPS="MCP Users"`). WP3 tests that need the full SSO path can reuse them.
+
+## Review fixes applied
+
+Applied after `docs/plans/WP2-review.md`, following the decisions recorded in `docs/plans/00-overview.md` ("Decisions recorded after reviews" and the `Outcome.NO_MCP_PERMISSION` note). Binding signatures are unchanged. The only interface addition is the approved `Outcome.NO_MCP_PERMISSION`. Every outbound call keeps its 5 s timeout. An unreachable provider still never rotates or revokes anything. Nothing is staged or committed.
+
+| Finding | What changed (file, function) | Verified by |
+|---|---|---|
+| **F1** required groups on `/mcp` | `mcp_transport.py` `MCPView.dispatch` now calls `policy.may_connect(user)` for every credential type: `blocked` → 401 "Access revoked" with the challenge; `inactive` / `no_mcp_permission` → 403 JSON-RPC "No MCP permission" with no challenge. Only allowed users queue the background re-check. | `TransportTest.test_user_outside_required_groups_gets_403`: an API token and an OAuth token both get 403, nothing is queued, `/api/user/me/` still works. Live: e2e `[E] after an admin unblock: tools/list with the API token -> 403 'No MCP permission'`. |
+| **WP3 guidance**: identity vs authorisation | `membership.py`: `_check_upstream` returns `(verdict, reason)`. The new `_classify(fresh)` decides: inactive → identity refusal `inactive`; `not policy.in_required_groups` → identity refusal `not_in_required_groups` (`NOT_IN_REQUIRED_GROUPS`); otherwise `policy.may_connect` decides, where `no_mcp_permission` is an authorisation refusal and any other reason is an identity refusal. Upstream `invalid_grant` still blocks. In `recheck`, an identity refusal → `block_user`, `NOT_MEMBER`. An authorisation refusal stamps `membership_checked_at`, clears `last_recheck_error`, calls `revoke_all_mcp_tokens` only (no block, upstream token kept), logs "member without MCP permission" and returns the new `Outcome.NO_MCP_PERMISSION`. `refresh_grant_allowed` maps that to `(False, "invalid_grant")`. The sweep counts it by `.value`. | `NoMcpPermissionTest.test_member_without_mcp_permission_is_revoked_not_blocked`: refused, not blocked, upstream token rotated and kept, stamp fresh, MCP tokens revoked, log line present, sweep counts `{"no_mcp_permission": 1}`. `NotMemberTest`: a lost group now stores `not_in_required_groups`. Live: e2e `[D] ... blocked=True reason='not_in_required_groups'`. |
+| `effective_scopes` | `policy.py` `effective_scopes(user)` returns an empty set when `not in_required_groups(user)`. The stub semantics are otherwise unchanged. | `test_auth_token.TokenEndpointTest.test_refresh_outside_required_groups_is_refused`: narrowing refuses and revokes. `LoginSignalTest.test_sso_login_of_an_unblocked_non_member_blocks_nothing` asserts the empty set. |
+| **F2** (minimum) sweep vs django-q timeout | `tasks.py` `membership_sweep(user_ids=None)`: candidate ids are collected first. No new re-check starts after `SWEEP_BUDGET_SECONDS = 60`. The remaining ids go to `_queue_continuation` (`offload_task("inventree_mcp.auth.tasks.membership_sweep", remaining, force_async=True, check_duplicates=True)`), counted as `deferred`. At least one user is re-checked per run, so a continuation always makes progress. A continuation re-checks only its ids that are still unblocked and still due. README ("The hourly sweep runs as one background task …") and this report document the 90 s `background.timeout` interaction: one re-check can take about 20 s (four calls with a 5 s timeout), so 60 + 20 stays under 90. | `SweepTest.test_sweep_stops_at_its_time_budget_and_queues_the_rest`: a fake clock; one user is re-checked, `{"member": 1, "deferred": 2}`, the exact continuation call is asserted, and the continuation re-checks exactly the two deferred users. Live: `dev/shell.sh` → `membership sweep: no_upstream_token=1, not_due=1`. |
+| **F3** back-off | `membership.py` `_check_upstream`: after `timeout`, `connection_error` or any `*http_5xx` (`_starts_backoff`), a per-provider cache marker `_backoff_key(provider_id)` is set for `PROVIDER_BACKOFF_SECONDS = 60`. While it is present, `_check_upstream` raises `_Unreachable(<cached code>)` without any call, and grace decides as before. The marker is checked before the call and set only on a real failure, so the back-off does not extend itself. | `UnreachableTest.test_provider_backoff_after_an_outage` (subtests timeout / connection_error / 503): three further re-checks make no call and keep the code; after the marker expires the provider is asked again (MEMBER). `test_no_backoff_for_answers_of_a_reachable_provider` (bad signature → no back-off). The existing unreachable subtests clear the cache between modes. |
+| **F4** login lifts blocks | `signals.py` `on_user_logged_in`: an SSO login always stamps `membership_checked_at`, `last_login_at` and clears `last_recheck_error`. It lifts the block only when `user.is_active and policy.in_required_groups(user)`. Otherwise the block stays and an INFO line ("kept the MCP block") is logged. No new block is set at login. | `LoginSignalTest.test_sso_login_of_a_non_member_keeps_the_block`, `test_sso_login_of_an_inactive_user_keeps_the_block`, `test_sso_login_of_an_unblocked_non_member_blocks_nothing`; the existing stamp-and-unblock and password-login tests still pass. Live: e2e `[E] state: checked 2 s ago, blocked=True reason='not_in_required_groups'`. |
+| **F5** queue churn | `membership.recheck`: after a `NO_UPSTREAM_TOKEN` outcome, it sets the transport's marker `recheck_queued_key(pk)` (shared helper, also used by `_queue_membership_recheck`) for `MEMBERSHIP_RECHECK_INTERVAL_MINUTES * 60`. Because this is set inside `recheck`, it covers the background task, the sweep and the refresh path. README states that the back-off, queue, warning and discovery markers are per process without InvenTree's global cache. | `TransportTest.test_no_upstream_token_holds_the_queue_marker_for_the_interval`: after `recheck_user` → `no_upstream_token`, an API-token request on a due user queues nothing. |
+| **F6** blocks while enforcement is off | `membership.is_blocked` no longer depends on `enforced()`, only on `models_available()`. `refresh_grant_allowed` checks the block before the "off" short-cut; otherwise "off" behaves as before (`(True, "")`, `recheck` → `DISABLED`, no new blocks). The README settings row and the `MEMBERSHIP_ENFORCED` description now say existing blocks still apply. | `DueAndEnforcementTest.test_enforcement_off`: `DISABLED`, not due, blocked; refresh 400 and `/mcp` 401; after `unblock_user` the refresh gives 200; no provider call. |
+| **F7** long-lived credentials | `membership.py`: the predicates are extracted once as `within_grace(state)` and `within_relogin(user, state)`. `refresh_grant_allowed` uses them, and so does the new `long_lived_credential_allowed(user)`, which judges by the last recorded outcome. A non-empty `last_recheck_error` outside `NO_TOKEN_CODES` (that is, unreachable) past grace → `unreachable_past_grace`. A no-token code (`no_token`, and also `no_provider` / `unsupported_provider`, which are the same `NO_UPSTREAM_TOKEN` outcome) past the re-login interval → `relogin_required`. It is always allowed while not enforced. `mcp_transport.py`: for non-OAuth credentials, the re-check is queued first (so recovery happens once the provider is back), then a refusal → 401 with a clear message and the realm-only challenge `Bearer realm="InvenTree"`. `/api/` is not touched. | `TransportTest.test_unreachable_past_grace_denies_long_lived_credentials` (API token and Basic: 401 with the realm-only challenge; `/api/user/me/` 200; within grace, or with the error cleared: 200; a re-check still queued) and `test_no_upstream_token_past_relogin_denies_long_lived_credentials` (401, `/api/` 200, a fresh login → 200, enforcement off → 200). Live: e2e scenario G. |
+| **F8** (optional) | `membership._adapter_class()` builds, on first use, a `CachedConfigAdapter(OpenIDConnectOAuth2Adapter)` whose `openid_config` property returns the cached discovery document. `_discovery(session, app)` only fetches and caches. The private `_openid_config` is no longer touched. | Every re-check test, plus live e2e B (a real rotation through allauth's endpoint and auth-method logic). |
+| **F9** userinfo stub | `membership._sync_groups`: a missing `userinfo` is seeded from `extra_data["id_token"]` (or `{"sub": uid}`). | `MemberRecheckTest.test_group_sync_seeds_userinfo_from_the_id_token`. |
+| **F10** missing app or table | `membership.warn_if_unenforceable()`, called from `InvenTreeMCP.__init__`, logs one WARNING per process when `MEMBERSHIP_ENFORCED` is on and the app will not be installed. It uses the same condition as core's `AppMixin`: `PLUGIN_TESTING` or `ENABLE_PLUGINS_APP`; at `__init__` the app is not installed yet, so `apps.is_installed` cannot be used. Request-path row reads (`is_blocked`, `recheck_due`, `_state` → `long_lived_credential_allowed` / `refresh_grant_allowed`) go through `_read()`, which runs the query in its own `transaction.atomic()`. On `DatabaseError` it logs once and returns the safe default (not blocked, not due, no state). README notes both. | `MissingTableTest.test_reads_fail_safe_and_log_once`: the table is really renamed inside the test transaction. All reads fail safe, `/mcp` with an API token gives 200, one warning is logged, and the connection stays usable. `test_warning_at_load_without_app_integration`: logged once, and not logged with `PLUGIN_TESTING`. |
+| **F11** dev duplication | `dev/oauth_smoke.py` now owns `register(agent, asm, client_name)`, `authorize_url(asm, client_id, **extra)` (random state, PKCE) and `approve_and_exchange(..., **extra)`, which checks that the state comes back. Its `main()` uses them (steps 4, 5, 7-8, 9b). `dev/membership_e2e.py` imports them and its copies are deleted. Both scripts were formatted with `ruff format --isolated`, which reflowed their pre-existing long lines. | Live: both smoke modes and the e2e pass (below). |
+| **F12** test gaps | 1. SSO login of a non-member (F4 tests) and an API-token user outside the required groups (F1 test). 2. `test_upstream_invalid_grant_blocks` now mints a fresh `make_token_pair` after the block and asserts 401 "Access revoked". 3. The sweep test adds an expired `ApiToken` and a refresh token of a non-façade (`MANUAL`) application; both are excluded and the counts are unchanged. | `SweepTest.test_sweep_picks_only_due_users_with_live_tokens`, `NotMemberTest.test_upstream_invalid_grant_blocks`. |
+| Near-duplicate | The login receiver uses `membership._locked_state(user)` instead of its own `select_for_update().get_or_create`. | `LoginSignalTest`. |
+| F13, F14 | Informational, no change. | |
+
+E2E scenarios changed with the decisions:
+
+- D: now expects `not_in_required_groups`.
+- E: now expects the block to survive the SSO login. It then shows the F1 403 after an admin `unblock_user`.
+- G is new and shows F7 live: 401 with the realm-only challenge, `/api/` unaffected, and recovery through the queued background re-check.
+
+AGENTS.md and README were updated for all of the above.
+
+### Verification
+
+```
+$ dev/test.sh inventree_mcp
+Ran 273 tests in 235.738s
+OK (skipped=3)                (the same three WellKnownRedirectTest skips as before)
+
+$ dev/test.sh inventree_mcp.test_mcp
+Ran 132 tests in 33.449s
+OK
+
+$ dev/test.sh inventree_mcp.tests.test_membership
+Ran 41 tests in 90.739s
+OK
+
+$ uvx ruff@0.16.0 check --preview inventree_mcp                            -> All checks passed!
+$ uvx ruff@0.16.0 format --preview --check inventree_mcp                   -> 51 files already formatted
+$ uvx ruff@0.16.0 check --preview --isolated inventree_mcp/tests           -> All checks passed!
+$ uvx ruff@0.16.0 format --preview --isolated --check inventree_mcp/tests  -> 9 files already formatted
+$ uvx ruff@0.16.0 check --isolated dev/membership_e2e.py dev/oauth_smoke.py         -> All checks passed!
+$ uvx ruff@0.16.0 format --isolated --check dev/membership_e2e.py dev/oauth_smoke.py -> 2 files already formatted
+```
+
+After `dev/compose.sh restart inventree-server inventree-worker`, `python3 dev/membership_e2e.py` (including the Authentik outage):
+
+```
+[A] connected through the façade: expires_in=3600 scopes=12
+[A] tools/list -> 200
+[B] last check aged to 2 h, refresh -> 200; upstream refresh token rotated: True
+[B] refresh again within the interval -> 200; upstream token unchanged: True
+[C] Authentik down, last check 2 h ago (grace 4 h): refresh -> 200; last_error='connection_error'
+[C] Authentik down, last check 5 h ago: refresh -> 400 invalid_grant; blocked=False live MCP refresh tokens=2
+[C] tools/list with the current access token -> 200 (nothing revoked)
+[C] Authentik back: the same refresh token -> 200 (attempt 11); checked 2 s ago
+[D] refresh -> 400 invalid_grant
+[D] state: checked 7203 s ago, blocked=True reason='not_in_required_groups' last_error='' upstream token=none groups=['Users'] live MCP refresh tokens=0
+[D] tools/list with the last access token -> 401
+[D] tools/list with an InvenTree API token of the blocked user -> 401 'Access revoked, sign in to InvenTree again.'
+[E] state: checked 2 s ago, blocked=True reason='not_in_required_groups' last_error='' upstream token=present groups=['Users'] live MCP refresh tokens=0
+[E] SSO login while outside the group: authorize -> 403 ('Access revoked' shown: True)
+[E] after an admin unblock: tools/list with the API token -> 403 'No MCP permission'
+[E] after an admin unblock: authorize -> 403 ('No MCP access' shown: True)
+[F] connected through the façade: expires_in=3600 scopes=12
+[F] tools/list -> 200
+[F] tools/list with the API token -> 200
+[G] last re-check unreachable, last success 5 h ago (grace 4 h): API token on /mcp -> 401 'MCP access suspended: group membership could not be confirmed with the identity provider for too long. Try again later or sign in to InvenTree again.'; WWW-Authenticate: Bearer realm="InvenTree"
+[G] the same API token on /api/user/me/ -> 200
+[G] after the queued background re-check: API token on /mcp -> 200 (attempt 1); checked 5 s ago, last_error=''
+OK: membership re-check end to end
+```
+
+The "attempt 11" in C is Authentik's start-up time, now possibly combined with the 60 s provider back-off. The loop allows 12 attempts at 5 s.
+
+`python3 dev/oauth_smoke.py --sso e2e-member`:
+
+```
+[14] refresh with the just-revoked refresh token -> 400 invalid_grant
+OK: OAuth façade flow completed (SSO as e2e-member)
+```
+
+`python3 dev/oauth_smoke.py` (password mode): `OK: OAuth façade flow completed (password login)`.
+
+Live sweep in `dev/shell.sh` (the running process, not the test runner): `membership sweep: no_upstream_token=1, not_due=1`.
+
+### Deferred
+
+- **F2 proper (WP5):** the lease-based restructuring. Under `select_for_update` set a short lease and commit; do the outbound calls and `_store_tokens` in autocommit; then run the group sync, decision and stamp in a short second transaction. Until then:
+  - the rotated upstream token is durable only at the end of the re-check's transaction;
+  - the row lock is held across the outbound calls, so the login receiver can wait on it;
+  - only the sweep's time budget guards against django-q's 90 s kill.
+
+  The back-off (F3) shortens outage-time lock holds to a cache read.
+- **F12 item 3:** no concurrent (multi-connection) test of the row lock. The sequential re-read test stays, as the spec asks.
+- **Per-process cache markers without Redis:** documented, not changed.
+- **F7 also applies to service accounts.** An API-token-only user with no upstream token and no interactive login inside `RELOGIN_INTERVAL_HOURS` is refused on `/mcp` once a background re-check has recorded `no_token` / `no_provider`. That follows the recorded decision ("same windows as refresh grants"). README tells such installations to turn `MEMBERSHIP_ENFORCED` off or give the account an upstream token.

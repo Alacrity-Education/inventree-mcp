@@ -47,8 +47,8 @@ from rest_framework.authentication import BasicAuthentication
 from rest_framework.views import APIView
 from users.authentication import ApiTokenAuthentication, ExtendedOAuth2Authentication
 
-from .auth import membership
-from .auth.discovery import challenge_header
+from .auth import membership, policy
+from .auth.discovery import REALM, challenge_header
 from .context import reset_current_user, set_current_user
 from .mcp_server import mcp
 from .settings import get_plugin_setting
@@ -179,6 +179,31 @@ def _auth_error_response(
     return response
 
 
+#: Messages of the long-lived credential refusals (membership.long_lived_credential_allowed()).
+_LONG_LIVED_REFUSALS = {
+    "unreachable_past_grace": (
+        "MCP access suspended: group membership could not be confirmed with the "
+        "identity provider for too long. Try again later or sign in to InvenTree again."
+    ),
+    "relogin_required": (
+        "MCP access suspended: sign in to InvenTree again to keep using this credential."
+    ),
+}
+
+
+def _long_lived_refusal(reason: str) -> JsonResponse:
+    """401 for an API token / Basic credential past the grace or re-login window.
+
+    The challenge is the bare realm: the credential itself is valid (no
+    error="invalid_token") and an OAuth flow is not what fixes it.
+    """
+    response = _error_response(
+        401, _LONG_LIVED_REFUSALS.get(reason, "MCP access suspended.")
+    )
+    response["WWW-Authenticate"] = f'Bearer realm="{REALM}"'
+    return response
+
+
 def _queue_membership_recheck(user) -> None:
     """Queue a background membership re-check for a long-lived credential (ApiToken, Basic).
 
@@ -186,11 +211,18 @@ def _queue_membership_recheck(user) -> None:
     and passwords are not, so their requests queue tasks.recheck_user when the
     last check is stale. Never makes the request wait; a short cache marker
     keeps a burst of requests from queueing (and de-duplicating) repeatedly.
+    After a NO_UPSTREAM_TOKEN outcome membership.recheck() holds the same
+    marker for the whole re-check interval. Without InvenTree's global cache
+    (Redis) the marker is per process.
     """
     try:
         if not membership.recheck_due(user):
             return
-        if not cache.add(f"inventree_mcp:recheck_queued:{user.pk}", True, 60):
+        if not cache.add(
+            membership.recheck_queued_key(user.pk),
+            True,
+            membership.RECHECK_QUEUED_SECONDS,
+        ):
             return
         from InvenTree.tasks import offload_task
 
@@ -258,12 +290,26 @@ class MCPView(APIView):
         )
 
         if user is not None and user.is_authenticated:
-            if membership.is_blocked(user):
-                return _auth_error_response(
-                    request, 401, "Access revoked, sign in to InvenTree again."
-                )
+            ok, reason = policy.may_connect(user)
+            if not ok:
+                if reason == "blocked":
+                    return _auth_error_response(
+                        request, 401, "Access revoked, sign in to InvenTree again."
+                    )
+                # inactive / no_mcp_permission: the credential itself is valid.
+                return _error_response(403, "No MCP permission")
             if not is_oauth2:
+                # Queued before the window check: once the provider is back, the
+                # background re-check is what lets this credential in again.
                 _queue_membership_recheck(user)
+                allowed, why = membership.long_lived_credential_allowed(user)
+                if not allowed:
+                    logger.info(
+                        "inventree-mcp: long-lived credential refused (%s) for user id %s",
+                        why,
+                        user.pk,
+                    )
+                    return _long_lived_refusal(why)
 
         token = set_current_user(user, drf_request.auth if is_oauth2 else None)
         try:

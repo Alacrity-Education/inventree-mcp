@@ -145,6 +145,18 @@ class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertEqual(response.json()["error"], "invalid_grant")
         self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
 
+    def test_refresh_outside_required_groups_is_refused(self):
+        """effective_scopes() is empty outside MCP_REQUIRED_GROUPS, so narrowing refuses."""
+        tokens = self._tokens()
+        self.set_setting("MCP_REQUIRED_GROUPS", "Somebody Else")
+
+        self.assertEqual(policy.effective_scopes(self.user), set())
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
     def test_refresh_refused_by_membership(self):
         tokens = self._tokens()
 

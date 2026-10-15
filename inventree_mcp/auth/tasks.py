@@ -7,6 +7,7 @@ membership_sweep (hourly). Queued on demand by mcp_transport.py: recheck_user.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 
 from django.db.models import Exists, OuterRef
@@ -16,6 +17,13 @@ from ..settings import get_plugin_setting
 from . import facade_supported
 
 logger = logging.getLogger("inventree")
+
+#: The sweep starts no new re-check after this many seconds and queues the rest
+#: as a continuation task. django-q kills a task after InvenTree's
+#: background.timeout (90 s by default) and one re-check can take up to about
+#: 20 s (four outbound calls with a 5 s timeout), so 60 s leaves headroom.
+SWEEP_BUDGET_SECONDS = 60
+_clock = time.monotonic
 
 
 def cleanup_stale_clients() -> int:
@@ -84,13 +92,20 @@ def recheck_user(user_id: int) -> str:
     return membership.recheck(user).value
 
 
-def membership_sweep() -> dict[str, int]:
+def membership_sweep(user_ids: list[int] | None = None) -> dict[str, int]:
     """Re-check users who hold MCP access but are due (hourly, via ScheduleMixin).
 
     Candidates are users with an unrevoked refresh token of a façade
     application (clients.mcp_applications()) or an active InvenTree API
     token, who are not blocked and whose last check is older than
     MEMBERSHIP_RECHECK_INTERVAL_MINUTES. Logs one line with counts only.
+
+    Time budget: no new re-check starts after SWEEP_BUDGET_SECONDS; the
+    remaining candidates are queued as a continuation of this task
+    (*user_ids*), which re-checks only those (still due, not blocked) users.
+    At least one user is re-checked per run, so a continuation always makes
+    progress. (The lease-based restructuring that also shortens the row lock
+    is WP5.)
     """
     from django.contrib.auth import get_user_model
     from django.db.models import Q
@@ -106,33 +121,49 @@ def membership_sweep() -> dict[str, int]:
 
     from ..models import MCPUserState
 
-    today = timezone.now().date()
-    holds_access = Exists(
-        ApiToken.objects.filter(user=OuterRef("pk"), revoked=False).filter(
-            Q(expiry__isnull=True) | Q(expiry__gte=today)
-        )
-    )
-    if facade_supported():
-        from oauth2_provider.models import get_refresh_token_model
-
-        from .clients import mcp_applications
-
-        holds_access |= Exists(
-            get_refresh_token_model().objects.filter(
-                user=OuterRef("pk"),
-                revoked__isnull=True,
-                application__in=mcp_applications(),
-            )
-        )
     # Not "mcp_state__..." from User: InvenTree registers plugin apps after the
     # User model's reverse relations are built, so that lookup is unavailable
     # in running processes (it only works in the test runner).
     blocked = MCPUserState.objects.filter(
         user=OuterRef("pk"), access_revoked_at__isnull=False
     )
-    users = get_user_model().objects.filter(holds_access).exclude(Exists(blocked))
+    users = get_user_model().objects.exclude(Exists(blocked))
 
-    for user in users.iterator():
+    if user_ids is None:
+        today = timezone.now().date()
+        holds_access = Exists(
+            ApiToken.objects.filter(user=OuterRef("pk"), revoked=False).filter(
+                Q(expiry__isnull=True) | Q(expiry__gte=today)
+            )
+        )
+        if facade_supported():
+            from oauth2_provider.models import get_refresh_token_model
+
+            from .clients import mcp_applications
+
+            holds_access |= Exists(
+                get_refresh_token_model().objects.filter(
+                    user=OuterRef("pk"),
+                    revoked__isnull=True,
+                    application__in=mcp_applications(),
+                )
+            )
+        users = users.filter(holds_access)
+    else:
+        users = users.filter(pk__in=user_ids)
+
+    pks = list(users.order_by("pk").values_list("pk", flat=True))
+    started = _clock()
+
+    for index, pk in enumerate(pks):
+        if index and _clock() - started >= SWEEP_BUDGET_SECONDS:
+            remaining = pks[index:]
+            counts["deferred"] = len(remaining)
+            _queue_continuation(remaining)
+            break
+        user = get_user_model().objects.filter(pk=pk).first()
+        if user is None:
+            continue
         if not membership.recheck_due(user):
             counts["not_due"] = counts.get("not_due", 0) + 1
             continue
@@ -148,3 +179,23 @@ def membership_sweep() -> dict[str, int]:
         or "no users",
     )
     return counts
+
+
+def _queue_continuation(user_ids: list[int]) -> None:
+    """Queue membership_sweep for the users the time budget left out."""
+    from InvenTree.tasks import offload_task
+
+    try:
+        offload_task(
+            "inventree_mcp.auth.tasks.membership_sweep",
+            user_ids,
+            force_async=True,
+            check_duplicates=True,
+        )
+    except Exception:  # the next hourly sweep picks them up
+        logger.warning(
+            "inventree-mcp: could not queue the membership sweep continuation "
+            "(%s users left for the next sweep)",
+            len(user_ids),
+            exc_info=True,
+        )

@@ -127,7 +127,7 @@ class InvenTreeMCP(
         },
         "MEMBERSHIP_ENFORCED": {
             "name": "Enforce SSO Membership",
-            "description": "Re-check MCP users' group membership at the SSO provider and block users who lost it. Users without an upstream refresh token (password logins, no offline_access) must sign in again after the re-login interval.",
+            "description": "Re-check MCP users' group membership at the SSO provider and block users who lost it. Users without an upstream refresh token (password logins, no offline_access) must sign in again after the re-login interval. Off: no re-checks and no new blocks; existing blocks still apply.",
             "validator": bool,
             "default": True,
         },
@@ -179,9 +179,10 @@ class InvenTreeMCP(
         """
         super().__init__()
 
-        from .auth import signals
+        from .auth import membership, signals
 
         signals.connect_signals()
+        membership.warn_if_unenforceable()
 
         if facade_supported():
             from .auth import settings_inject

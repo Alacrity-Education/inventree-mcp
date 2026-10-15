@@ -37,8 +37,9 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   `plugin_setting(key)` / `plugin_setting_list(key)` with the defaults declared in `core.SETTINGS`.
 - `mcp_server.py` - the `MCPServer` instance; imports `tools/*` for their `@mcp.tool()` side effect.
 - `mcp_transport.py` - Django view bridging Streamable HTTP onto the MCP server; 401 with the OAuth
-  challenge, 401 for users blocked by the membership re-check, background re-check for API-token and
-  Basic requests.
+  challenge; `policy.may_connect()` for every credential (blocked: 401, inactive / outside
+  `MCP_REQUIRED_GROUPS`: 403); for API-token and Basic requests a background re-check and
+  `membership.long_lived_credential_allowed()` (401 past the grace / re-login window).
 - `oauth2_bridge.py` - lets `call_view()` present an OAuth2-authenticated request's real token to
   the proxied view, and works around upstream InvenTree OAuth2 scope-enforcement bugs.
 - `tools/` - one module per resource, each a thin async wrapper around `call_view()`;
@@ -83,20 +84,25 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   membership re-check (`SSO_PROVIDER_ID` or the single `openid_connect` app).
 - `auth/token.py` - `MCPTokenView` (dead refresh tokens sorted out first, then the membership gate,
   then scope re-narrowing, all before DOT), `MCPRevokeView`.
-- `auth/policy.py` - `mcp_scopes_available()`, `effective_scopes()`, `may_connect()` (blocked,
-  `in_required_groups()` / `MCP_REQUIRED_GROUPS`), `narrow()` (`effective_scopes`/`narrow` are stub
-  bodies until WP3).
+- `auth/policy.py` - `mcp_scopes_available()`, `effective_scopes()` (empty outside
+  `MCP_REQUIRED_GROUPS`), `may_connect()` (blocked, `in_required_groups()` / `MCP_REQUIRED_GROUPS`),
+  `narrow()` (`effective_scopes`/`narrow` are stub bodies until WP3).
 - `auth/membership.py` - membership re-check against the SSO provider: `recheck()`,
   `refresh_grant_allowed()`, `token_grant_allowed()`, `recheck_due()`, `is_blocked()`,
   `block_user()`, `unblock_user()`, `revoke_all_mcp_tokens()`. Reuses allauth (the upstream refresh
   token stays in `SocialToken`, `OpenIDConnectOAuth2Adapter` for endpoints and client auth, jwtkit for
   the ID token) and core's `InvenTree.sso.ensure_sso_groups` for the group sync; never compare raw
-  claim strings, decide with `policy.may_connect()`. Every outbound call has a 5 s timeout; re-checks
-  are serialised by a row lock on `MCPUserState`.
+  claim strings. Identity refusals (inactive, outside `MCP_REQUIRED_GROUPS`, upstream
+  `invalid_grant`) block; a `no_mcp_permission` from `policy.may_connect()` only revokes the MCP
+  tokens (`Outcome.NO_MCP_PERMISSION`). The grace and re-login predicates (`within_grace()`,
+  `within_relogin()`) are shared by `refresh_grant_allowed()` and `long_lived_credential_allowed()`.
+  Every outbound call has a 5 s timeout, a provider is left alone for 60 s after a timeout /
+  connection error / 5xx; re-checks are serialised by a row lock on `MCPUserState`.
 - `auth/signals.py` - allauth `user_logged_in`: SSO logins stamp `membership_checked_at` and lift a
-  block, other logins record `last_login_at` (connected from the plugin's `__init__`).
-- `auth/tasks.py` - `cleanup_stale_clients()` (daily), `membership_sweep()` (hourly), both via
-  `ScheduleMixin`; `recheck_user()` (queued by `mcp_transport.py` for API-token/Basic requests).
+  block only when the user is active and in `MCP_REQUIRED_GROUPS`, other logins record
+  `last_login_at` (connected from the plugin's `__init__`).
+- `auth/tasks.py` - `cleanup_stale_clients()` (daily), `membership_sweep()` (hourly, 60 s budget,
+  then a continuation task with the remaining user ids), both via `ScheduleMixin`; `recheck_user()` (queued by `mcp_transport.py` for API-token/Basic requests).
 - `tests/` - OAuth façade tests (`test_auth_*.py`, `test_settings_inject.py`, shared
   `oauth_helpers.py`), membership re-checks (`test_membership.py`, a fake OIDC provider at the
   `requests` boundary); `test_mcp.py` holds the original suite.

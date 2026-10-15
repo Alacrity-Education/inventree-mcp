@@ -133,7 +133,10 @@ granted (read-only scopes while **Read Only** is on).
   `https://claude.com` (browser preflights to `/plugin/` are answered by InvenTree's CORS middleware).
 - Plugin settings: **Enable OAuth Sign-in** (`OAUTH_ENABLED`) on; URL integration, schedule
   integration and app integration (`ENABLE_PLUGINS_APP`, needed for the plugin's `MCPUserState`
-  model; run `invoke migrate` after installing or upgrading) enabled for plugins.
+  model; run `invoke migrate` after installing or upgrading) enabled for plugins. With
+  `MEMBERSHIP_ENFORCED` on and app integration off, the plugin logs a warning at start-up: re-checks
+  and blocks are then disabled. While the migration is missing, reads of the MCP user state fail
+  safe (logged once) instead of failing requests.
 - A reverse proxy that **replaces** `X-Forwarded-For` with the client address instead of appending
   to it, and gunicorn not reachable directly. InvenTree takes the client IP from the *first*
   `X-Forwarded-For` entry, which a client can set itself when the proxy appends; the registration
@@ -157,30 +160,51 @@ on by default):
 
 | Check point | When | What happens |
 |---|---|---|
-| SSO login | every login through the MCP sign-in provider | InvenTree's group sync runs as usual; the plugin records the check and lifts a block. |
+| SSO login | every login through the MCP sign-in provider | InvenTree's group sync runs as usual; the plugin records the check and the login. It lifts a block only when the user is active and in `MCP_REQUIRED_GROUPS`; otherwise the block stays. |
 | Token refresh | when the last check is older than `MEMBERSHIP_RECHECK_INTERVAL_MINUTES` (60) | Synchronous re-check before the token is rotated. A refusal is `invalid_grant`, which makes Claude ask the user to sign in again. |
-| MCP request | every request | Blocked users get `401`. OAuth access tokens need nothing more (they live an hour and are re-checked at refresh). Requests with an InvenTree API token or Basic auth queue a background re-check when the last one is stale; the request never waits. |
-| Hourly sweep | users holding a live MCP refresh token or API token | Background re-check of everyone who is due. |
+| MCP request | every request, any credential | Blocked users get `401` with the OAuth challenge. Users who are inactive or outside `MCP_REQUIRED_GROUPS` get `403` "No MCP permission". OAuth access tokens need nothing more (they live an hour and are re-checked at refresh). Requests with an InvenTree API token or Basic auth queue a background re-check when the last one is stale (the request never waits), and follow the refresh grant's windows: they get `401` (challenge `Bearer realm="InvenTree"` only) when the last re-check found the provider unreachable and the last successful check is older than `MEMBERSHIP_GRACE_HOURS`, or when there is no upstream refresh token and the last login is older than `RELOGIN_INTERVAL_HOURS`. InvenTree's own `/api/` is never affected. |
+| Hourly sweep | users holding a live MCP refresh token or API token | Background re-check of everyone who is due, see below for its time budget. |
 
 The re-check redeems the user's upstream refresh token, which allauth stored at the login
 (`SocialToken`, *Social application tokens* in the admin), at the provider's token endpoint, stores
 the rotated token on the same row, verifies the new ID token against the provider's keys, and feeds
 the `groups` claim (`SSO_GROUP_KEY`) to InvenTree's own SSO group sync (`SSO_GROUP_MAP`,
-`SSO_REMOVE_GROUPS`), exactly as a login does. The user is then still a member when the plugin's
-policy accepts the synced user: active and, when `MCP_REQUIRED_GROUPS` is set, in one of those
-InvenTree groups.
+`SSO_REMOVE_GROUPS`), exactly as a login does. The synced user is then judged by the plugin's
+policy. Identity refusals block the user: inactive, not in one of the `MCP_REQUIRED_GROUPS`, or the
+provider refused the grant. A user whose identity is confirmed but whose groups grant no MCP access
+(for example, no MCP ruleset) is not blocked: only their MCP tokens are revoked.
 
 | Outcome | Effect |
 |---|---|
 | Still a member | Check recorded; the refresh proceeds. |
-| Not a member, or the provider answers `invalid_grant` (user removed, disabled, grant revoked or expired), or the InvenTree user is inactive | User blocked: every MCP token revoked, the upstream token deleted, `401` on MCP, the authorize page says *Access revoked*. The next SSO login lifts the block. |
-| Provider unreachable (timeout, connection error, 5xx, malformed answer, unverifiable ID token) | Refreshes keep working while the last successful check is younger than `MEMBERSHIP_GRACE_HOURS` (4); after that `invalid_grant`, but nothing is revoked or rotated, and the same refresh token works again once the provider is back. |
-| No upstream refresh token (password login, or the provider issued none because `offline_access` was not granted) | Refreshes keep working while the last login to InvenTree is younger than `RELOGIN_INTERVAL_HOURS` (24), then `invalid_grant`. A warning per user and hour names the cause. This is the degraded mode, not the design. |
+| Not in `MCP_REQUIRED_GROUPS` (`revoked_reason` `not_in_required_groups`), the provider answers `invalid_grant` (user removed, disabled, grant revoked or expired), or the InvenTree user is inactive | User blocked: every MCP token revoked, the upstream token deleted, `401` on MCP, the authorize page says *Access revoked*. The next SSO login lifts the block once the user is active and back in a required group; an admin can lift it with `unblock_user`. |
+| Member without MCP permission | Check recorded, the user's MCP tokens revoked, the refresh refused with `invalid_grant`. No block, the upstream token is kept; the next authorize works as soon as an MCP permission is granted. |
+| Provider unreachable (timeout, connection error, 5xx, malformed answer, unverifiable ID token) | Refreshes keep working while the last successful check is younger than `MEMBERSHIP_GRACE_HOURS` (4); after that `invalid_grant`, but nothing is revoked or rotated, and the same refresh token works again once the provider is back. After a timeout, connection error or 5xx the plugin does not call that provider again for 60 seconds; re-checks in that window count as unreachable at once. |
+| No upstream refresh token (password login, or the provider issued none because `offline_access` was not granted) | Refreshes keep working while the last login to InvenTree is younger than `RELOGIN_INTERVAL_HOURS` (24), then `invalid_grant`. A warning per user and hour names the cause. The user is not queued for another background re-check within the re-check interval. This is the degraded mode, not the design. |
+
+API tokens and Basic credentials follow the same two windows on the MCP endpoint, judged by the last
+recorded re-check (see the check-point table). Service accounts that use an API token with
+`MEMBERSHIP_ENFORCED` on therefore need an upstream refresh token, or an interactive login within
+`RELOGIN_INTERVAL_HOURS`.
 
 Every call to the provider has a 5 second timeout, re-checks of one user are serialised, and the logs
 carry only user ids, the provider host and reason codes (never tokens, claims or addresses). The
 state is visible in the admin under *MCP user states* (`membership_checked_at`, `access_revoked_at`,
 `revoked_reason`, `last_recheck_error`).
+
+The hourly sweep runs as one background task. django-q kills a task after InvenTree's
+`background.timeout` (`INVENTREE_BACKGROUND_TIMEOUT`, 90 seconds by default), and one re-check can
+take up to about 20 seconds when the provider is slow. The sweep therefore starts no new re-check
+after 60 seconds and queues the remaining users as a continuation task. Raising
+`background.timeout` gives it more room; lowering it below about 85 seconds risks a sweep being killed
+in the middle of a re-check. A re-check holds a database row lock for the user while it talks to the
+provider; replacing that with a short lease is planned hardening.
+
+The plugin keeps short-lived markers in Django's cache: the provider back-off, the "re-check queued"
+marker of each user, the "no upstream token" warning marker and the provider's discovery document.
+With InvenTree's global cache (Redis) they are shared by all processes. Without it every web and
+background worker process has its own, so the back-off and the markers apply per process and the
+hourly warning can appear once per process.
 
 **Authentik (or any OIDC provider) prerequisites:**
 
@@ -271,11 +295,11 @@ OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
 | `UNUSED_CLIENT_RETENTION_DAYS` | `90` | Daily cleanup of registered clients without a live token. |
 | `OAUTH_FORCE_SSO` | `True` | Send the browser straight to the SSO provider when it has no InvenTree session. |
 | `SSO_PROVIDER_ID` | empty | allauth provider id to sign in with and to re-check membership at; empty selects the single configured `openid_connect` provider. |
-| `MEMBERSHIP_ENFORCED` | `True` | Re-check group membership at the SSO provider and block users who lost it ([Membership re-checks](#membership-re-checks)). Off: no re-checks, no blocks. |
+| `MEMBERSHIP_ENFORCED` | `True` | Re-check group membership at the SSO provider and block users who lost it ([Membership re-checks](#membership-re-checks)). Off: no re-checks and no new blocks; existing blocks still apply until an SSO login that passes the identity checks or `unblock_user`. |
 | `MEMBERSHIP_RECHECK_INTERVAL_MINUTES` | `60` | How old the last check may be before a refresh re-checks. |
 | `MEMBERSHIP_GRACE_HOURS` | `4` | How long refreshes keep working while the provider is unreachable. |
 | `RELOGIN_INTERVAL_HOURS` | `24` | Without an upstream refresh token, how long after the last login refreshes keep working. |
-| `MCP_REQUIRED_GROUPS` | empty | Comma separated InvenTree group names (case-insensitive); when set, a user must be in one of them to connect and to keep the connection. |
+| `MCP_REQUIRED_GROUPS` | empty | Comma separated InvenTree group names (case-insensitive); when set, a user must be in one of them to connect and to keep the connection, with any credential (OAuth, API token, Basic). |
 
 The lifetime settings are injected into django-oauth-toolkit at runtime and therefore apply to
 **every** OAuth2 application on the instance while `OAUTH_ENABLED` is on (InvenTree has no

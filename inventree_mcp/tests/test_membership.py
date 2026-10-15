@@ -9,6 +9,7 @@ the dev stack; allauth then stores SocialToken rows with app=NULL.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import time
@@ -27,10 +28,11 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.core.cache import cache
+from django.db import connection
 from django.test import Client, RequestFactory, override_settings
 from django.utils import timezone
 from InvenTree.unit_test import InvenTreeTestCase
-from oauth2_provider.models import AccessToken, RefreshToken
+from oauth2_provider.models import AccessToken, RefreshToken, get_application_model
 from users.models import ApiToken
 
 from ..auth import membership, policy, tasks
@@ -341,6 +343,23 @@ class MemberRecheckTest(MembershipTestCase):
         self.assertIn(("GET", USERINFO_URL, 5), self.idp.calls)
         self.assertEqual(self.group_names(), {"MCP Users"})
 
+    def test_group_sync_seeds_userinfo_from_the_id_token(self):
+        """F9: without stored userinfo the claim goes next to the ID token's data, not a stub."""
+        self.account.extra_data = {
+            "id_token": {"sub": SUB, "preferred_username": "member-1"}
+        }
+        self.account.save()
+        self.set_checked(hours_ago=2)
+
+        self.assertEqual(membership.recheck(self.user), Outcome.MEMBER)
+
+        self.account.refresh_from_db()
+        userinfo = self.account.extra_data["userinfo"]
+        self.assertEqual(userinfo["preferred_username"], "member-1")
+        self.assertEqual(userinfo["sub"], SUB)
+        self.assertEqual(userinfo["groups"], ["idp-mcp", "idp-users"])
+        self.assertIn("id_token", self.account.extra_data)
+
     def test_second_recheck_in_one_interval_makes_no_call(self):
         """Test 11: serialised by the row lock, re-read inside it."""
         self.set_checked(hours_ago=2)
@@ -369,7 +388,7 @@ class NotMemberTest(MembershipTestCase):
         self.assertEqual(response.status_code, 400, response.content)
         self.assertEqual(response.json()["error"], "invalid_grant")
         self.assertEqual(self.group_names(), {"Users"})
-        self.assert_blocked("no_mcp_permission")
+        self.assert_blocked(membership.NOT_IN_REQUIRED_GROUPS)
 
         # The next refresh is refused without asking the provider again.
         calls = len(self.idp.calls)
@@ -409,7 +428,13 @@ class NotMemberTest(MembershipTestCase):
         self.assertEqual(response.status_code, 400, response.content)
         self.assertEqual(response.json()["error"], "invalid_grant")
         self.assert_blocked("invalid_grant")
-        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+        # A fresh token pair (block_user already deleted the old one) is refused
+        # because of the block itself.
+        application = RefreshToken.objects.filter(user=self.user).first().application
+        access, _refresh = make_token_pair(application, self.user)
+        response = self.mcp_call(access.token)
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Access revoked", response.json()["error"]["message"])
         self.assertEqual(self.authorize_page().context["reason"], "blocked")
 
     def test_inactive_user_is_blocked(self):
@@ -418,6 +443,52 @@ class NotMemberTest(MembershipTestCase):
 
         self.assertEqual(membership.recheck(self.user), Outcome.NOT_MEMBER)
         self.assertEqual(self.state().revoked_reason, "inactive")
+
+
+class NoMcpPermissionTest(MembershipTestCase):
+    """A confirmed member whose groups grant no MCP access: revoke, never block."""
+
+    def test_member_without_mcp_permission_is_revoked_not_blocked(self):
+        tokens = self._tokens()
+        self.set_checked(hours_ago=2)
+
+        # In MCP_REQUIRED_GROUPS, but the policy refuses for another reason
+        # (WP3: no MCP ruleset).
+        with (
+            patch.object(
+                policy, "may_connect", return_value=(False, "no_mcp_permission")
+            ),
+            self.assertLogs("inventree", level="INFO") as logs,
+        ):
+            self.assertEqual(
+                membership.refresh_grant_allowed(self.user), (False, "invalid_grant")
+            )
+
+        self.assertTrue(
+            any("member without MCP permission" in line for line in logs.output)
+        )
+        state = self.state()
+        self.assertIsNone(state.access_revoked_at)
+        self.assertEqual(state.revoked_reason, "")
+        self.assertEqual(state.last_recheck_error, "")
+        self.assertGreater(
+            state.membership_checked_at, timezone.now() - datetime.timedelta(minutes=1)
+        )
+        self.assertFalse(membership.is_blocked(self.user))
+        # The upstream token is kept (rotated), the MCP tokens are revoked.
+        self.assertEqual(self.upstream_token().token_secret, "upstream-rt-1")
+        self.assertFalse(
+            RefreshToken.objects.filter(user=self.user, revoked__isnull=True).exists()
+        )
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
+        # The sweep counts the new outcome like any other.
+        with patch.object(
+            membership, "recheck", return_value=Outcome.NO_MCP_PERMISSION
+        ):
+            ApiToken.objects.create(user=self.user, name="sweep")
+            self.set_checked(hours_ago=2)
+            self.assertEqual(tasks.membership_sweep(), {"no_mcp_permission": 1})
 
 
 class UnreachableTest(MembershipTestCase):
@@ -436,6 +507,7 @@ class UnreachableTest(MembershipTestCase):
     def test_within_grace_refresh_succeeds(self):
         for mode, (code, rotated) in self.FAILURES.items():
             with self.subTest(mode=mode):
+                cache.clear()  # the provider back-off of the previous mode
                 tokens = self._tokens()
                 secret_before = self.upstream_token().token_secret
                 self.set_checked(hours_ago=2)  # grace is 4 hours
@@ -456,6 +528,7 @@ class UnreachableTest(MembershipTestCase):
     def test_past_grace_refused_without_revoking_then_works_again(self):
         for mode in self.FAILURES:
             with self.subTest(mode=mode):
+                cache.clear()
                 self.idp.mode = "ok"
                 tokens = self._tokens()
                 self.set_checked(hours_ago=5)
@@ -470,11 +543,48 @@ class UnreachableTest(MembershipTestCase):
                 # Nothing rotated or revoked: the pair still works ...
                 self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 200)
 
-                # ... and the same refresh token works once the provider is back.
+                # ... and the same refresh token works once the provider is back
+                # (and the back-off marker has expired).
+                cache.clear()
                 self.idp.mode = "ok"
                 response = self.refresh(self.client_id, tokens["refresh_token"])
                 self.assertEqual(response.status_code, 200, response.content)
                 self.assertEqual(self.state().last_recheck_error, "")
+
+    def test_provider_backoff_after_an_outage(self):
+        """F3: after a timeout, connection error or 5xx no re-check calls out for a while."""
+        for mode, code in (
+            ("timeout", "timeout"),
+            ("connection_error", "connection_error"),
+            ("503", "http_5xx"),
+        ):
+            with self.subTest(mode=mode):
+                cache.clear()
+                self.idp.mode = mode
+                outcome = membership.recheck(self.user, force=True)
+                self.assertEqual(outcome, Outcome.UNREACHABLE)
+                calls = len(self.idp.calls)
+
+                # The provider is back, but the marker keeps further re-checks local.
+                self.idp.mode = "ok"
+                for _attempt in range(3):
+                    outcome = membership.recheck(self.user, force=True)
+                    self.assertEqual(outcome, Outcome.UNREACHABLE)
+                self.assertEqual(len(self.idp.calls), calls)
+                self.assertEqual(self.state().last_recheck_error, code)
+                self.assertIsNotNone(self.upstream_token())
+
+                # Once the marker expires the provider is asked again.
+                cache.delete(membership._backoff_key("authentik"))
+                outcome = membership.recheck(self.user, force=True)
+                self.assertEqual(outcome, Outcome.MEMBER)
+                self.assertGreater(len(self.idp.calls), calls)
+
+    def test_no_backoff_for_answers_of_a_reachable_provider(self):
+        self.idp.mode = "bad_signature"
+        self.assertEqual(membership.recheck(self.user, force=True), Outcome.UNREACHABLE)
+        self.idp.mode = "ok"
+        self.assertEqual(membership.recheck(self.user, force=True), Outcome.MEMBER)
 
     def test_without_id_token_userinfo_confirms_the_subject(self):
         self.idp.mode = "no_id_token"
@@ -549,13 +659,20 @@ class DueAndEnforcementTest(MembershipTestCase):
         self.assertTrue(membership.recheck_due(self.user))
 
     def test_enforcement_off(self):
+        """Off: no re-checks and no new blocks, but existing blocks are honoured."""
         tokens = self._tokens()
         self.set_checked(hours_ago=24, access_revoked_at=timezone.now())
         self.set_setting("MEMBERSHIP_ENFORCED", False)
 
         self.assertEqual(membership.recheck(self.user, force=True), Outcome.DISABLED)
-        self.assertFalse(membership.is_blocked(self.user))
         self.assertFalse(membership.recheck_due(self.user))
+        self.assertTrue(membership.is_blocked(self.user))
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
+        # An admin lifts the block by hand; nothing calls the provider.
+        membership.unblock_user(self.user)
         response = self.refresh(self.client_id, tokens["refresh_token"])
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(self.idp.calls, [])
@@ -599,6 +716,46 @@ class LoginSignalTest(MembershipTestCase):
         self.assertGreater(
             state.membership_checked_at, now - datetime.timedelta(minutes=1)
         )
+
+    def test_sso_login_of_a_non_member_keeps_the_block(self):
+        """F4: core's sync removed the required group, so the login does not lift the block."""
+        membership.block_user(self.user, membership.NOT_IN_REQUIRED_GROUPS)
+        self.user.groups.remove(Group.objects.get(name="MCP Users"))
+
+        with self.assertLogs("inventree", level="INFO") as logs:
+            self.sso_login()
+
+        state = self.state()
+        now = timezone.now()
+        self.assertIsNotNone(state.access_revoked_at)
+        self.assertEqual(state.revoked_reason, membership.NOT_IN_REQUIRED_GROUPS)
+        self.assertTrue(membership.is_blocked(self.user))
+        self.assertGreater(state.last_login_at, now - datetime.timedelta(minutes=1))
+        self.assertGreater(
+            state.membership_checked_at, now - datetime.timedelta(minutes=1)
+        )
+        self.assertTrue(any("kept the MCP block" in line for line in logs.output))
+
+    def test_sso_login_of_an_inactive_user_keeps_the_block(self):
+        membership.block_user(self.user, "inactive")
+        self.user.is_active = False
+        self.user.save()
+
+        self.sso_login()
+
+        self.assertTrue(membership.is_blocked(self.user))
+
+    def test_sso_login_of_an_unblocked_non_member_blocks_nothing(self):
+        """No new block at login: the policy (403 / empty scopes) refuses instead."""
+        self.user.groups.remove(Group.objects.get(name="MCP Users"))
+
+        self.sso_login()
+
+        state = self.state()
+        self.assertIsNone(state.access_revoked_at)
+        self.assertIsNotNone(state.membership_checked_at)
+        self.assertEqual(policy.may_connect(self.user), (False, "no_mcp_permission"))
+        self.assertEqual(policy.effective_scopes(self.user), set())
 
     def test_password_login_only_records_the_login(self):
         membership.block_user(self.user, "no_mcp_permission")
@@ -657,6 +814,102 @@ class TransportTest(MembershipTestCase):
         self.assertEqual(tasks.recheck_user(self.user.pk), "member")
         self.assertEqual(tasks.recheck_user(10**9), "missing")
 
+    def test_user_outside_required_groups_gets_403(self):
+        """F1: MCP_REQUIRED_GROUPS applies to API tokens (and OAuth tokens) on /mcp."""
+        tokens = self._tokens()
+        self.set_checked(hours_ago=0.1)
+        self.user.groups.remove(Group.objects.get(name="MCP Users"))
+
+        with patch("InvenTree.tasks.offload_task") as offload:
+            response = self.call_with_api_token()
+        self.assertEqual(response.status_code, 403, response.content)
+        self.assertEqual(response.json()["error"]["message"], "No MCP permission")
+        self.assertNotIn("WWW-Authenticate", response)
+        offload.assert_not_called()
+
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 403)
+
+        # The rest of InvenTree is unaffected.
+        response = Client().get(
+            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.api_token.key}"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+    def assert_suspended(self, response, text: str) -> None:
+        self.assertEqual(response.status_code, 401, response.content)
+        self.assertIn(text, response.json()["error"]["message"])
+        self.assertEqual(response["WWW-Authenticate"], 'Bearer realm="InvenTree"')
+
+    def test_unreachable_past_grace_denies_long_lived_credentials(self):
+        """F7: the last re-check found the provider unreachable, grace is over."""
+        self.set_checked(hours_ago=5, last_recheck_error="connection_error")
+
+        with patch("InvenTree.tasks.offload_task") as offload:
+            response = self.call_with_api_token()
+        self.assert_suspended(response, "could not be confirmed")
+        # A re-check is still queued: it lets the credential in again.
+        offload.assert_called_once()
+
+        # Basic is a long-lived credential too.
+        self.user.set_password("pw-123")
+        self.user.save()
+        basic = base64.b64encode(f"{self.user.username}:pw-123".encode()).decode()
+        with patch("InvenTree.tasks.offload_task"):
+            response = self.mcp_call(HTTP_AUTHORIZATION=f"Basic {basic}")
+        self.assert_suspended(response, "could not be confirmed")
+
+        # The interactive API is never affected.
+        response = Client().get(
+            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.api_token.key}"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        # Within the grace period, or with the provider back, it works.
+        self.set_checked(hours_ago=2, last_recheck_error="connection_error")
+        with patch("InvenTree.tasks.offload_task"):
+            self.assertEqual(self.call_with_api_token().status_code, 200)
+        self.set_checked(hours_ago=5, last_recheck_error="")
+        with patch("InvenTree.tasks.offload_task"):
+            self.assertEqual(self.call_with_api_token().status_code, 200)
+
+    def test_no_upstream_token_past_relogin_denies_long_lived_credentials(self):
+        """F7: no upstream token and the last login is older than the re-login interval."""
+        long_ago = timezone.now() - datetime.timedelta(hours=25)
+        self.set_checked(hours_ago=None, last_recheck_error="no_token")
+        MCPUserState.objects.filter(user=self.user).update(last_login_at=long_ago)
+        User.objects.filter(pk=self.user.pk).update(last_login=long_ago)
+
+        with patch("InvenTree.tasks.offload_task"):
+            response = self.call_with_api_token()
+        self.assert_suspended(response, "sign in to InvenTree again")
+
+        response = Client().get(
+            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.api_token.key}"
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        # A login inside the interval lets the credential in again.
+        MCPUserState.objects.filter(user=self.user).update(last_login_at=timezone.now())
+        with patch("InvenTree.tasks.offload_task"):
+            self.assertEqual(self.call_with_api_token().status_code, 200)
+
+        # Enforcement off: the windows do not apply.
+        MCPUserState.objects.filter(user=self.user).update(last_login_at=long_ago)
+        self.set_setting("MEMBERSHIP_ENFORCED", False)
+        self.assertEqual(self.call_with_api_token().status_code, 200)
+
+    def test_no_upstream_token_holds_the_queue_marker_for_the_interval(self):
+        """F5: a user without an upstream token is not queued again within the interval."""
+        self.upstream.delete()
+        self.set_checked(hours_ago=2)
+
+        self.assertEqual(tasks.recheck_user(self.user.pk), "no_upstream_token")
+        self.assertTrue(cache.get(membership.recheck_queued_key(self.user.pk)))
+
+        with patch("InvenTree.tasks.offload_task") as offload:
+            self.assertEqual(self.call_with_api_token().status_code, 200)
+        offload.assert_not_called()
+
     def test_blocked_user_gets_401(self):
         membership.block_user(self.user, "no_mcp_permission")
 
@@ -699,6 +952,21 @@ class SweepTest(MembershipTestCase):
         user("due-no-tokens", old)
         user("due-blocked", old, refresh=True, blocked=True)
         user("due-revoked-api", old, api_token=False)
+
+        # An expired API token, and a refresh token of a non-façade application.
+        expired = user("due-expired-api", old)
+        ApiToken.objects.create(
+            user=expired,
+            name="t",
+            expiry=timezone.now().date() - datetime.timedelta(days=1),
+        )
+        other_app = get_application_model().objects.create(
+            name="Not MCP",
+            client_type="public",
+            authorization_grant_type="authorization-code",
+            redirect_uris="http://127.0.0.1/cb",
+        )
+        make_token_pair(other_app, user("due-other-app", old))
         self.set_checked(hours_ago=0.1)  # self.user holds no MCP token anyway
 
         seen = []
@@ -718,6 +986,45 @@ class SweepTest(MembershipTestCase):
         self.assertTrue(
             any("membership sweep: member=2" in line for line in logs.output)
         )
+
+    def test_sweep_stops_at_its_time_budget_and_queues_the_rest(self):
+        """F2 minimum: no new re-check after the budget; the rest goes to a continuation."""
+        accounts = []
+        for index in range(3):
+            account = User.objects.create_user(username=f"sweep-{index}", password="x")
+            ApiToken.objects.create(user=account, name="t")
+            accounts.append(account)
+        pks = [account.pk for account in accounts]
+
+        seen = []
+
+        def fake_recheck(account, *, force=False):
+            seen.append(account.pk)
+            return Outcome.MEMBER
+
+        # Started at 0 s; the second user is reached after 61 s.
+        with (
+            patch.object(tasks, "_clock", side_effect=[0, 61]),
+            patch.object(membership, "recheck", side_effect=fake_recheck),
+            patch("InvenTree.tasks.offload_task") as offload,
+        ):
+            counts = tasks.membership_sweep()
+
+        self.assertEqual(seen, pks[:1])
+        self.assertEqual(counts, {"member": 1, "deferred": 2})
+        offload.assert_called_once_with(
+            "inventree_mcp.auth.tasks.membership_sweep",
+            pks[1:],
+            force_async=True,
+            check_duplicates=True,
+        )
+
+        # The continuation re-checks exactly the deferred users.
+        seen.clear()
+        with patch.object(membership, "recheck", side_effect=fake_recheck):
+            counts = tasks.membership_sweep(pks[1:])
+        self.assertEqual(seen, pks[1:])
+        self.assertEqual(counts, {"member": 2})
 
     def test_sweep_does_nothing_when_not_enforced(self):
         self.set_setting("MEMBERSHIP_ENFORCED", False)
@@ -740,3 +1047,61 @@ class ModelPermissionTest(MembershipTestCase):
         self.assertFalse(MCPUserState.check_user_permission(owner, "change", state))
         self.assertFalse(MCPUserState.check_user_permission(other, "view", state))
         self.assertFalse(MCPUserState.check_user_permission(owner, "view"))
+
+
+class MissingTableTest(MembershipTestCase):
+    """F10: a missing table (migrations not applied) never turns MCP requests into 500s."""
+
+    def setUp(self):
+        super().setUp()
+        self.api_token = ApiToken.objects.create(user=self.user, name="mcp test")
+        membership._db_error_logged = False
+        self.addCleanup(setattr, membership, "_db_error_logged", False)
+
+    def test_reads_fail_safe_and_log_once(self):
+        # The table really goes missing (DDL is transactional in PostgreSQL;
+        # the test's rollback restores it).
+        table = apps.get_model("inventree_mcp", "MCPUserState")._meta.db_table
+        with connection.cursor() as cursor:
+            cursor.execute(f"ALTER TABLE {table} RENAME TO {table}_moved")
+
+        with self.assertLogs("inventree", level="WARNING") as logs:
+            self.assertFalse(membership.is_blocked(self.user))
+            self.assertFalse(membership.is_blocked(self.user))
+            self.assertFalse(membership.recheck_due(self.user))
+            self.assertEqual(
+                membership.long_lived_credential_allowed(self.user), (True, "")
+            )
+            response = self.mcp_call(HTTP_AUTHORIZATION=f"Token {self.api_token.key}")
+            self.assertEqual(response.status_code, 200, response.content)
+
+        warnings = [
+            line for line in logs.output if "cannot read MCP user state" in line
+        ]
+        self.assertEqual(len(warnings), 1)
+        # The connection is still usable (each read ran in its own savepoint).
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        self.assertTrue(User.objects.filter(pk=self.user.pk).exists())
+
+    def test_warning_at_load_without_app_integration(self):
+        membership._unenforceable_logged = False
+        self.addCleanup(setattr, membership, "_unenforceable_logged", False)
+
+        with (
+            override_settings(PLUGIN_TESTING=False),
+            patch("common.settings.get_global_setting", return_value=False),
+            self.assertLogs("inventree", level="WARNING") as logs,
+        ):
+            membership.warn_if_unenforceable()
+            membership.warn_if_unenforceable()
+        warnings = [line for line in logs.output if "ENABLE_PLUGINS_APP" in line]
+        self.assertEqual(len(warnings), 1)
+
+        membership._unenforceable_logged = False
+        with (
+            override_settings(PLUGIN_TESTING=True),  # the app is installed
+            patch.object(membership.logger, "warning") as warning,
+        ):
+            membership.warn_if_unenforceable()
+        warning.assert_not_called()

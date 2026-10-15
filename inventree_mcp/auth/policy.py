@@ -1,10 +1,11 @@
 """Which MCP scopes a user may hold, and whether they may connect at all.
 
-effective_scopes() and narrow() are WP1 stub bodies (every active user gets
-every advertised MCP scope); WP3 replaces them with the MCP ruleset. The
-signatures and the call sites in authorize.py, token.py and discovery.py stay
-as they are. may_connect() also applies the membership block (WP2) and
-MCP_REQUIRED_GROUPS (in_required_groups()).
+effective_scopes() is a WP1 stub body (every active user in
+MCP_REQUIRED_GROUPS gets every advertised MCP scope); WP3 replaces it with the
+MCP ruleset. The signatures and the call sites in authorize.py, token.py,
+discovery.py and mcp_transport.py stay as they are. may_connect() also applies
+the membership block (WP2) and MCP_REQUIRED_GROUPS (in_required_groups()), so
+authorize, refresh narrowing and the MCP endpoint agree without separate checks.
 """
 
 from __future__ import annotations
@@ -46,10 +47,17 @@ def mcp_scopes_available() -> list[str]:
 
 
 def effective_scopes(user) -> set[str]:
-    """The MCP scopes *user* may hold. Stub: everything advertised, for active users."""
-    if user is not None and user.is_authenticated and user.is_active:
-        return set(mcp_scopes_available())
-    return set()
+    """The MCP scopes *user* may hold.
+
+    Empty for anonymous and inactive users and for users outside
+    MCP_REQUIRED_GROUPS. Stub otherwise: everything advertised (WP3: the
+    MCP ruleset).
+    """
+    if user is None or not user.is_authenticated or not user.is_active:
+        return set()
+    if not in_required_groups(user):
+        return set()
+    return set(mcp_scopes_available())
 
 
 def in_required_groups(user) -> bool:
