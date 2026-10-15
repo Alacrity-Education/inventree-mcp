@@ -39,7 +39,14 @@ logger = logging.getLogger("inventree")
 #: Up to this many group members are revoked in the request; more go to a background task.
 REVOKE_SYNC_LIMIT = 20
 
-_FLAGS = ("can_view", "can_add", "can_change", "can_delete")
+
+def _flags() -> tuple[str, ...]:
+    """MCPRuleSet.RULE_OPTIONS (imported late: the plugin's app may not be installed)."""
+    from ..models import MCPRuleSet
+
+    return MCPRuleSet.RULE_OPTIONS
+
+
 #: The ruleset model as a lazy sender: connected once the plugin's app is installed.
 _RULESET_MODEL = "inventree_mcp.MCPRuleSet"
 
@@ -105,19 +112,31 @@ def on_user_logged_in(sender, request=None, user=None, sociallogin=None, **kwarg
 
 def ensure_rulesets(group) -> int:
     """Create the missing MCPRuleSet rows (all flags false) of *group*; returns how many."""
+    return ensure_rulesets_for([group])
+
+
+def ensure_rulesets_for(groups) -> int:
+    """ensure_rulesets() for several groups: one SELECT, at most one bulk INSERT."""
     from users.ruleset import RULESET_NAMES
 
     from ..models import MCPRuleSet
 
+    group_ids = [group.pk for group in groups]
+    if not group_ids:
+        return 0
     existing = set(
-        MCPRuleSet.objects.filter(group=group).values_list("name", flat=True)
-    )
-    missing = [str(name) for name in RULESET_NAMES if str(name) not in existing]
-    if missing:
-        MCPRuleSet.objects.bulk_create(
-            [MCPRuleSet(group=group, name=name) for name in missing],
-            ignore_conflicts=True,
+        MCPRuleSet.objects.filter(group_id__in=group_ids).values_list(
+            "group_id", "name"
         )
+    )
+    missing = [
+        MCPRuleSet(group_id=group_id, name=str(name))
+        for group_id in group_ids
+        for name in RULESET_NAMES
+        if (group_id, str(name)) not in existing
+    ]
+    if missing:
+        MCPRuleSet.objects.bulk_create(missing, ignore_conflicts=True)
     return len(missing)
 
 
@@ -125,38 +144,28 @@ def grants_anything(rows) -> bool:
     """Whether any of *rows* (MCPRuleSet instances or flag dicts) has a true flag."""
     for row in rows:
         get = row.get if isinstance(row, dict) else lambda f, r=row: getattr(r, f)
-        if any(get(flag) for flag in _FLAGS):
+        if any(get(flag) for flag in _flags()):
             return True
     return False
 
 
 def live_mcp_token_count(user_ids) -> int:
-    """Live façade tokens of *user_ids* (unrevoked refresh tokens plus access tokens)."""
-    from oauth2_provider.models import get_access_token_model, get_refresh_token_model
+    """Live façade tokens of *user_ids* (unrevoked refresh plus unexpired access tokens)."""
+    from .membership import mcp_token_querysets
 
-    from .clients import mcp_applications
-
-    applications = mcp_applications()
-    refresh = get_refresh_token_model().objects.filter(
-        user_id__in=user_ids, revoked__isnull=True, application__in=applications
-    )
-    access = get_access_token_model().objects.filter(
-        user_id__in=user_ids, application__in=applications
-    )
+    refresh, access = mcp_token_querysets(user_ids)
     return refresh.count() + access.count()
 
 
 def revoke_users(user_ids, why: str) -> tuple[int, int]:
     """Revoke the MCP tokens of *user_ids*: (users, tokens).
 
-    Up to REVOKE_SYNC_LIMIT users synchronously; more are handed to
-    ``tasks.revoke_mcp_tokens`` (offload_task runs it inline when no worker
-    is running), and *tokens* is then the number of live tokens at queueing
-    time. Logs counts only.
+    Up to REVOKE_SYNC_LIMIT users synchronously (``tasks.revoke_mcp_tokens``
+    called inline); more are handed to that task (offload_task runs it inline
+    when no worker is running), and *tokens* is then the number of live
+    tokens at queueing time. Logs counts only.
     """
-    from django.contrib.auth import get_user_model
-
-    from .membership import revoke_all_mcp_tokens
+    from .tasks import revoke_mcp_tokens
 
     user_ids = sorted(set(user_ids))
     if not user_ids:
@@ -179,17 +188,7 @@ def revoke_users(user_ids, why: str) -> tuple[int, int]:
         )
         return len(user_ids), tokens
 
-    tokens = sum(
-        revoke_all_mcp_tokens(user)
-        for user in get_user_model().objects.filter(pk__in=user_ids)
-    )
-    logger.info(
-        "inventree-mcp: %s; revoked %s MCP tokens of %s users",
-        why,
-        tokens,
-        len(user_ids),
-    )
-    return len(user_ids), tokens
+    return len(user_ids), revoke_mcp_tokens(user_ids, why)
 
 
 def revoke_group_members(
@@ -237,7 +236,7 @@ def on_group_deleting(sender, instance=None, **kwargs):
     try:
         with transaction.atomic():
             granted = grants_anything(
-                MCPRuleSet.objects.filter(group=instance).values(*_FLAGS)
+                MCPRuleSet.objects.filter(group=instance).values(*_flags())
             )
     except DatabaseError:
         return
@@ -257,7 +256,7 @@ def on_ruleset_saving(sender, instance=None, raw=False, **kwargs):
     if raw or instance is None or instance.pk is None:
         return
     instance._mcp_previous_flags = (
-        type(instance).objects.filter(pk=instance.pk).values(*_FLAGS).first()
+        type(instance).objects.filter(pk=instance.pk).values(*_flags()).first()
     )
 
 
@@ -267,7 +266,7 @@ def on_ruleset_saved(sender, instance=None, created=False, raw=False, **kwargs):
     if raw or created or not previous:
         return
     instance._mcp_previous_flags = None
-    if any(previous[flag] and not getattr(instance, flag) for flag in _FLAGS):
+    if any(previous[flag] and not getattr(instance, flag) for flag in _flags()):
         revoke_group_members(instance.group, "MCP permissions of a group reduced")
 
 

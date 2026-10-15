@@ -212,6 +212,8 @@ class TransportNarrowingTest(PermissionSetTestCase):
         super().setUpTestData()
         category = PartCategory.objects.create(name="WP3")
         Part.objects.create(name="WP3 part", description="x", category=category)
+        # A second part, so list_parts {"limit": 1} has a "next" link.
+        Part.objects.create(name="WP3 part 2", description="x", category=category)
 
     def setUp(self):
         super().setUp()
@@ -225,7 +227,7 @@ class TransportNarrowingTest(PermissionSetTestCase):
         self.assertEqual(response.status_code, 200, response.content)
         return {tool["name"] for tool in response.json()["result"]["tools"]}
 
-    def call_tool(self, name: str, **headers):
+    def call_tool(self, name: str, arguments: dict | None = None, **headers):
         return (
             Client()
             .post(
@@ -234,7 +236,7 @@ class TransportNarrowingTest(PermissionSetTestCase):
                     "jsonrpc": "2.0",
                     "id": 5,
                     "method": "tools/call",
-                    "params": {"name": name, "arguments": {}},
+                    "params": {"name": name, "arguments": arguments or {}},
                 }),
                 content_type="application/json",
                 HTTP_ACCEPT="application/json, text/event-stream",
@@ -249,6 +251,7 @@ class TransportNarrowingTest(PermissionSetTestCase):
             application, self.user, scope=" ".join(policy.narrow(None, self.user))
         )
         oauth_tools = self.tools(HTTP_AUTHORIZATION=f"Bearer {access.token}")
+        access_rows = list(AccessToken.objects.values_list("pk", "scope", "expires"))
         token_tools = self.tools(HTTP_AUTHORIZATION=f"Token {self.api_token}")
 
         self.assertEqual(token_tools, oauth_tools)
@@ -265,12 +268,127 @@ class TransportNarrowingTest(PermissionSetTestCase):
             "list_parts", HTTP_AUTHORIZATION=f"Token {self.api_token}"
         )["result"]
         self.assertFalse(result.get("isError"), result)
+        # Nothing persisted through the whole proxy path (the scoped token is unsaved).
+        self.assertEqual(
+            list(AccessToken.objects.values_list("pk", "scope", "expires")),
+            access_rows,
+        )
 
         # The interactive API is untouched: the same API token reads stock.
         response = Client().get(
             "/api/stock/", HTTP_AUTHORIZATION=f"Token {self.api_token}"
         )
         self.assertEqual(response.status_code, 200)
+
+    def non_facade_token(self, scope: str) -> AccessToken:
+        """A token of an application registered by hand (core's /o/ issues such tokens)."""
+        from oauth2_provider.models import get_application_model
+
+        Application = get_application_model()
+        application = Application.objects.create(
+            name="Admin-registered client",
+            client_type=Application.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://client.example/callback",
+            registration_source=Application.RegistrationSource.MANUAL,
+            user=None,
+        )
+        access, _refresh = make_token_pair(application, self.user, scope=scope)
+        return access
+
+    def test_non_facade_oauth_token_is_cut_to_the_mcp_roles(self):
+        """F1: interactive stock view and a stock scope, but MCP grants parts only."""
+        access = self.non_facade_token("g:read r:view:stock r:view:part")
+        bearer = {"HTTP_AUTHORIZATION": f"Bearer {access.token}"}
+
+        tools = self.tools(**bearer)
+        self.assertIn("list_parts", tools)
+        self.assertNotIn("list_stock_items", tools)
+        result = self.call_tool("list_stock_items", **bearer)["result"]
+        self.assertTrue(result["isError"])
+        self.assertIn("permission", result["content"][0]["text"])
+        result = self.call_tool("list_parts", {"limit": 1}, **bearer)["result"]
+        self.assertFalse(result.get("isError"), result)
+        # The presented token itself is unchanged.
+        access.refresh_from_db()
+        self.assertEqual(access.scope, "g:read r:view:stock r:view:part")
+
+    def test_oauth_token_without_any_mcp_scope_gets_403(self):
+        access = self.non_facade_token("r:view:stock r:change:part")
+        response = self.mcp_call(access.token)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["message"], "No MCP permission")
+
+    def test_leaving_the_group_takes_effect_at_the_next_request(self):
+        """F3: no revocation needed, the transport cuts to the current MCP scopes."""
+        MCPRuleSet.objects.filter(group=self.group).update(can_view=False)
+        mcp_group = Group.objects.create(name="MCP parts")
+        grant_mcp(mcp_group, "part.view")
+        self.user.groups.add(mcp_group)
+        application = self.create_cimd_application()
+        access, refresh = make_token_pair(
+            application, self.user, scope="g:read r:view:part"
+        )
+        self.assertEqual(self.mcp_call(access.token).status_code, 200)
+
+        self.user.groups.remove(mcp_group)
+        response = self.mcp_call(access.token)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["message"], "No MCP permission")
+        refresh.refresh_from_db()
+        self.assertIsNone(refresh.revoked)  # nothing revoked, nothing needed
+
+    @override_settings(ALLOWED_HOSTS=["mcp.example"])
+    def test_paginated_list_uses_the_request_host(self):
+        """F2: proxied requests carry the MCP request's host, not "testserver"."""
+        for authorization in (
+            f"Token {self.api_token}",
+            "Bearer "
+            + make_token_pair(
+                self.create_cimd_application(), self.user, scope="g:read r:view:part"
+            )[0].token,
+        ):
+            result = self.call_tool(
+                "list_parts",
+                {"limit": 1},
+                HTTP_AUTHORIZATION=authorization,
+                HTTP_HOST="mcp.example",
+            )["result"]
+            self.assertFalse(result.get("isError"), result)
+            body = result.get("structuredContent") or json.loads(
+                result["content"][0]["text"]
+            )
+            self.assertEqual(len(body["results"]), 1)
+            self.assertTrue(
+                body["next"].startswith("http://mcp.example/"), body["next"]
+            )
+
+    def test_request_meta_reaches_the_proxied_request(self):
+        from django.test import RequestFactory
+
+        from ..mcp_transport import request_meta
+
+        request = RequestFactory().post(
+            "/plugin/inventree-mcp/mcp/",
+            HTTP_HOST="testserver",
+            REMOTE_ADDR="192.0.2.7",
+            HTTP_ACCEPT_LANGUAGE="de",
+            HTTP_AUTHORIZATION="Token secret",
+            secure=True,
+        )
+        meta = request_meta(request)
+        self.assertEqual(
+            meta,
+            {
+                "HTTP_HOST": "testserver",
+                "wsgi.url_scheme": "https",
+                "REMOTE_ADDR": "192.0.2.7",
+                "HTTP_ACCEPT_LANGUAGE": "de",
+            },
+        )
+        token = context.set_current_user(self.user, None, meta)
+        self.addCleanup(context.reset_current_user, token)
+        self.assertEqual(context.get_current_request_meta(), meta)
 
     def test_empty_effective_scopes_get_403(self):
         MCPRuleSet.objects.filter(group=self.group).update(can_view=False)

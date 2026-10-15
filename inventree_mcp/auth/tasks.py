@@ -93,8 +93,12 @@ def recheck_user(user_id: int) -> str:
     return membership.recheck(user).value
 
 
-def revoke_mcp_tokens(user_ids: list[int]) -> int:
-    """Revoke the MCP tokens of *user_ids* (an MCP permission reduction); returns the token count."""
+def revoke_mcp_tokens(user_ids: list[int], why: str = "MCP permissions reduced") -> int:
+    """Revoke the MCP tokens of *user_ids*; returns the token count.
+
+    Queued by signals.revoke_users for groups above REVOKE_SYNC_LIMIT members
+    and called inline by it for smaller ones. Logs counts and *why* only.
+    """
     from django.contrib.auth import get_user_model
 
     from .membership import revoke_all_mcp_tokens
@@ -104,7 +108,8 @@ def revoke_mcp_tokens(user_ids: list[int]) -> int:
         for user in get_user_model().objects.filter(pk__in=user_ids)
     )
     logger.info(
-        "inventree-mcp: revoked %s MCP tokens of %s users (MCP permissions reduced)",
+        "inventree-mcp: %s; revoked %s MCP tokens of %s users",
+        why,
         count,
         len(user_ids),
     )

@@ -10,11 +10,16 @@ request object through every tool signature.
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from django.contrib.auth.models import AbstractUser
+
+_NO_META: Mapping[str, str] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,12 @@ class _Identity:
     # Propagated so proxy.call_view() makes the proxied view see these scopes,
     # not just the user's role permissions. See proxy.py.
     oauth2_token: Any | None = None
+    # WSGI environ entries of the originating MCP request that proxied
+    # requests must carry instead of APIRequestFactory's defaults: the
+    # resolved HTTP_HOST and wsgi.url_scheme (absolute URLs such as a
+    # paginated list's "next" are built from them, and "testserver" fails
+    # ALLOWED_HOSTS), REMOTE_ADDR, and HTTP_ACCEPT_LANGUAGE when sent.
+    request_meta: Mapping[str, str] = field(default=_NO_META)
 
 
 _current_identity: ContextVar[_Identity | None] = ContextVar(
@@ -35,10 +46,20 @@ _current_identity: ContextVar[_Identity | None] = ContextVar(
 
 
 def set_current_user(
-    user: AbstractUser | None, oauth2_token: Any | None = None
+    user: AbstractUser | None,
+    oauth2_token: Any | None = None,
+    request_meta: Mapping[str, str] | None = None,
 ) -> Token:
-    """Bind *user* (and, if OAuth2-authenticated, the real access token) for this context."""
-    identity = _Identity(user, oauth2_token) if user is not None else None
+    """Bind *user*, the token whose scopes bound the request, and the request's meta.
+
+    *request_meta* (see _Identity) is optional; without it proxied requests
+    keep APIRequestFactory's defaults.
+    """
+    identity = (
+        _Identity(user, oauth2_token, MappingProxyType(dict(request_meta or {})))
+        if user is not None
+        else None
+    )
     return _current_identity.set(identity)
 
 
@@ -98,3 +119,9 @@ def get_current_oauth2_token() -> Any | None:
     """Return the real OAuth2 access token for the current MCP request, if any."""
     identity = _current_identity.get()
     return identity.oauth2_token if identity else None
+
+
+def get_current_request_meta() -> dict[str, str]:
+    """WSGI environ entries of the originating MCP request (empty outside a request)."""
+    identity = _current_identity.get()
+    return dict(identity.request_meta) if identity else {}

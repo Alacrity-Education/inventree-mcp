@@ -280,19 +280,23 @@ Every InvenTree group has two sets of roles with the same shape (one row per rol
 - its **interactive roles** (core's group roles, used by the web UI and `/api/`), unchanged;
 - its **MCP roles** (the plugin's `MCPRuleSet`), what members may do *through MCP*.
 
-**MCP access = interactive roles ∩ MCP roles.** The MCP roles of a user's groups (their union)
-become OAuth2 scopes on the user's MCP tokens; InvenTree core then checks the user's interactive
-roles *and* the token's scopes on every proxied call, as for any OAuth2 request. The plugin
-re-implements no permission check, and the MCP roles never grant more than the interactive roles.
+**MCP access = interactive roles ∩ MCP roles, per table.** The MCP roles of a user's groups (their
+union) become OAuth2 scopes on the user's MCP tokens; InvenTree core then checks the user's
+interactive roles *and* the token's scopes on every proxied call, as for any OAuth2 request. The
+plugin re-implements no permission check, and the MCP roles never grant more than the interactive
+roles. For a table shared by several roles, any interactive role and any MCP role that cover the
+table suffice (see the last bullet).
 
 - New groups get MCP roles with every flag off (so do existing groups when the plugin's migration
   runs): **after installing or upgrading, nobody can use MCP until an administrator grants MCP
   roles** ("Copy from roles" copies a group's interactive roles).
 - A user whose groups grant no MCP role gets `403` "No MCP permission" on the endpoint and the *No
   MCP access* page at sign-in. With `MCP_REQUIRED_GROUPS` set, groups outside it count for nothing.
-- InvenTree API tokens (and Basic, see `MCP_ALLOW_BASIC_AUTH`) on the MCP endpoint get exactly the
-  same narrowing as an OAuth token: the request runs under an unsaved token carrying the user's MCP
-  scopes. The same API token on `/api/` keeps the user's full interactive roles.
+- Every credential on the MCP endpoint is cut to the user's *current* MCP scopes on every request.
+  An OAuth token runs under its own scopes ∩ those scopes, whichever application issued it (the
+  façade, or an application registered in InvenTree's admin and served by core's `/o/`); an
+  InvenTree API token (and Basic, see `MCP_ALLOW_BASIC_AUTH`) runs under an unsaved token carrying
+  them. Nothing is saved. The same API token on `/api/` keeps the user's full interactive roles.
 - **Read Only** (`MCP_READ_ONLY`) strips the add / change / delete scopes; MCP write roles take
   effect only once it is off.
 - Superusers pass every interactive role check; their MCP access is still their groups' MCP roles,
@@ -301,14 +305,18 @@ re-implements no permission check, and the MCP roles never grant more than the i
   member of the group at once (more than 20 members: in a background task); clients reconnect and
   get the narrower scopes. API tokens are never revoked. An **addition** revokes nothing: it applies
   at the next sign-in, and for API tokens at the next request. Removing a user from a group applies
-  at their next token refresh (at most the access token lifetime).
+  at their next MCP request (nothing is revoked; the request is cut to the remaining MCP scopes, or
+  refused with `403` when none are left).
 - Without app integration (`ENABLE_PLUGINS_APP`) there are no MCP roles, so every MCP request is
   refused (logged once).
-- A role that covers a table together with other roles (parts are in both *Parts* and *Build
-  Orders*, stock items in *Stock Items* and *Build Orders*) is reachable with any one of those
-  roles' scopes, exactly as the interactive role check accepts any one of the roles. (InvenTree
-  itself would require all of them for an OAuth token; the plugin's proxy relaxes that to match the
-  role check.)
+- **Tables shared by several roles** (parts are in both *Parts* and *Build Orders*, stock items in
+  *Stock Items* and *Build Orders*, companies in the three order roles): any interactive role and
+  any MCP role that cover the table suffice, even when they are different roles, exactly as the
+  interactive role check accepts any one of the roles. Example: interactive *Parts: view* only and
+  MCP *Build Orders: view* only lets MCP list parts. The effective document's `effective` map is per
+  role and does not show such a combination; its `note` says so. (InvenTree itself would require all
+  the roles' scopes for an OAuth token; the plugin's proxy relaxes that to match the role check, see
+  `docs/upstream/` patch 4.)
 
 Scope mapping (core's granular scopes, `users/oauth2_scopes.py`):
 
@@ -334,13 +342,14 @@ the plugin's admin pages):
 | `POST api/rulesets/copy/` `{"group": pk}` | same | MCP roles := the group's interactive roles |
 | `POST api/rulesets/clear/` `{"group": pk}` | same | every MCP flag off (revokes the members) |
 | `POST api/rulesets/revoke/` `{"group": pk}` | same | revoke the members' MCP tokens: `{"users": n, "tokens": m, "queued": bool}` |
-| `GET api/effective/<user_pk>/` | the user; staff admins for anybody | `roles` (interactive), `mcp_roles`, `effective` (both; what MCP can do), each `{role: {label, view, add, change, delete}}`, plus `scopes`, `may_connect`, `reason` |
+| `GET api/effective/<user_pk>/` | the user; staff admins for anybody | `roles` (interactive), `mcp_roles`, `effective` (both; what MCP can do), each `{role: {label, view, add, change, delete}}`, plus `scopes`, `may_connect`, `reason`, `note` (how to read `effective` for tables shared by several roles) |
 | `GET api/connections/[?user=<pk>]` | the user; staff admins with `?user=` | live MCP connections (façade refresh tokens): `pk`, `client_name`, `client_host`, `client_trusted`, `created`, `expires`, `access_expires`, `scopes` |
 | `DELETE api/connections/<pk>/` | the owner; staff admins | revoke the connection |
 | `GET api/status/[?user=<pk>]` | the user; staff admins with `?user=` | `oauth_enabled`, `mcp_url`, `membership` (`checked_at`, `blocked`, `reason`), `scopes`, `may_connect`, `reason` |
 
-An OAuth token needs the `a:staff` scope for the staff endpoints, so an MCP token (which never
-carries it) cannot change MCP permissions.
+OAuth tokens are refused on the plugin API by InvenTree's middleware (`401`; it accepts sessions
+and API tokens only); the views additionally require `a:staff` for the staff endpoints, which MCP
+tokens never carry.
 
 ## Configuration
 
@@ -392,8 +401,29 @@ of their groups ([Two permission sets](#two-permission-sets)). Supported auth me
 - An InvenTree API token: `Authorization: Token <token>`.
 - Basic auth (username/password), only with `MCP_ALLOW_BASIC_AUTH` on.
 - An OAuth2 bearer token: `Authorization: Bearer <token>`, from the OAuth sign-in above or any other
-  InvenTree OAuth2 application. A scoped token (e.g. `r:view:part`) narrows access *below* the
-  underlying user's roles - useful for issuing an agent a tightly-scoped token without creating a
+  InvenTree OAuth2 application (always cut to the user's MCP roles). A scoped token (e.g.
+  `r:view:part`) narrows access *below* the underlying user's roles - useful for issuing an agent a tightly-scoped token without creating a
   separate low-privilege user.
 
 Session/cookie auth is not supported (not meaningful for a machine client).
+
+## GUI
+
+The plugin adds two pages to the InvenTree web interface (InvenTree newer than 1.5.7, which introduced plugin pages;
+on 1.5.7 the plugin offers no pages and no navigation entries, everything else works).
+
+- **MCP Access** (`/web/plugin/inventree-mcp/groups`, staff only): pick a group on the left. Accordions show the
+  group's interactive roles (the same grid as the core group drawer, saved to core), its **MCP Roles** (what MCP
+  clients may do for its members; saved through the plugin API, "Copy from roles" and "Clear" buttons, a warning mark
+  on flags that grant more than the interactive role and therefore have no effect), and its members with their
+  effective MCP access and connection count. "Revoke MCP tokens for this group" signs the members' MCP clients out.
+- **MCP** (`/web/plugin/inventree-mcp/connections`, every user): status (OAuth enabled, whether you may connect and
+  why not, membership check), your effective MCP permissions, your connected clients with a revoke button, and the
+  connection instructions (MCP URL, `claude mcp add`, claude.ai steps).
+
+A group panel "MCP Roles" (`Panel.js:renderMCPRolesPanel`) is registered for `target_model == "group"` as the entry
+point for a future core group drawer.
+
+The pages are React bundles built from `frontend/` into `inventree_mcp/static/` (generated, git-ignored, never edited by
+hand): `cd frontend && npm ci && npm run build`. A source checkout installed with pip needs that build first; a missing
+build is logged as a warning and the pages are left out. See `dev/README.md` for the dev stack and `dev/ui_smoke.py`.

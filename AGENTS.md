@@ -30,23 +30,31 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
 
 ## File map
 
-- `context.py` - contextvar carrying the authenticated Django user into tool execution.
-- `proxy.py` - `call_view()`, the permission boundary described above.
+- `context.py` - contextvar carrying the authenticated Django user into tool execution, with the
+  token whose scopes bound the request and `request_meta` (the MCP request's resolved host, scheme,
+  `REMOTE_ADDR`, `Accept-Language`; `get_current_request_meta()`).
+- `proxy.py` - `call_view()`, the permission boundary described above. Its factory requests carry
+  `get_current_request_meta()`, so paginated views build `next` links with the real host instead of
+  `testserver` (which fails `ALLOWED_HOSTS` on a real instance).
 - `settings.py` - `get_plugin_setting(key, default)` for this plugin's own settings (coerced to
   `type(default)`, fail-safe; read from the database while the registry is still loading),
   `plugin_setting(key)` / `plugin_setting_list(key)` with the defaults declared in `core.SETTINGS`.
 - `mcp_server.py` - the `MCPServer` instance; imports `tools/*` for their `@mcp.tool()` side effect.
 - `mcp_transport.py` - Django view bridging Streamable HTTP onto the MCP server; 401 with the OAuth
   challenge; `policy.may_connect()` for every credential (blocked: 401, inactive / outside
-  `MCP_REQUIRED_GROUPS` / no MCP role: 403); for API-token and Basic requests a background re-check,
-  `membership.long_lived_credential_allowed()` (401 past the grace / re-login window) and the MCP
-  narrowing: the identity is bound with an *unsaved* DOT `AccessToken` carrying
-  `policy.effective_scopes()` (`scoped_token_for()`), so proxied views enforce it like an OAuth
-  token. Basic only with `MCP_ALLOW_BASIC_AUTH` (`get_authenticators()`).
-- `oauth2_bridge.py` - lets `call_view()` present the bound token (a real OAuth2 token, or the
-  transport's scoped token for API-token / Basic requests) to the proxied view, and works around
-  upstream InvenTree OAuth2 scope-enforcement bugs, including splitting multi-role scope
-  requirements into "any one role's scope" (as core's role check accepts any one role).
+  `MCP_REQUIRED_GROUPS` / no MCP role: 403), computed once per request with the user's MCP scopes
+  (`policy.connect_scopes()`). Every credential is cut to those scopes with an *unsaved* DOT
+  `AccessToken`: an OAuth token of any application to its scopes ∩ them with its own expiry
+  (`narrowed_oauth_token()`), API-token and Basic requests to them (`scoped_token_for()`, after a
+  background re-check and `membership.long_lived_credential_allowed()`, 401 past the grace /
+  re-login window); an empty scope is a 403. So proxied views enforce the current MCP roles like an
+  OAuth token, and a group change applies at the next request. `request_meta()` is bound for the
+  proxy. Basic only with `MCP_ALLOW_BASIC_AUTH` (`get_authenticators()`).
+- `oauth2_bridge.py` - lets `call_view()` present the bound token (the transport's unsaved token:
+  the narrowed OAuth2 token, or the scoped token for API-token / Basic requests) to the proxied
+  view, and works around upstream InvenTree OAuth2 scope-enforcement bugs, including splitting
+  multi-role scope requirements into "any one role's scope" (as core's role check accepts any one
+  role; `_any_role_alternatives` retires with `docs/upstream/` patch 4).
 - `tools/` - one module per resource, each a thin async wrapper around `call_view()`;
   `discovery.py` holds `describe_filters()`.
 - `schema_introspection.py` / `output_schemas.py` - derive each tool's MCP `outputSchema` from the
@@ -75,7 +83,9 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
 - `auth/api.py` - DRF API of the MCP permission set (rulesets list / detail / copy / clear / revoke,
   effective, connections, status). Reuses core's `RuleSetSerializer`, `check_user_role`,
   `get_user_roles`, the fixed OAuth scope check from `oauth2_bridge.py` and DOT's `revoke()`; staff
-  endpoints need staff + the admin role's change permission (and `a:staff` for OAuth tokens).
+  endpoints need staff + the admin role's change permission (InvenTree's middleware refuses OAuth
+  tokens on these paths with 401; the views additionally require `a:staff`). The effective document
+  is per role and carries a `note` on tables shared by several roles (access is per table).
 - `auth/discovery.py` - protected-resource metadata (subclass of DOT's
   `OAuthProtectedResourceMetadataView`) and authorization-server metadata views, `issuer()`,
   `resource()`, `challenge_header()` (DOT's `build_bearer_challenge`; the `WWW-Authenticate` value
@@ -101,12 +111,14 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   rulesets as core's granular scopes, cut to the advertised ones so `MCP_READ_ONLY` strips writes,
   plus `g:read`; empty outside `MCP_REQUIRED_GROUPS`; everything for superusers with
   `MCP_SUPERUSER_FULL_ACCESS`), `may_connect()` (inactive, blocked, `in_required_groups()`, then
-  `no_mcp_permission` when no scope is left), `narrow()`, `mcp_roles()`.
+  `no_mcp_permission` when no scope is left), `connect_scopes()` (may_connect plus the scopes in one
+  pass, for the transport), `narrow()`, `mcp_roles()`.
 - `auth/membership.py` - membership re-check against the SSO provider: `recheck()`,
   `refresh_grant_allowed()`, `token_grant_allowed()`, `recheck_due()`, `is_blocked()`,
-  `block_user()`, `unblock_user()`, `revoke_all_mcp_tokens()`. Reuses allauth (the upstream refresh
-  token stays in `SocialToken`, `OpenIDConnectOAuth2Adapter` for endpoints and client auth, jwtkit for
-  the ID token) and core's `InvenTree.sso.ensure_sso_groups` for the group sync; never compare raw
+  `block_user()`, `unblock_user()`, `revoke_all_mcp_tokens()`, `mcp_token_querysets()` (the live
+  façade tokens of a set of users; shared by revocation and `signals.live_mcp_token_count()`).
+  Reuses allauth (the upstream refresh token stays in `SocialToken`, `OpenIDConnectOAuth2Adapter`
+  for endpoints and client auth, jwtkit for the ID token) and core's `InvenTree.sso.ensure_sso_groups` for the group sync; never compare raw
   claim strings. Identity refusals (inactive, outside `MCP_REQUIRED_GROUPS`, upstream
   `invalid_grant`) block; a `no_mcp_permission` from `policy.may_connect()` only revokes the MCP
   tokens (`Outcome.NO_MCP_PERMISSION`). The grace and re-login predicates (`within_grace()`,
@@ -115,10 +127,11 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   connection error / 5xx; re-checks are serialised by a row lock on `MCPUserState`.
 - `auth/signals.py` - allauth `user_logged_in`: SSO logins stamp `membership_checked_at` and lift a
   block only when the user is active and in `MCP_REQUIRED_GROUPS`, other logins record
-  `last_login_at`. MCP rulesets: `ensure_rulesets()` (Group `post_save` and the API), revocation of
+  `last_login_at`. MCP rulesets: `ensure_rulesets()` / `ensure_rulesets_for()` (Group `post_save` and the API; one
+  SELECT and one bulk INSERT for any number of groups), revocation of
   the group's members on a reduction (flag true -> false, row or group deleted) through
-  `membership.revoke_all_mcp_tokens()` only (never a block; above 20 members in
-  `tasks.revoke_mcp_tokens`). All connected from the plugin's `__init__`.
+  `membership.revoke_all_mcp_tokens()` only (never a block) through `tasks.revoke_mcp_tokens`
+  (inline up to 20 members, a background task above). All connected from the plugin's `__init__`.
 - `auth/tasks.py` - `cleanup_stale_clients()` (daily), `membership_sweep()` (hourly, 60 s budget,
   then a continuation task with the remaining user ids), both via `ScheduleMixin`; `recheck_user()` (queued by `mcp_transport.py` for API-token/Basic requests); `revoke_mcp_tokens()` (queued by a ruleset reduction of a large group).
 - `tests/` - OAuth façade tests (`test_auth_*.py`, `test_settings_inject.py`, shared

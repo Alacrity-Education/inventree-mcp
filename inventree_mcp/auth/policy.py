@@ -6,7 +6,9 @@ their groups' rows as core's granular scopes ("r:view:part", ...), cut down to
 mcp_scopes_available() (so MCP_READ_ONLY strips the write scopes), plus "g:read"
 when anything is left. Core enforces interactive roles AND token scopes on
 every proxied call, so MCP access = interactive roles ∩ MCP roles; nothing here
-re-checks a permission.
+re-checks a permission. For a table shared by several roles (part_part: part
+and build), any interactive role and any MCP role covering the table suffice
+(oauth2_bridge._any_role_alternatives, core's own any-role rule).
 
 may_connect() adds the membership block (WP2), MCP_REQUIRED_GROUPS
 (in_required_groups()) and "no MCP scope at all", so authorize, refresh
@@ -76,15 +78,20 @@ def effective_scopes(user) -> set[str]:
         return set()
     if not in_required_groups(user):
         return set()
+    return set(_granted_scopes(user))
 
+
+def _granted_scopes(user) -> list[str]:
+    """effective_scopes() past the identity and MCP_REQUIRED_GROUPS checks, in advertised order."""
     available = mcp_scopes_available()
     if user.is_superuser and get_plugin_setting("MCP_SUPERUSER_FULL_ACCESS", False):
-        return set(available)
+        return available
 
-    scopes = ruleset_scopes(user) & set(available)
-    if scopes and GENERAL_READ_SCOPE in available:
-        scopes.add(GENERAL_READ_SCOPE)
-    return scopes
+    scopes = ruleset_scopes(user)
+    granted = [scope for scope in available if scope in scopes]
+    if granted and GENERAL_READ_SCOPE in available:
+        granted.insert(0, GENERAL_READ_SCOPE)  # first, as in mcp_scopes_available()
+    return granted
 
 
 def mcp_roles(user) -> dict[str, dict[str, bool]]:
@@ -174,17 +181,29 @@ def may_connect(user) -> tuple[bool, str]:
     The identity checks come first; membership._classify() relies on that
     order to tell identity refusals from a lacking MCP permission.
     """
+    ok, reason, _scopes = connect_scopes(user)
+    return ok, reason
+
+
+def connect_scopes(user) -> tuple[bool, str, list[str]]:
+    """may_connect() and narrow(None, user) in one pass: (ok, reason, scopes).
+
+    The MCP endpoint needs both on every request; this runs
+    in_required_groups() and the ruleset query once. *scopes* is empty
+    whenever *ok* is False.
+    """
     if user is None or not user.is_authenticated:
-        return False, "anonymous"
+        return False, "anonymous", []
     if not user.is_active:
-        return False, "inactive"
+        return False, "inactive", []
     if membership.is_blocked(user):
-        return False, "blocked"
+        return False, "blocked", []
     if not in_required_groups(user):
-        return False, "no_mcp_permission"
-    if not effective_scopes(user):
-        return False, "no_mcp_permission"
-    return True, ""
+        return False, "no_mcp_permission", []
+    scopes = _granted_scopes(user)
+    if not scopes:
+        return False, "no_mcp_permission", []
+    return True, "", scopes
 
 
 def narrow(requested: Iterable[str] | None, user) -> list[str]:

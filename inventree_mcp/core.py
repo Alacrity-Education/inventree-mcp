@@ -1,12 +1,21 @@
 """MCP server for InvenTree"""
 
+from __future__ import annotations
+
 import logging
+from pathlib import Path
 from typing import ClassVar
 
 from django.core.validators import MinValueValidator
 from django.urls import reverse_lazy
 from plugin import InvenTreePlugin
-from plugin.mixins import AppMixin, ScheduleMixin, SettingsMixin, UrlsMixin
+from plugin.mixins import (
+    AppMixin,
+    ScheduleMixin,
+    SettingsMixin,
+    UrlsMixin,
+    UserInterfaceMixin,
+)
 
 from . import PLUGIN_VERSION
 from ._well_known_compat import WellKnownMixin
@@ -14,9 +23,19 @@ from .auth import facade_supported, oauth_enabled
 
 logger = logging.getLogger("inventree")
 
+# Plugin pages (get_ui_routes) arrived after InvenTree 1.5.7 (core PR #12900). Without them the navigation
+# entries would link to pages that do not exist, so they are only offered when the host supports routes.
+UI_ROUTES_SUPPORTED = hasattr(UserInterfaceMixin, "get_ui_routes")
+
 
 class InvenTreeMCP(
-    WellKnownMixin, AppMixin, ScheduleMixin, SettingsMixin, UrlsMixin, InvenTreePlugin
+    WellKnownMixin,
+    AppMixin,
+    ScheduleMixin,
+    SettingsMixin,
+    UrlsMixin,
+    UserInterfaceMixin,
+    InvenTreePlugin,
 ):
     """InvenTreeMCP - custom InvenTree plugin."""
 
@@ -256,3 +275,90 @@ class InvenTreeMCP(
             ]
 
         return urls
+
+    # User interface (from UserInterfaceMixin); the bundles are built from frontend/ into static/
+    # Ref: https://docs.inventree.org/en/latest/plugins/mixins/ui/
+    def _ui_source(self, source: str) -> str | None:
+        """URL of a built bundle ("File.js:exportedFunction"), or None (with a warning) when it is missing.
+
+        A missing build must not break the UI feature API, which serves every plugin.
+        """
+        file_name = source.partition(":")[0]
+        if not (Path(__file__).parent / "static" / file_name).is_file():
+            logger.warning(
+                "inventree-mcp: %s is missing, run 'npm ci && npm run build' in frontend/",
+                file_name,
+            )
+            return None
+        try:
+            return self.plugin_static_file(source, check_exists=False)
+        except Exception:
+            logger.warning("inventree-mcp: cannot resolve %s", source, exc_info=True)
+            return None
+
+    @staticmethod
+    def _is_staff(request) -> bool:
+        user = getattr(request, "user", None)
+        return bool(user and user.is_authenticated and user.is_staff)
+
+    def get_ui_routes(self, request, context, **kwargs):
+        """Pages: the group permission editor (staff) and the personal connections page."""
+        routes = []
+        groups = self._ui_source("Groups.js:renderGroupsPage")
+        if groups and self._is_staff(request):
+            routes.append({
+                "key": "mcp-groups-route",
+                "title": "MCP Access",
+                "source": groups,
+                "options": {"path": "groups"},
+            })
+        connections = self._ui_source("Connections.js:renderConnectionsPage")
+        if connections and request.user.is_authenticated:
+            routes.append({
+                "key": "mcp-connections-route",
+                "title": "MCP",
+                "source": connections,
+                "options": {"path": "connections"},
+            })
+        return routes
+
+    def get_ui_navigation_items(self, request, context, **kwargs):
+        """Navigation entries for the two pages (only where the host serves plugin routes)."""
+        items = []
+        if not UI_ROUTES_SUPPORTED:
+            logger.info(
+                "inventree-mcp: this InvenTree has no plugin routes, no navigation items"
+            )
+            return items
+        if self._is_staff(request):
+            items.append({
+                "key": "mcp-groups",
+                "title": "MCP Access",
+                "icon": "ti:plug-connected",
+                "options": {"url": f"plugin/{self.SLUG}/groups"},
+            })
+        if request.user.is_authenticated:
+            items.append({
+                "key": "mcp-connections",
+                "title": "MCP",
+                "icon": "ti:plug-connected",
+                "options": {"url": f"plugin/{self.SLUG}/connections"},
+            })
+        return items
+
+    def get_ui_panels(self, request, context, **kwargs):
+        """The "MCP Roles" panel on a group (entry point for the core group drawer)."""
+        context = context or {}
+        if context.get("target_model") != "group" or not self._is_staff(request):
+            return []
+        source = self._ui_source("Panel.js:renderMCPRolesPanel")
+        if not source:
+            return []
+        return [
+            {
+                "key": "mcp-roles",
+                "title": "MCP Roles",
+                "icon": "ti:plug-connected",
+                "source": source,
+            }
+        ]

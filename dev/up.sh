@@ -49,6 +49,21 @@ MSG
 }
 hosts_warning
 
+# --- 1b. frontend bundles (build output, git-ignored: inventree_mcp/static/) ---------------------------------------
+# Built on the host (node + npm) when Groups.js is missing or older than any file under frontend/src or its build config;
+# the server container collects inventree_mcp/static/ into /static/plugins/inventree-mcp/ when it starts.
+FRONTEND_DIR="$REPO_DIR/frontend"
+BUNDLE="$REPO_DIR/inventree_mcp/static/Groups.js"
+if [[ -d "$FRONTEND_DIR" ]]; then
+    if [[ ! -f "$BUNDLE" ]] || [[ -n "$(find "$FRONTEND_DIR/src" "$FRONTEND_DIR/package.json" "$FRONTEND_DIR/vite.config.ts" -type f -newer "$BUNDLE" -print -quit)" ]]; then
+        command -v npm >/dev/null || die "npm is not installed, needed to build the plugin frontend (frontend/)"
+        log "building the plugin frontend (npm ci && npm run build)"
+        (cd "$FRONTEND_DIR" && npm ci && npm run build) || die "frontend build failed"
+    fi
+else
+    echo "WARNING: frontend/ is missing, the plugin pages will not be available" >&2
+fi
+
 # --- 2. database, cache, mail and Authentik ------------------------------------------------------------------------
 log "starting db, cache, mailpit and Authentik (first run pulls ~2 GB of images)"
 dc up -d --wait --wait-timeout 900 db cache mailpit authentik-db authentik-server authentik-worker

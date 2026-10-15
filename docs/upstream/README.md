@@ -1,12 +1,13 @@
 # Upstream patches for InvenTree core
 
-Three small patches against InvenTree core `master` (base commit `9b8fdeb06`), prepared but **not submitted**. Each retires a workaround in the `inventree-mcp` plugin. They are independent and can be proposed as three separate PRs.
+Four small patches against InvenTree core `master` (base commit `9b8fdeb06`), prepared but **not submitted**. Each retires a workaround in the `inventree-mcp` plugin. They are independent and can be proposed as four separate PRs.
 
 Source: local branch `upstream-patches` in the worktree `/home/alex.lucaci/Projects/inventree/.worktrees/upstream-patches` (clone `/home/alex.lucaci/Projects/inventree/InvenTree`, branch `master` untouched). Patch files (from `git format-patch master..upstream-patches`) are in this directory:
 
 - `0001-Allow-OAUTH2_PROVIDER-options-to-be-set-via-config.y.patch`
 - `0002-Preserve-next-through-account_login-and-honour-it-in.patch`
 - `0003-Render-plugin-panels-in-the-group-and-user-drawers-e.patch`
+- `0004-Accept-any-one-role-s-scope-for-tables-shared-by-sev.patch`
 
 Each applies cleanly (`git apply --check` and `git am`) on a fresh checkout of `master` at `9b8fdeb06`. Note: the plan named the files `0001-oauth2-provider-config-override.patch` etc.; format-patch derives names from the commit subjects.
 
@@ -74,6 +75,31 @@ Caveat to mention in the PR: when frontend and backend are on different origins 
 
 ---
 
+## 4. Any one role's scope for tables shared by several rulesets (`map_scope`)
+
+**Motivation.** Several tables belong to more than one ruleset: `part_part` to *part* and *build*, `stock_stockitem` to *stock* and *build*, `company_company` / `company_contact` / `company_address` to *purchase_order*, *sales_order* and *return_order*, `company_supplierpart` / `company_manufacturerpart` to *part* and *purchase_order*, and a few more. The role check for a request (`users.permissions.check_user_permission`) accepts **any** of the table's roles. The OAuth2 scope check required **all** of them: `InvenTree/permissions.py` `map_scope(roles=...)` returned
+
+```python
+return [[get_granular_scope(action, table) for table in roles]]
+```
+
+one alternative holding every role's scope (an AND; the loop variable was even named `table` while it holds role names). A token issued with exactly the scopes the *Parts* role grants (`r:view:part`) could therefore not list parts unless it also held `r:view:build`. Found in the WP3 review of the plugin (decision 1).
+
+**What it changes.**
+- `InvenTree/permissions.py` `map_scope()`: `return [[get_granular_scope(action, role)] for role in roles]`, one alternative per role, which `TokenMatchesOASRequirements` treats as OR. The docstring says so. `map_scope(roles=...)` has a single caller (`InvenTreeRoleScopeMixin.get_required_alternate_scopes`); the `only_read`, `map_read` and `OPTIONS` paths are unchanged.
+- Tests: `InvenTree/tests.py::OAuth2ScopeMapTest`: `test_map_scope_any_role` (every method of a two-role table, a single role unchanged, `OPTIONS` still `g:read`) and `test_multi_role_table_accepts_any_role_scope` (`PartList`'s required scopes contain `[r:view:part]` and `[r:view:build]`; DOT's `TokenMatchesOASRequirements` passes a token with either scope and refuses `r:view:stock`).
+- Side effect to mention in the PR: the OpenAPI security requirements of multi-role endpoints change from one requirement with every role's scope to one requirement per role (`schema.py` turns each alternative into a requirement), so the schema diff shows them; no API version bump is needed for a fix that only relaxes to what the role check already allowed, but maintainers may want one.
+
+**Retiring the plugin workaround.** `oauth2_bridge._any_role_alternatives` (called only from `scoped_view_class`) splits every all-role-scope alternative into one alternative per scope, which is exactly what the patched `map_scope` returns. Once the minimum supported InvenTree version includes the patch, drop `_any_role_alternatives` and use `get_required_alternate_scopes(...)` as it is (until then it is a no-op on patched cores: an alternative of one scope is left as it is). Its test `test_policy.TransportNarrowingTest.test_multi_role_tables_accept_any_role_scope` keeps passing either way. The other two bridge workarounds (core bugs 1 and 2 in the `oauth2_bridge.py` docstring: the raw `TokenMatchesOASRequirements()` in `check_oauth2_authentication` and the broken `super().has_permission` fallback) are not covered by these patches.
+
+**Verification performed.**
+- `uvx ruff@0.16.0 check` on `permissions.py` and `tests.py`: pass; `ruff format --diff` shows no change in the added code (only the pre-existing differences noted below).
+- The two tests were run in the dev stack's InvenTree 1.5.7 server container (`manage.py shell`, the patched `map_scope` executed into `InvenTree.permissions`, whose `map_scope` / `precalculated_roles` code is identical in 1.5.7): `Ran 2 tests ... OK`. Against the unpatched function both fail (`[['r:view:part', 'r:view:build']] != [['r:view:part'], ['r:view:build']]`).
+- The four patches `git am` cleanly onto a fresh `master` worktree at `9b8fdeb06`, and the result is tree-identical to `upstream-patches`.
+- NOT run: core's full test suite (`invoke dev.test`) and the schema export diff.
+
+---
+
 ## Environment notes (all patches)
 
 - The frontend uses `yarn.lock`; `yarn`/`corepack` are not installed here and `npm ci` is impossible (no `package-lock.json`). `npm install` fails with an ERESOLVE peer conflict (`@codecov/vite-plugin` vs `vite@7`), so `--legacy-peer-deps` was used; resolved versions may differ slightly from `yarn.lock`. `yarn.lock` and `package-lock.json` were not committed.
@@ -84,7 +110,7 @@ Caveat to mention in the PR: when frontend and backend are on different origins 
 - [ ] Open a discussion/issue first (InvenTree prefers this for new settings and UI features); link the plugin use case.
 - [ ] Target `master`; one PR per patch; PR template filled in; a title in the project's style.
 - [ ] Docs updated: patch 1 has `docs/docs/start/config.md` and `config_template.yaml`; patch 2 needs a short note on `next` handling in the authentication/SSO docs; patch 3 needs a note in the plugin UI panel docs (`docs/docs/plugins/mixins/ui.md`) that `group` and `user` are valid panel targets.
-- [ ] Tests: patch 1 `test_oauth2_provider_override`; patch 2 `test_account_login_preserves_next` plus a Playwright test for the `next` flow (login with `/web/?next=/api-doc/` style target); patch 3 a Playwright test with a mock plugin panel in the group drawer (the `inventree-plugin-creator` demo plugin can provide it). Run `invoke dev.test` for the touched backend apps in a proper environment.
+- [ ] Tests: patch 4 `OAuth2ScopeMapTest`; patch 1 `test_oauth2_provider_override`; patch 2 `test_account_login_preserves_next` plus a Playwright test for the `next` flow (login with `/web/?next=/api-doc/` style target); patch 3 a Playwright test with a mock plugin panel in the group drawer (the `inventree-plugin-creator` demo plugin can provide it). Run `invoke dev.test` for the touched backend apps in a proper environment.
 - [ ] `pre-commit run --all-files` (ruff, biome) and the frontend `yarn build`/`lib` build.
 - [ ] Run `invoke dev.translate` / `lingui extract` only if maintainers ask; otherwise leave locales to the translation workflow.
 - [ ] API version bump: not needed (no API change). Frontend library version/changelog: patch 3 adds an entry.

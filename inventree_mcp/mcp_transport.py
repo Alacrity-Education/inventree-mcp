@@ -9,9 +9,12 @@ doesn't include plugin URLs - an OAuth2 bearer token would otherwise never
 even reach this view (verified: /api/part/ accepts it, this endpoint 401s
 before dispatch() runs at all). We gate on REQUIRE_AUTH ourselves, then bind
 the authenticated identity into the MCP request context (see context.py) so
-tools can act as that user - and, for OAuth2 requests, under that token's
-actual granted scopes, not just the user's role permissions - via
-proxy.call_view(). This is what makes per-tool permission enforcement
+tools can act as that user - and under the user's current MCP scopes
+(policy.connect_scopes()), not just the user's role permissions - via
+proxy.call_view(): an OAuth2 token is bound cut to its granted scopes ∩ those
+scopes (narrowed_oauth_token()), an API token or Basic credential as an
+unsaved token carrying them (scoped_token_for()). The request's resolved host,
+scheme and client address go along (request_meta()) for the proxied requests. This is what makes per-tool permission enforcement
 possible, instead of trusting "authenticated = allowed to do anything" as a
 single plugin-wide bypass.
 
@@ -248,18 +251,57 @@ def _queue_membership_recheck(user) -> None:
         )
 
 
-def scoped_token_for(user):
+def scoped_token_for(user, scopes=None):
     """An unsaved DOT AccessToken carrying *user*'s MCP scopes (policy.narrow(None, user)).
 
     Bound as the identity's oauth2_token for API-token and Basic requests, so
     proxied views enforce the MCP rulesets exactly as for an OAuth token.
     Never saved: no token value, no application, nothing to revoke or leak.
+    *scopes* (policy.connect_scopes()'s list) saves recomputing them.
     """
+    if scopes is None:
+        scopes = policy.narrow(None, user)
     return get_access_token_model()(
         user=user,
-        scope=" ".join(policy.narrow(None, user)),
+        scope=" ".join(scopes),
         expires=timezone.now() + _SCOPED_TOKEN_LIFETIME,
     )
+
+
+def narrowed_oauth_token(token, user, scopes):
+    """An unsaved AccessToken: the presented OAuth *token*'s scopes ∩ *scopes*, same expiry.
+
+    Every OAuth token on /mcp is cut to the user's current MCP scopes, not
+    only the façade's (narrowed at authorize and refresh): core's /o/
+    endpoints issue tokens of any application with any scope, and a group
+    membership or ruleset change since issue takes effect at the next
+    request. An empty intersection leaves an empty scope (the caller answers
+    403). Like scoped_token_for(), never saved.
+    """
+    allowed = set(scopes)
+    return get_access_token_model()(
+        user=user,
+        scope=" ".join(s for s in (token.scope or "").split() if s in allowed),
+        expires=token.expires,
+    )
+
+
+def request_meta(request: HttpRequest) -> dict[str, str]:
+    """The WSGI environ entries proxied requests inherit (context._Identity.request_meta).
+
+    Resolved values: get_host() has validated the host against ALLOWED_HOSTS
+    and applied USE_X_FORWARDED_HOST, is_secure() SECURE_PROXY_SSL_HEADER;
+    the raw X-Forwarded-* headers are not passed on. No credentials, cookies
+    or CSRF headers (the bridge supplies authentication).
+    """
+    meta = {
+        "HTTP_HOST": request.get_host(),
+        "wsgi.url_scheme": "https" if request.is_secure() else "http",
+        "REMOTE_ADDR": request.META.get("REMOTE_ADDR", "127.0.0.1"),
+    }
+    if request.META.get("HTTP_ACCEPT_LANGUAGE"):
+        meta["HTTP_ACCEPT_LANGUAGE"] = request.META["HTTP_ACCEPT_LANGUAGE"]
+    return meta
 
 
 class MCPView(APIView):
@@ -320,8 +362,10 @@ class MCPView(APIView):
             drf_request.successful_authenticator, OAuth2Authentication
         )
 
+        oauth2_token = None
         if user is not None and user.is_authenticated:
-            ok, reason = policy.may_connect(user)
+            # may_connect() and the user's MCP scopes in one pass.
+            ok, reason, scopes = policy.connect_scopes(user)
             if not ok:
                 if reason == "blocked":
                     return _auth_error_response(
@@ -329,7 +373,9 @@ class MCPView(APIView):
                     )
                 # inactive / no_mcp_permission: the credential itself is valid.
                 return _error_response(403, "No MCP permission")
-            if not is_oauth2:
+            if is_oauth2:
+                oauth2_token = narrowed_oauth_token(drf_request.auth, user, scopes)
+            else:
                 # Queued before the window check: once the provider is back, the
                 # background re-check is what lets this credential in again.
                 _queue_membership_recheck(user)
@@ -341,17 +387,13 @@ class MCPView(APIView):
                         user.pk,
                     )
                     return _long_lived_refusal(why)
-
-        oauth2_token = None
-        if is_oauth2:
-            oauth2_token = drf_request.auth
-        elif user is not None and user.is_authenticated:
-            # API token / Basic: narrowed like an OAuth token (module docstring).
-            oauth2_token = scoped_token_for(user)
+                # API token / Basic: narrowed like an OAuth token (module docstring).
+                oauth2_token = scoped_token_for(user, scopes)
             if not oauth2_token.scope:
+                # An OAuth token holding none of the user's MCP scopes.
                 return _error_response(403, "No MCP permission")
 
-        token = set_current_user(user, oauth2_token)
+        token = set_current_user(user, oauth2_token, request_meta(request))
         try:
             # async_to_sync (rather than a hand-rolled event loop) is what lets
             # proxy.call_view()'s sync_to_async(thread_sensitive=True) route

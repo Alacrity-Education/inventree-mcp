@@ -174,3 +174,102 @@ Revoked 1 MCP tokens for user id 9
 - **Permissions the pages rely on:** the groups page and the panel need staff + admin.change (the same condition as editing core's roles); the connections page works for any authenticated user. Session auth with CSRF works (`context.api` sends the token).
 - **Static files:** InvenTree copies the plugin's whole `inventree_mcp/static/` tree, including `assets/` and `.vite/`, to `STATIC_ROOT/plugins/inventree-mcp/` at plugin load (`plugin.staticfiles.copy_plugin_static_files`). Verified on the dev stack: `/static/plugins/inventree-mcp/Groups.js` → 200, and `assets/McpRolesEditor-*.js` / `assets/useAsync-*.js` are present. `MANIFEST.in` already has `recursive-include inventree_mcp/static *`. Still missing in `core.py`: `UserInterfaceMixin` with the routes and panel from the WP4 frontend report (`plugin_static_file("Groups.js:renderGroupsPage")`, `"Connections.js:renderConnectionsPage"`, `"Panel.js:renderMCPRolesPanel"` for `target_model == "group"`, staff only).
 - **Dev defaults:** "MCP Users" has MCP view on every role and `admin` is a member (`dev/configure_inventree.py`), so the pages have data and the smoke scripts pass. `dev/permissions_e2e.py` restores whatever it finds.
+
+## Review fixes applied
+
+Findings of `docs/plans/WP3-review.md`, applied on `feature/oauth-facade` (not committed in this repository). Known limitations 1 and 2 above are resolved by F2 and F1/F3.
+
+| Finding | What changed (file, function) | Verified by |
+|---|---|---|
+| **F1** OAuth tokens of non-façade applications bypassed the MCP roles | `mcp_transport.py`: `MCPView.dispatch` now cuts **every** OAuth token on `/mcp`. New `narrowed_oauth_token(token, user, scopes)` builds an unsaved `AccessToken(user, scope = token scopes ∩ policy's MCP scopes, expires = the real token's expiry)`. An empty intersection gives the existing 403 "No MCP permission" (one check now covers OAuth, API-token and Basic). The presented token row is never changed. | `test_policy.TransportNarrowingTest.test_non_facade_oauth_token_is_cut_to_the_mcp_roles`: a `registration_source="manual"` application, token `g:read r:view:stock r:view:part`, interactive stock view, MCP parts only. Results: `list_parts` is listed and works; `list_stock_items` is not listed and its call fails with the permission error; the stored token is unchanged. `test_oauth_token_without_any_mcp_scope_gets_403`: `r:view:stock r:change:part` gives 403 "No MCP permission". `test_api_token_sees_what_an_oauth_token_sees` now also asserts that the `AccessToken` rows (pk, scope, expires) are identical before and after the API-token `tools/list` and `tools/call` round trips. |
+| **F3** removing a user from a group revoked nothing | Closed by F1: the transport intersects with the *current* MCP scopes on every request, so no `m2m_changed` receiver is needed. README bullet updated. | `test_leaving_the_group_takes_effect_at_the_next_request`: 200, then `user.groups.remove(...)`, then 403 "No MCP permission" with the same access token. The refresh token is not revoked. |
+| **F2** proxied requests used host `testserver`, so every paginated tool failed on real instances | `context.py`: `_Identity.request_meta` (read-only mapping, default empty). `set_current_user(user, oauth2_token=None, request_meta=None)` stays backward compatible. New `get_current_request_meta()`. `mcp_transport.py`: new `request_meta(request)` = resolved `HTTP_HOST` (`get_host()`), `wsgi.url_scheme` (`is_secure()`) and `REMOTE_ADDR`, plus `HTTP_ACCEPT_LANGUAGE` when sent. Raw `X-Forwarded-*`, credentials and cookies are not passed on. It is bound in `dispatch`. `proxy.py`: `_call_view_sync` passes `**get_current_request_meta()` to both factory calls (GET and write), and `_user_has_access_sync` passes it to `_factory.generic`. | `test_paginated_list_uses_the_request_host`: `@override_settings(ALLOWED_HOSTS=["mcp.example"])`, `HTTP_HOST="mcp.example"`, `list_parts {"limit": 1}` with an API token and with a façade OAuth token. Results: `isError` false, 1 row, `next` starts with `http://mcp.example/`. With `meta = {}` in the proxy the same test fails with `DisallowedHost: Invalid HTTP_HOST header: 'testserver'` (`FAILED (failures=1)`), so it guards the regression. `test_request_meta_reaches_the_proxied_request` covers the meta mapping (https, `REMOTE_ADDR`, `Accept-Language`, no `Authorization`). Live results: see below. |
+| **F10** the e2e accepted a failing `list_parts` | `dev/permissions_e2e.py`: new `real_tool_calls()` (with `call_tool()` taking any `Authorization` and arguments, and `tool_body()`). For the OAuth token in A and the API token in B it requires `list_parts {"limit": 1}` with `isError` false, at least one row and `next` on the proxy's base URL, then `get_part` on that row with `isError` false and the same pk. | Live through Caddy on `http://localhost:8080` (see below). |
+| **F4** the effective document and README described a per-role intersection, while access is per table | Chose the cheaper correct option: **a note**, not a per-table computation. A per-role `effective` value cannot express "reachable through another role" without a new shape. `auth/api.py`: `EFFECTIVE_NOTE`, and `effective_document()` returns it as `note` (`EffectiveSerializer.note`, plus help text on `effective`). This is an additive key; the frontend ignores it. README: "MCP access = interactive roles ∩ MCP roles, per table", and the multi-role bullet now says "any interactive role and any MCP role that cover the table suffice, even when they are different roles", with the *Parts view* / *Build view* example. The `policy.py` module docstring says the same. | `EffectiveApiTest.test_document` asserts the note. |
+| **F5** `test_mcp_token_cannot_change_mcp_permissions` passed on the middleware's 401 | `tests/test_api.py`: the test now asserts `401` (even with `a:staff` on the token) and its docstring explains why: `AuthRequiredMiddleware` runs before DRF and knows only sessions and API tokens. New `test_staff_endpoints_require_a_staff_on_an_oauth_token` calls `MCPRuleSetDetail` directly (`APIRequestFactory`, `authentication_classes_for(user, token)`). Results: `g:read r:view:admin r:change:admin` gives 403 with the row unchanged; `a:staff` gives 200 with the row changed. README sentence and `auth/api.py` docstring changed to "OAuth tokens are refused on the plugin API by InvenTree's middleware (`401`); the views additionally require `a:staff`". | Both tests pass in the full run. |
+| **F6** duplicated token queries and revoke loop | `auth/membership.py`: new `mcp_token_querysets(user_ids)` returns `(refresh, access)`: unrevoked refresh tokens and access tokens with `expires__gt=now`, both limited to `mcp_applications()`. The querysets are lazy, so access tokens that DOT removed with their refresh token are not seen again. `revoke_all_mcp_tokens(user)` uses it. `auth/signals.py`: `live_mcp_token_count()` uses it, so expired access tokens are no longer counted as live. `revoke_users()` calls `tasks.revoke_mcp_tokens(user_ids, why)` inline for up to 20 users. `auth/tasks.py`: `revoke_mcp_tokens(user_ids, why="MCP permissions reduced")` logs `why` and counts only. | `ReductionRevokesTest` (incl. the offload case, `revoke_mcp_tokens(user_ids) == 1`), `test_api` revoke, `test_membership` (42 tests), and the e2e D lines below. |
+| **F7** repeated queries per MCP request | `auth/policy.py`: new `connect_scopes(user) -> (ok, reason, scopes)`. It applies the `may_connect` order, then computes the scopes once through the new private `_granted_scopes()` (in advertised order). `may_connect(user)` keeps its signature and delegates to it. `effective_scopes()` uses `_granted_scopes()` too. The transport calls `connect_scopes()` once and passes the scopes to `scoped_token_for(user, scopes)` (optional new argument, backward compatible) and `narrowed_oauth_token()`. Per request: `in_required_groups` runs once (was three times) and the ruleset SELECT once (was twice). | Unchanged behaviour: `EffectiveScopesTest`, `NoMcpPermissionTest`, `TransportNarrowingTest`, `test_membership` all pass. |
+| **F8** `GET api/rulesets/` without `?group` ensured per group | Chose **bulk ensure**, not "only with `?group`": a core role added by an upgrade still appears in the all-groups listing. `auth/signals.py`: new `ensure_rulesets_for(groups)` does one SELECT of `(group_id, name)` and at most one `bulk_create(ignore_conflicts=True)` over the missing pairs. `ensure_rulesets(group)` delegates to it. `auth/api.py` `MCPRuleSetList.get` calls `ensure_rulesets_for([group] or Group.objects.all())`. | `RuleSetApiTest`, `RowsTest`, and e2e C (`rulesets/ 200` for all groups). |
+| **F9** role `choices` on the model | Dropped `choices` from `MCPRuleSet.name` (`models.py`, with a comment) and from the `CreateModel` in `migrations/0002_mcpruleset.py`, which is still unreleased (only on `feature/oauth-facade`, no tag contains it). This is a state-only change with no SQL, so there is no new migration and no churn when core adds a role. No serializer validation is needed: `name` is read-only in the API (core's `RuleSetSerializer.Meta.read_only_fields`), and rows are created only from `RULESET_NAMES`. `label` still uses `RULESET_CHOICES`. | `dev/manage.sh makemigrations inventree_mcp --check --dry-run` gives `No changes detected in app 'inventree_mcp'`. |
+| **Nit** a third spelling of the four flags | `auth/signals.py`: `_FLAGS` replaced by `_flags()`, which returns `MCPRuleSet.RULE_OPTIONS` (imported late, because the plugin's app may not be installed). | Ruleset signal tests pass. |
+| **Upstream** core's `map_scope` all-roles bug (decision 1) | Committed `cc50ad2bb` "Accept any one role's scope for tables shared by several rulesets" in `/home/alex.lucaci/Projects/inventree/.worktrees/upstream-patches` (branch `upstream-patches`). `InvenTree/permissions.py` `map_scope`: `return [[get_granular_scope(action, role)] for role in roles]`, with the docstring updated. `InvenTree/tests.py::OAuth2ScopeMapTest` (2 tests). `git format-patch master..upstream-patches -o docs/upstream/` regenerated all four files; 0001-0003 differ only in the `[PATCH n/4]` subject line. `docs/upstream/README.md` has the new section 4, which says that `oauth2_bridge._any_role_alternatives` retires when the patch is merged. | The core tests ran in the dev server container (InvenTree 1.5.7, identical `map_scope` / `precalculated_roles` code) with the patched function: `Ran 2 tests ... OK`. Unpatched: both FAIL (`[['r:view:part', 'r:view:build']] != [['r:view:part'], ['r:view:build']]`). `git am` of all four patches on a fresh `master` worktree at `9b8fdeb06` gives a tree identical to `upstream-patches`. `uvx ruff@0.16.0 check` on both files: `All checks passed!` |
+
+Tests (`dev/test.sh`, dev stack InvenTree 1.5.7, DOT 3.4.0; the 332 include the other agent's `test_ui.py`):
+
+```
+$ dev/test.sh inventree_mcp
+Ran 332 tests in 472.769s
+OK (skipped=3)
+$ dev/test.sh inventree_mcp.test_mcp
+Ran 132 tests in 33.660s
+OK
+```
+
+A first full run had two failures: `test_mcp.MCPTransportTest.test_oauth2_bearer_auth_succeeds` and `test_membership.NotMemberTest.test_removed_from_group_is_blocked_until_the_next_sso_login`. A first version of F1 also treated a `g:read`-only intersection as empty, and both tests use `g:read`-only tokens. That rule was not asked for, so I dropped it: the cut is the plain intersection.
+
+Lint:
+
+```
+uvx ruff@0.16.0 check --preview inventree_mcp                       -> All checks passed!
+uvx ruff@0.16.0 format --preview --check inventree_mcp              -> 52 files already formatted
+uvx ruff@0.16.0 check --isolated inventree_mcp/tests dev/permissions_e2e.py dev/oauth_smoke.py dev/membership_e2e.py -> All checks passed!
+uvx ruff@0.16.0 format --isolated --preview --check inventree_mcp/tests -> 12 files already formatted
+uvx ruff@0.16.0 format --isolated --check dev/permissions_e2e.py    -> 1 file already formatted
+```
+
+Run without `--preview`, `ruff format --isolated` would un-hug the brackets in the existing test files, so the tests are formatted with `--isolated --preview`, which is their existing style. `ruff check --isolated dev` still reports one pre-existing `UP035` in `dev/authentik/sso_smoke.py`. That file is not part of this change and was not touched.
+
+Live checks after `dev/compose.sh restart inventree-server inventree-worker`, all through Caddy at `http://localhost:8080` (`X-Forwarded-*` in play). First, admin's API token with raw `tools/call` on `/plugin/inventree-mcp/mcp/`:
+
+```
+list_parts {"limit":1} isError=False {'count': 438, 'next': 'http://localhost:8080/api/part/?limit=1&offset=1'}
+list_locations {"limit":1} isError=False {'count': 19, 'next': 'http://localhost:8080/api/stock/location/?limit=1&offset=1'}
+get_part {"part_id":1} isError=False {'pk': 1, 'name': 'R_10R_0402_1%'}
+```
+
+Before the fix, the review got `Invalid HTTP_HOST header: 'testserver'` for the same calls.
+
+`python3 dev/permissions_e2e.py`:
+
+```
+[A] token scope: 'g:read r:view:part'
+[A] tools/list -> 200; 16 tools; part tools ['get_manufacturer_part', 'get_part', 'get_supplier_part', 'list_manufacturer_parts', 'list_parts', 'list_supplier_parts']; stock tools []
+[A] tools/call list_stock_items -> isError=True 'Error executing tool list_stock_items: You do not have permission to perform this action.'
+[A] OAuth token: tools/call list_parts {'limit': 1} -> isError=False, count=438, rows=1, next='http://localhost:8080/api/part/'
+[A] OAuth token: tools/call get_part {'part_id': 82} -> isError=False, pk=82
+[B] e2e-member's API token on /api/stock/ -> 200 (count=1278)
+[B] e2e-member's API token on /mcp tools/list -> 200; 16 tools; identical to the OAuth list: True
+[B] API token: tools/call list_parts {'limit': 1} -> isError=False, count=438, rows=1, next='http://localhost:8080/api/part/'
+[B] API token: tools/call get_part {'part_id': 82} -> isError=False, pk=82
+[C] plugin API in the server process: rulesets/ 200, rulesets/ 200, effective/9/ 200, connections/ 200, status/ 200; live connections of e2e-member: 1
+[D] cleared MCP view on parts: live MCP refresh tokens of e2e-member 1 -> 0
+[D] refresh with the live refresh token -> 400 invalid_grant
+[D] tools/list with the access token -> 401
+[D] API token on /mcp -> 403 'No MCP permission'
+[D] API token on /api/stock/ -> 200
+[D] effective document: may_connect=False reason='no_mcp_permission'
+[-] restored the MCP roles of 'MCP Users' and deleted the API token
+OK: MCP permission set end to end
+```
+
+`python3 dev/oauth_smoke.py --sso e2e-member` (tail):
+
+```
+[9] tools/list -> 200; 56 tools, e.g. ['describe_filters', 'make_web_link', 'list_attachments', 'get_attachment']
+[10] refresh -> 200; expires_in=3600 refresh token rotated: True
+[12] tools/list with the pre-refresh access token -> 401 (revoked by rotation)
+[14] refresh with the just-revoked refresh token -> 400 invalid_grant
+OK: OAuth façade flow completed (SSO as e2e-member)
+```
+
+`python3 dev/membership_e2e.py --skip-outage` (tail):
+
+```
+[D] tools/list with an InvenTree API token of the blocked user -> 401 'Access revoked, sign in to InvenTree again.'
+[E] after an admin unblock: tools/list with the API token -> 403 'No MCP permission'
+[F] tools/list with the API token -> 200
+[G] after the queued background re-check: API token on /mcp -> 200 (attempt 1); checked 4 s ago, last_error=''
+OK: membership re-check end to end
+```
+
+Docs: README "Two permission sets" (per-table wording, every credential cut on every request, group removal at the next request, the multi-role bullet with the `note`, the plugin API sentence) and "Authentication" (OAuth tokens of any application are cut to the MCP roles). AGENTS.md file map: `context.py`, `proxy.py`, `mcp_transport.py`, `oauth2_bridge.py`, `auth/api.py`, `auth/policy.py`, `auth/membership.py` and `auth/signals.py`. The README GUI section was not touched.

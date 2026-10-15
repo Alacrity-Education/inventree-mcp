@@ -19,7 +19,11 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 from rest_framework.views import APIView
 from rest_framework.viewsets import ViewSetMixin
 
-from .context import get_current_oauth2_token, get_current_user
+from .context import (
+    get_current_oauth2_token,
+    get_current_request_meta,
+    get_current_user,
+)
 from .oauth2_bridge import authentication_classes_for, scoped_view_class
 from .settings import get_plugin_setting
 
@@ -81,11 +85,16 @@ def _call_view_sync(
         )
 
     factory_method = getattr(_factory, method.lower())
+    # The originating request's resolved host, scheme and client address
+    # (context._Identity.request_meta) instead of the factory's "testserver":
+    # paginated views build absolute "next" / "previous" links from it, and
+    # "testserver" fails ALLOWED_HOSTS on a real instance.
+    meta = get_current_request_meta()
 
     if method == "GET":
-        request = factory_method(path, data=query_params or {})
+        request = factory_method(path, data=query_params or {}, **meta)
     else:
-        request = factory_method(path, data=data or {}, format="json")
+        request = factory_method(path, data=data or {}, format="json", **meta)
 
     actions = _viewset_actions(view_cls, method, view_kwargs)
 
@@ -135,7 +144,7 @@ def _user_has_access_sync(view_cls: type[APIView], method: str) -> bool:
 
     oauth2_token = get_current_oauth2_token()
     method = method.upper()
-    request = _factory.generic(method, "/")
+    request = _factory.generic(method, "/", **get_current_request_meta())
 
     if oauth2_token is not None:
         # Same reasoning as _call_view_sync's OAuth2 branch: a synthetic

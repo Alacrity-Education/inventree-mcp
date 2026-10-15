@@ -29,6 +29,41 @@ Plugin code is bind-mounted and installed with `pip install -e`: Python edits sh
 (`pip install` over the network plus `invoke update`), so it takes about a minute.
 `dev/test.sh` always runs the current files, no restart needed.
 
+## Frontend (plugin pages)
+
+The pages ("MCP Access" for staff, "MCP" for everybody) are React bundles built from `frontend/` into
+`inventree_mcp/static/` (git-ignored build output; never edit it by hand).
+
+```bash
+dev/up.sh                              # builds them first when Groups.js is missing or older than frontend/src
+(cd frontend && npm ci && npm run build)   # rebuild by hand (also: npm run lint, npm test, npm run check:bundles)
+dev/compose.sh restart inventree-server inventree-worker
+```
+
+InvenTree copies the plugin's static tree to `dev/data/static/plugins/inventree-mcp/` (Caddy serves it as
+`/static/plugins/inventree-mcp/`) when the plugin registry loads, so a restart of the server container is the step that
+refreshes the files after a rebuild (a registry reload, e.g. a `dev/test.sh` run that reloads plugins, also copies
+them). Check with `curl -I http://localhost:8080/static/plugins/inventree-mcp/Groups.js`; hard-reload the browser
+afterwards (the plain `Groups.js` names are cached, core prefers the hashed copies when it builds the URLs).
+A build removes the old hashed files (`--emptyOutDir`) but the copy in `dev/data/static/` keeps them, which is harmless.
+
+Plugin pages (routes) need an InvenTree newer than 1.5.7 (core PR #12900, in `inventree/inventree:latest`). On the
+default 1.5.7 stack the plugin therefore offers no pages and no navigation entries (the "MCP Roles" group panel is
+ready for the core change that requests group panels). To try the pages set `INVENTREE_TAG=latest` and
+`DEMO_DATASET_REF=WORKTREE` in `dev/.env`, then `dev/down.sh -v && dev/up.sh`.
+
+Headless-browser check of both pages (`dev/ui_smoke.py`, screenshots in `docs/plans/screenshots/`); the host python is
+usually externally managed, so use a virtualenv:
+
+```bash
+python3 -m venv /tmp/pw && /tmp/pw/bin/pip install playwright && /tmp/pw/bin/playwright install chromium
+/tmp/pw/bin/python dev/ui_smoke.py [--base-url http://localhost:8080]
+```
+
+Hot reload with InvenTree's `plugin_dev` block (`plugin_dev: {slug: inventree-mcp, host: http://localhost:5174}` in
+`config.yaml`, debug mode on) was not attempted: the frontend has no `npm run dev` script and the stable stack has no
+plugin routes to load into.
+
 ## URLs and accounts
 
 | What | URL | Login |
@@ -73,6 +108,7 @@ API token for curl: `curl -s -u admin:admin http://localhost:8080/api/user/token
 | `authentik/sso_smoke.py` | scripted SSO login round trip; importable: `sso_login(username)`, `browse(..., stop=...)`, `Browser` |
 | `configure_inventree.py` | global settings, groups `Users` and `MCP Users` (MCP roles: view on every role; admin is a member) (run by `up.sh`) |
 | `oauth_smoke.py`, `membership_e2e.py`, `permissions_e2e.py` | live checks: OAuth façade, membership re-checks, MCP permission set |
+| `ui_smoke.py` | headless-browser check of the plugin pages (see Frontend) |
 | `data/` | InvenTree data dir (config, static, media, secret key), git-ignored |
 
 Why an entrypoint wrapper: the image's `init.sh` only prepares directories and `config.yaml`; it never runs

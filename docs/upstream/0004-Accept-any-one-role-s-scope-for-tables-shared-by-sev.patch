@@ -1,0 +1,109 @@
+From cc50ad2bb9b2372aba904b668a4500cd51af94b5 Mon Sep 17 00:00:00 2001
+From: lucaci32u4 <lucaci32u4@gmail.com>
+Date: Thu, 15 Oct 2026 08:50:27 +0300
+Subject: [PATCH 4/4] Accept any one role's scope for tables shared by several
+ rulesets
+
+map_scope(roles=...) returned a single alternative holding every role's
+scope, so an OAuth2 token needed the scopes of all rulesets a table belongs
+to (part_part: part AND build; company_company: purchase, sales AND return
+order). The role check for the same request
+(users.permissions.check_user_permission) accepts any one of the roles, so a
+token issued with exactly the scopes a role grants could not use that
+role's tables.
+
+Return one alternative per role instead, which TokenMatchesOASRequirements
+treats as OR. Add unit tests for map_scope and for the scope check on a
+multi-role table (PartList).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../InvenTree/InvenTree/permissions.py        |  5 +-
+ src/backend/InvenTree/InvenTree/tests.py      | 51 +++++++++++++++++++
+ 2 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/InvenTree/InvenTree/permissions.py b/src/backend/InvenTree/InvenTree/permissions.py
+index 807117c21..5e46c44c1 100644
+--- a/src/backend/InvenTree/InvenTree/permissions.py
++++ b/src/backend/InvenTree/InvenTree/permissions.py
+@@ -52,7 +52,7 @@ def map_scope(
+     """Generate the required scopes for OAS permission views.
+ 
+     Args:
+-        roles (Optional[list[str]]): A list of roles or tables to generate granular scopes for.
++        roles (Optional[list[str]]): A list of roles to generate granular scopes for. Any one of them suffices: a table that belongs to several rulesets is accessible with the scope of any of them, as the role check (users.permissions.check_user_permission) accepts any of the roles.
+         only_read (bool): If True, only the read scope will be returned for all actions.
+         read_name (str): The read scope name to use when `only_read` is True.
+         map_read (Optional[list[str]]): A list of HTTP methods that should map to the default read scope (use if some actions requirea differing role).
+@@ -68,7 +68,8 @@ def map_scope(
+         if only_read:
+             return [[read_name]]
+         if roles:
+-            return [[get_granular_scope(action, table) for table in roles]]
++            # One alternative per role (OR), not one alternative with every role (AND)
++            return [[get_granular_scope(action, role)] for role in roles]
+         return [[action]]
+ 
+     def get_scope(method, action):
+diff --git a/src/backend/InvenTree/InvenTree/tests.py b/src/backend/InvenTree/InvenTree/tests.py
+index 7c5454f93..76296809d 100644
+--- a/src/backend/InvenTree/InvenTree/tests.py
++++ b/src/backend/InvenTree/InvenTree/tests.py
+@@ -2078,3 +2078,54 @@ class InvenTreeAppConfigTests(TestCase):
+ 
+             self.assertEqual(raised.exception.code, 1)
+             self.assertFalse(apps.PRE_1_0_0_CHECK_DONE)
++
++
++class OAuth2ScopeMapTest(TestCase):
++    """Scopes required for tables that belong to several rulesets."""
++
++    def test_map_scope_any_role(self):
++        """map_scope(roles=...) gives one alternative per role."""
++        from InvenTree.permissions import map_scope
++
++        scopes = map_scope(roles=['part', 'build'])
++        self.assertEqual(scopes['GET'], [['r:view:part'], ['r:view:build']])
++        self.assertEqual(scopes['POST'], [['r:add:part'], ['r:add:build']])
++        self.assertEqual(scopes['PATCH'], [['r:change:part'], ['r:change:build']])
++        self.assertEqual(scopes['DELETE'], [['r:delete:part'], ['r:delete:build']])
++        self.assertEqual(scopes['OPTIONS'], [['g:read']])
++
++        # A single role is unchanged
++        self.assertEqual(map_scope(roles=['stock'])['GET'], [['r:view:stock']])
++
++    def test_multi_role_table_accepts_any_role_scope(self):
++        """A token with the scope of one of the table's roles passes the scope check."""
++        from oauth2_provider.contrib.rest_framework import TokenMatchesOASRequirements
++        from oauth2_provider.models import AccessToken
++
++        from InvenTree.permissions import InvenTreeRoleScopeMixin, precalculated_roles
++        from part.api import PartList
++
++        # part_part belongs to the 'part' and the 'build' rulesets
++        self.assertEqual(sorted(precalculated_roles['part_part']), ['build', 'part'])
++
++        required = InvenTreeRoleScopeMixin().get_required_alternate_scopes(
++            None, PartList()
++        )
++        self.assertIn(['r:view:part'], required['GET'])
++        self.assertIn(['r:view:build'], required['GET'])
++
++        class Request:
++            method = 'GET'
++
++            def __init__(self, scope):
++                self.auth = AccessToken(
++                    scope=scope, expires=timezone.now() + timedelta(hours=1)
++                )
++
++        class View:
++            required_alternate_scopes = required
++
++        check = TokenMatchesOASRequirements()
++        self.assertTrue(check.has_permission(Request('r:view:part'), View()))
++        self.assertTrue(check.has_permission(Request('r:view:build'), View()))
++        self.assertFalse(check.has_permission(Request('r:view:stock'), View()))
+-- 
+2.56.0
+

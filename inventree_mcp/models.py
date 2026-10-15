@@ -103,9 +103,12 @@ class MCPRuleSet(models.Model):
         verbose_name=_("Group"),
         help_text=_("Group"),
     )
+    # No ``choices``: a role added by a core upgrade would otherwise make
+    # Django report a (no-SQL) AlterField for this app. The rows are only
+    # created from users.ruleset.RULESET_NAMES (ensure_rulesets, migration
+    # 0002) and the API serves ``name`` read-only.
     name = models.CharField(
         max_length=50,
-        choices=RULESET_CHOICES,
         verbose_name=_("Name"),
         help_text=_("Permission set"),
     )

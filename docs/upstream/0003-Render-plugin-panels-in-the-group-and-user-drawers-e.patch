@@ -1,7 +1,7 @@
 From 630bc8b24b4793ca9cdce577b6e29ccc05a8508f Mon Sep 17 00:00:00 2001
 From: lucaci32u4 <lucaci32u4@gmail.com>
 Date: Thu, 15 Oct 2026 07:23:39 +0300
-Subject: [PATCH 3/3] Render plugin panels in the group and user drawers;
+Subject: [PATCH 3/4] Render plugin panels in the group and user drawers;
  export RoleTable from the UI library
 
 GroupDrawer and UserDrawer fetch plugin panels via usePluginPanels

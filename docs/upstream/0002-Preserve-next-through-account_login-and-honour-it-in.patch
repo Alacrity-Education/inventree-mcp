@@ -1,7 +1,7 @@
 From 1a8e5ff3a86fc348b47c0527f145456ddea46baf Mon Sep 17 00:00:00 2001
 From: lucaci32u4 <lucaci32u4@gmail.com>
 Date: Thu, 15 Oct 2026 07:22:32 +0300
-Subject: [PATCH 2/3] Preserve 'next' through account_login and honour it in
+Subject: [PATCH 2/4] Preserve 'next' through account_login and honour it in
  the React login flow
 
 The legacy account_login route redirected to the frontend and dropped the

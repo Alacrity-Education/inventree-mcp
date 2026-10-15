@@ -818,29 +818,44 @@ def unblock_user(user) -> None:
         logger.info("inventree-mcp: MCP block lifted for user id %s", user.pk)
 
 
-def revoke_all_mcp_tokens(user) -> int:
-    """Revoke every live token *user* holds for an MCP (DCR/CIMD) application.
+def mcp_token_querysets(user_ids):
+    """(refresh, access): the live façade tokens of *user_ids*, as two querysets.
 
-    Refresh tokens go through DOT's RefreshToken.revoke(), which also removes
-    the paired access token. Access tokens without a live refresh token are
-    revoked with AccessToken.revoke(). Returns the number of tokens revoked.
+    Refresh tokens: unrevoked. Access tokens: not expired. Both only of MCP
+    (DCR/CIMD) applications (clients.mcp_applications()). Lazy, so an access
+    queryset evaluated after revoking the refresh tokens no longer sees the
+    paired access tokens DOT removed with them.
     """
     from oauth2_provider.models import get_access_token_model, get_refresh_token_model
 
     from .clients import mcp_applications
 
     applications = mcp_applications()
+    refresh = get_refresh_token_model().objects.filter(
+        user_id__in=user_ids, revoked__isnull=True, application__in=applications
+    )
+    access = get_access_token_model().objects.filter(
+        user_id__in=user_ids, expires__gt=timezone.now(), application__in=applications
+    )
+    return refresh, access
+
+
+def revoke_all_mcp_tokens(user) -> int:
+    """Revoke every live token *user* holds for an MCP (DCR/CIMD) application.
+
+    Refresh tokens go through DOT's RefreshToken.revoke(), which also removes
+    the paired access token. Live access tokens without a live refresh token
+    are revoked with AccessToken.revoke() (expired ones are DOT's
+    cleartokens' business). Returns the number of tokens revoked.
+    """
+    refresh, access = mcp_token_querysets([user.pk])
     count = 0
 
-    for refresh_token in get_refresh_token_model().objects.filter(
-        user=user, revoked__isnull=True, application__in=applications
-    ):
+    for refresh_token in refresh:
         refresh_token.revoke()
         count += 1
 
-    for access_token in get_access_token_model().objects.filter(
-        user=user, application__in=applications
-    ):
+    for access_token in access:
         access_token.revoke()
         count += 1
 

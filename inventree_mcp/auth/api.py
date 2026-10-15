@@ -16,9 +16,10 @@ Authentication is InvenTree's default list (session for the web UI, API
 token, Basic, OAuth2). Permissions reuse core's classes: DRF's
 IsAuthenticated, core's role check (users.permissions.check_user_role) and
 core's OAuth2 scope check (oauth2_bridge's fixed
-InvenTreeTokenMatchesOASRequirements). An OAuth token needs "a:staff" for the
-staff endpoints, so an MCP token (which never carries it) cannot change MCP
-permissions. Serializers are explicit (core's RuleSetSerializer for the
+InvenTreeTokenMatchesOASRequirements). OAuth tokens are refused on these
+views by InvenTree's AuthRequiredMiddleware (it knows sessions and API tokens
+only, and runs before DRF); the views additionally require "a:staff" on an
+OAuth token for the staff endpoints, which MCP tokens never carry. Serializers are explicit (core's RuleSetSerializer for the
 rulesets) for schema generation; InvenTree's schema export only covers /api/
 and disables plugins anyway.
 
@@ -55,7 +56,7 @@ from ..settings import get_plugin_setting
 from . import membership, oauth_enabled, policy
 from .clients import is_trusted_client, mcp_applications
 from .discovery import resource
-from .signals import ensure_rulesets, revoke_group_members
+from .signals import ensure_rulesets, ensure_rulesets_for, revoke_group_members
 
 FLAGS = MCPRuleSet.RULE_OPTIONS
 PERMISSIONS = tuple(perm for _flag, perm in policy.FLAG_PERMISSIONS)
@@ -171,11 +172,15 @@ class EffectiveSerializer(serializers.Serializer):
     )
     effective = serializers.DictField(
         child=RoleFlagsSerializer(),
-        help_text="What MCP can actually do: interactive roles AND MCP scopes",
+        help_text=(
+            "Per role: interactive role AND MCP scope. Tables shared by several "
+            "roles can be reachable without both on the same role (see note)"
+        ),
     )
     scopes = serializers.ListField(child=serializers.CharField())
     may_connect = serializers.BooleanField()
     reason = serializers.CharField(allow_blank=True)
+    note = serializers.CharField(help_text="How to read 'effective'")
 
 
 class ConnectionSerializer(serializers.Serializer):
@@ -279,9 +284,8 @@ class MCPRuleSetList(ListAPI):
     def get(self, request, *args, **kwargs):
         """List, creating missing rows first (a role added by a core upgrade appears)."""
         group = self._group()
-        groups = [group] if group is not None else list(Group.objects.all())
-        for each in groups:
-            ensure_rulesets(each)
+        # One SELECT and at most one bulk INSERT, for one group or all of them.
+        ensure_rulesets_for([group] if group is not None else Group.objects.all())
         queryset = self.get_queryset()
         if group is not None:
             queryset = queryset.filter(group=group)
@@ -376,6 +380,16 @@ class MCPRuleSetRevoke(_GroupAction):
 
 # -- effective permissions -------------------------------------------------------------
 
+#: The effective document's note (F4 of the WP3 review): "effective" is per role,
+#: access is per table.
+EFFECTIVE_NOTE = (
+    "'effective' marks a role when the user holds it interactively and as an MCP "
+    "role. Access is checked per table: for a table shared by several roles (for "
+    "example parts: Parts and Build Orders; stock items: Stock Items and Build "
+    "Orders; companies: the three order roles), any interactive role and any MCP "
+    "role that cover the table suffice, even when they differ."
+)
+
 
 def _role_map(flags_of) -> dict[str, dict]:
     """{role: {label, view, add, change, delete}} for every core role, in core's order."""
@@ -414,6 +428,7 @@ def effective_document(user) -> dict:
         "scopes": scopes,
         "may_connect": ok,
         "reason": reason,
+        "note": EFFECTIVE_NOTE,
     }
 
 

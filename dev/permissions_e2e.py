@@ -5,9 +5,10 @@
      (clear, then PATCH the part row); the effective document of e2e-member
   A  e2e-member connects through the façade (login bridge -> Authentik -> consent -> token):
      the token carries g:read r:view:part; tools/list lists the part tools and no stock tool;
-     a stock tool call fails with the permission error
+     a stock tool call fails with the permission error; list_parts {"limit": 1} succeeds with a
+     row and a "next" link on the proxy's host, and get_part on that row succeeds
   B  e2e-member's InvenTree API token: /api/stock/ still answers 200 (interactive roles untouched),
-     and on /mcp it sees exactly the OAuth tool list
+     on /mcp it sees exactly the OAuth tool list, and list_parts / get_part succeed as in A
   C  the plugin API in the server process: rulesets (all groups), effective, connections (?user=),
      status all answer 200 (no query goes through a reverse relation from a core model)
   D  admin clears the flag: the live refresh token is revoked at once (refresh -> invalid_grant,
@@ -117,7 +118,14 @@ def tool_names(payload: dict) -> set[str]:
     return {tool["name"] for tool in payload.get("result", {}).get("tools", [])}
 
 
-def call_tool(agent: Browser, base_url: str, access_token: str, name: str) -> dict:
+def call_tool(
+    agent: Browser,
+    base_url: str,
+    authorization: str,
+    name: str,
+    arguments: dict | None = None,
+) -> dict:
+    """tools/call with *authorization* ("Bearer ..." / "Token ..."); the JSON-RPC result."""
     _status, _, text = agent.request(
         "POST",
         f"{base_url}/plugin/inventree-mcp/mcp/",
@@ -125,14 +133,63 @@ def call_tool(agent: Browser, base_url: str, access_token: str, name: str) -> di
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": name, "arguments": {"limit": 1}},
+            "params": {
+                "name": name,
+                "arguments": {"limit": 1} if arguments is None else arguments,
+            },
         },
         headers={
             "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {access_token}",
+            "Authorization": authorization,
         },
     )
     return json.loads(text or "{}").get("result", {})
+
+
+def tool_body(result: dict) -> dict:
+    """A tool result's structured content (or its JSON text)."""
+    if isinstance(result.get("structuredContent"), dict):
+        return result["structuredContent"]
+    try:
+        return json.loads((result.get("content") or [{}])[0].get("text", "{}"))
+    except ValueError:
+        return {}
+
+
+def real_tool_calls(
+    agent: Browser, base_url: str, authorization: str, label: str, who: str
+) -> None:
+    """list_parts {"limit": 1} and get_part on its row must succeed (paginated + detail call)."""
+    result = call_tool(agent, base_url, authorization, "list_parts", {"limit": 1})
+    message = (result.get("content") or [{}])[0].get("text", "")
+    body = tool_body(result)
+    rows = body.get("results") or []
+    following = body.get("next") or ""
+    step(
+        label,
+        f"{who} tools/call list_parts {{'limit': 1}} -> isError={bool(result.get('isError'))}, "
+        f"count={body.get('count')}, rows={len(rows)}, next={following.split('?')[0]!r}",
+    )
+    expect(
+        not result.get("isError") and len(rows) >= 1,
+        f"list_parts failed: {message[:200]!r}",
+    )
+    expect(
+        following.startswith(f"{base_url}/"),
+        f"'next' is not on {base_url}: {following!r}",
+    )
+    pk = rows[0]["pk"]
+    result = call_tool(agent, base_url, authorization, "get_part", {"part_id": pk})
+    body = tool_body(result)
+    step(
+        label,
+        f"{who} tools/call get_part {{'part_id': {pk}}} -> isError={bool(result.get('isError'))}, "
+        f"pk={body.get('pk')}",
+    )
+    expect(
+        not result.get("isError") and body.get("pk") == pk,
+        f"get_part failed: {(result.get('content') or [{}])[0].get('text', '')[:200]!r}",
+    )
 
 
 def stock_with_api_token(
@@ -220,7 +277,8 @@ def run(admin: Admin, base_url: str, group: int) -> None:
         status == 200 and "list_parts" in oauth_tools and not oauth_tools & STOCK_TOOLS,
         "tools/list does not reflect MCP view on parts only",
     )
-    result = call_tool(agent, base_url, tokens["access_token"], "list_stock_items")
+    bearer = f"Bearer {tokens['access_token']}"
+    result = call_tool(agent, base_url, bearer, "list_stock_items")
     message = (result.get("content") or [{}])[0].get("text", "")
     step(
         "A",
@@ -229,18 +287,8 @@ def run(admin: Admin, base_url: str, group: int) -> None:
     expect(
         result.get("isError") and "permission" in message, "stock tool call not refused"
     )
-    result = call_tool(agent, base_url, tokens["access_token"], "list_parts")
-    message = (result.get("content") or [{}])[0].get("text", "")
-    # Past the permission check; on the dev stack the proxied serializer then trips over the
-    # proxy's "testserver" host (pre-existing, independent of WP3; see docs/plans/WP3-report.md).
-    step(
-        "A",
-        f"tools/call list_parts -> isError={bool(result.get('isError'))} "
-        f"{'(no permission error)' if 'permission' not in message else repr(message)}",
-    )
-    expect(
-        "permission" not in message, "part tool call refused by the permission check"
-    )
+    # A paginated list (absolute "next" link built from the MCP request's host) and a detail call.
+    real_tool_calls(agent, base_url, bearer, "A", "OAuth token:")
 
     # B: the interactive API is untouched; the API token on /mcp is narrowed the same way.
     api_token = create_api_token()
@@ -258,6 +306,7 @@ def run(admin: Admin, base_url: str, group: int) -> None:
         status == 200 and token_tools == oauth_tools,
         "API token not narrowed like OAuth",
     )
+    real_tool_calls(agent, base_url, f"Token {api_token}", "B", "API token:")
 
     # C: every plugin API endpoint answers from the server process.
     checks = [

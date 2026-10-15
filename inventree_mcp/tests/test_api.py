@@ -179,9 +179,14 @@ class RuleSetApiTest(ApiTestCase):
         )
 
     def test_mcp_token_cannot_change_mcp_permissions(self):
-        """An OAuth token needs a:staff here; MCP tokens never carry it."""
+        """Bearer tokens never reach the plugin API: 401 from InvenTree's middleware.
+
+        AuthRequiredMiddleware runs before DRF and knows only sessions and API
+        tokens, so the views' own a:staff requirement (next test) is defence
+        in depth.
+        """
         access, _refresh = make_token_pair(
-            self.application, self.user, scope="g:read r:view:admin"
+            self.application, self.user, scope="g:read r:view:admin a:staff"
         )
         row = self.rows()["part"]
         response = Client().patch(
@@ -190,8 +195,35 @@ class RuleSetApiTest(ApiTestCase):
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {access.token}",
         )
-        self.assertIn(response.status_code, (401, 403))
+        self.assertEqual(response.status_code, 401)
         self.assertTrue(self.rows()["part"].can_view)
+
+    def test_staff_endpoints_require_a_staff_on_an_oauth_token(self):
+        """Called directly (past the middleware): the scope check itself refuses."""
+        from rest_framework.test import APIRequestFactory
+
+        from ..auth.api import MCPRuleSetDetail
+        from ..oauth2_bridge import authentication_classes_for
+
+        row = self.rows()["part"]
+
+        def patch(scope: str):
+            access, _refresh = make_token_pair(self.application, self.user, scope=scope)
+            view = MCPRuleSetDetail.as_view(
+                authentication_classes=authentication_classes_for(self.user, access)
+            )
+            request = APIRequestFactory().patch(
+                f"/rulesets/{row.pk}/", {"can_view": False}, format="json"
+            )
+            return view(request, pk=row.pk)
+
+        response = patch("g:read r:view:admin r:change:admin")
+        self.assertEqual(response.status_code, 403, response.data)
+        self.assertTrue(self.rows()["part"].can_view)
+
+        response = patch("a:staff")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(self.rows()["part"].can_view)
 
 
 class RowsTest(ApiTestCase):
@@ -247,6 +279,7 @@ class EffectiveApiTest(ApiTestCase):
         self.assertFalse(doc["effective"]["build"]["view"])  # MCP only
         self.assertTrue(doc["effective"]["part"]["view"])  # both
         self.assertTrue(doc["effective"]["stock"]["view"])
+        self.assertIn("any interactive role and any MCP role", doc["note"])
 
     def test_no_permission_document(self):
         MCPRuleSet.objects.filter(group=self.plain_group).update(can_view=False)
