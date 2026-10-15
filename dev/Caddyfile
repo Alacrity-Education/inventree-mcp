@@ -1,0 +1,58 @@
+# Adapted from InvenTree's contrib/container/Caddyfile: plain HTTP on container port 80 (published as 127.0.0.1:8080).
+(cors-headers) {
+	header Allow GET,HEAD,OPTIONS
+	header Access-Control-Allow-Origin *
+	header Access-Control-Allow-Methods GET,HEAD,OPTIONS
+	header Access-Control-Allow-Headers Authorization,Content-Type,User-Agent,traceparent
+
+	@cors_preflight{args[0]} method OPTIONS
+
+	handle @cors_preflight{args[0]} {
+		respond "" 204
+	}
+}
+
+{
+	admin off
+	auto_https off
+}
+
+# internal health check for the compose healthcheck
+:9090 {
+	handle /api/system/health/* {
+		reverse_proxy inventree-server:8000
+	}
+	handle {
+		respond 404
+	}
+}
+
+:80 {
+	log {
+		output stdout
+	}
+
+	encode gzip
+
+	request_body {
+		max_size 100MB
+	}
+
+	handle_path /static/* {
+		import cors-headers static
+		root * /var/www/static
+		file_server
+	}
+
+	handle_path /media/* {
+		import cors-headers media
+		root * /var/www/media
+		file_server
+		header Content-Disposition attachment
+		forward_auth inventree-server:8000 {
+			uri /auth/
+		}
+	}
+
+	reverse_proxy inventree-server:8000
+}

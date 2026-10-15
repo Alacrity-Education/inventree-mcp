@@ -1,0 +1,1 @@
+-e /home/inventree/plugins/inventree-mcp

@@ -1,0 +1,143 @@
+# Disposable development and test stack for the InvenTree MCP plugin. See dev/README.md.
+# Secrets for the dev Authentik come from ./.env, which up.sh generates (git-ignored, never commit it).
+# Published ports (loopback unless noted): 8080 proxy, 8000 gunicorn, 8025 Mailpit, 19000 Authentik (all interfaces).
+# Nothing is published on 5432, 80 or 443.
+name: inventree-mcp-dev
+
+x-inventree: &inventree
+  image: inventree/inventree:${INVENTREE_TAG:-1.5.7}
+  env_file:
+    - inventree.env
+  # root so that `pip install -e` into the image's site-packages works (same as upstream CI)
+  user: root
+  # The browser on the host and the containers must reach Authentik under the same URL
+  extra_hosts:
+    - "authentik.localtest.me:host-gateway"
+  volumes:
+    - ./data:/home/inventree/data
+    - ..:/home/inventree/plugins/inventree-mcp
+    - ../../demo-dataset:/home/inventree/demo:ro
+    - ./entrypoint.sh:/dev-entrypoint.sh:ro
+  entrypoint: ["/bin/bash", "/dev-entrypoint.sh"]
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: inventree
+      POSTGRES_PASSWORD: inventree
+      POSTGRES_DB: inventree
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inventree -d inventree"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  cache:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "127.0.0.1:8025:8025"
+
+  inventree-server:
+    <<: *inventree
+    command: gunicorn -c ./gunicorn.conf.py InvenTree.wsgi -b 0.0.0.0:8000 --chdir ./src/backend/InvenTree
+    environment:
+      DEV_RUN_UPDATE: "1"
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "invoke server-health --address http://localhost:8000"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+
+  inventree-worker:
+    <<: *inventree
+    command: invoke worker
+    depends_on:
+      inventree-server:
+        condition: service_healthy
+
+  proxy:
+    image: caddy:alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      inventree-server:
+        condition: service_healthy
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/static:/var/www/static:ro
+      - ./data/media:/var/www/media:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "--header=Host: localhost", "http://127.0.0.1:9090/api/system/health/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  authentik-db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${PG_PASS:?run dev/up.sh, it writes dev/.env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - authentik-db:/var/lib/postgresql/data
+
+  authentik-server:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.3}
+    command: server
+    environment: &authentik-env
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?run dev/up.sh, it writes dev/.env}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_BOOTSTRAP_EMAIL: admin@example.test
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+    ports:
+      # all interfaces on purpose: containers reach it through host-gateway
+      - "0.0.0.0:${AUTHENTIK_PORT:-19000}:9000"
+    shm_size: 512mb
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+
+  authentik-worker:
+    image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.3}
+    command: worker
+    environment: *authentik-env
+    shm_size: 512mb
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  authentik-db:
