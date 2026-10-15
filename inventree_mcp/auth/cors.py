@@ -8,17 +8,18 @@ the metadata documents use ``*`` instead (see discovery.py).
 from __future__ import annotations
 
 from django.http import HttpResponse
+from django.utils.cache import patch_vary_headers
 
-from ..settings import get_plugin_setting
+from ..settings import plugin_setting_list
 
-DEFAULT_TRUSTED_ORIGINS = "https://claude.ai,https://claude.com"
 PREFLIGHT_MAX_AGE_SECONDS = 3600
 
 
 def trusted_origins() -> list[str]:
     """Origins allowed to call the façade endpoints, from TRUSTED_CLIENT_ORIGINS."""
-    value = get_plugin_setting("TRUSTED_CLIENT_ORIGINS", DEFAULT_TRUSTED_ORIGINS)
-    return [origin.strip().rstrip("/") for origin in value.split(",") if origin.strip()]
+    return [
+        origin.rstrip("/") for origin in plugin_setting_list("TRUSTED_CLIENT_ORIGINS")
+    ]
 
 
 class TrustedOriginCORSMixin:
@@ -44,5 +45,5 @@ class TrustedOriginCORSMixin:
         # Application.allowed_origins matches; do not send it twice.
         if origin and "Access-Control-Allow-Origin" not in response:
             response["Access-Control-Allow-Origin"] = origin
-            response["Vary"] = "Origin"
+            patch_vary_headers(response, ["Origin"])
         return response

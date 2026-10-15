@@ -137,3 +137,158 @@ Call sites (replace bodies in `policy.py` and `membership.py`, not these calls):
 - **`sso_provider_id(request)` in `login_bridge.py`** resolves the allauth provider and accepts `request=None` for use without a request. WP2's re-check should reuse it to find the `SocialApp`/`SocialToken`.
 - **Models:** `models.py` and `migrations/` exist and are empty, and `AppMixin` is active. WP2 and WP3 add `MCPUserState` and `MCPRuleSet` plus migrations there.
 - **Tests:** `tests/oauth_helpers.OAuthFacadeTestMixin` enables the plugin and `OAUTH_ENABLED`, restores DOT's settings in `tearDownClass`, and provides `register()`, `obtain_code()`, `exchange_code()`, `refresh()` and `mcp_call()`. `tests/test_auth_flow.py` is the end-to-end regression test to keep green.
+
+## Review fixes applied
+
+Applies `docs/plans/WP1-review.md` (F1 to F17, Duplication, 1.5.x discovery, Test quality, Next-stage readiness). Not committed.
+
+### Findings
+
+| Finding | What changed (file: function) |
+|---|---|
+| **F1** (blocker) | `auth/token.py`: `MCPTokenView._check_refresh_grant` now runs `membership.refresh_grant_allowed()` for revoked rows too. A revoked row goes to DOT only when it was rotated, i.e. a successor access token exists (`AccessToken.objects.filter(source_refresh_token=rt).exists()`), so DOT re-serves the pair it already issued. A revoked row with no successor inside the grace window gets `invalid_grant` (`_revoked_within_grace()` uses DOT's own `REFRESH_TOKEN_GRACE_PERIOD_SECONDS` test). One case still goes to DOT: a revoked row past the grace window. DOT refuses it there and applies reuse protection to the family. That keeps the family revocation when an old rotated token is replayed after its successor was itself rotated, because the successor access token is gone by then. Unknown original scopes now get `invalid_grant` instead of being passed through. New `_scope_list()` drops the `''` that `scope_to_list('')` yields. The test's `_expire_grace_period()` call that hid the bug is removed. |
+| **F2** | `auth/authorize.py`: `MCPAuthorizationView.get` forces `approval_prompt=force` on a copy of `request.GET` before DOT's `get()`. This covers both the query parameter and an instance-wide `REQUEST_APPROVAL_PROMPT=auto`. Consent is now skipped only by `_may_skip_consent()`. |
+| **F3** | `settings.py: get_plugin_setting` reads the stored value (`_stored_value()`: `PluginSetting` of an active `PluginConfig`) while the registry has not loaded the plugin yet. So `core.InvenTreeMCP.__init__ -> settings_inject.apply()` now injects at start-up in every process. `auth/__init__.py: FacadeViewMixin.dispatch` and `auth/discovery.py: challenge_header` call `ensure_applied()` before the enabled check, so turning the façade off restores DOT's values. `auth/settings_inject.py: connect_signals()` is called from the plugin's `__init__` and is idempotent through `dispatch_uid`. It connects a django-q `pre_execute` receiver (`_before_task` -> `ensure_applied()`), which runs in the worker process before every task, including InvenTree's daily `run_oauth_maintenance`. |
+| **F4** | Both `http_method_names` are now tuples (`discovery._MetadataResponseMixin`, `login_bridge.MCPLoginBridgeView`). The `noqa` at `core.py` `__init__` and at `tests/test_auth_authorize.py` `assertErrorPage` is gone. `AGENTS.md` lint section: pin corrected to ruff v0.16.0 (CI installs the latest), with the `uvx` commands. ruff 0.17 (CI) flagged `delattr(cls, "_oauthlib_core")` in `settings_inject._reset_oauthlib_cores`; it is now `del cls._oauthlib_core`. CI runs `ruff check` at the repo root, so `dev/` must pass too. Its import-sort, `noqa` and `if-exp` findings are fixed in `dev/authentik/sso_smoke.py`, `dev/authentik/bootstrap.py` and `dev/configure_inventree.py`. |
+| **F5** | `auth/discovery.py: ProtectedResourceMetadataView(FacadeViewMixin, _MetadataResponseMixin, OAuthProtectedResourceMetadataView)` overrides `get_resource`, `get_authorization_servers`, `get_scopes_supported`, `get_resource_name` and `get_resource_documentation`. `_MetadataResponseMixin` adds `Cache-Control` and the `OPTIONS` answer. The import is guarded, because `mcp_transport.py` imports `discovery` on any DOT version. The AS metadata view stays hand-built (docstring says why). |
+| **F6** | `auth/discovery.py: challenge_header` uses DOT's `build_bearer_challenge(request, oauth2_error={"scope": …[, "error": "invalid_token"]}, realm="InvenTree", resource_metadata_url=…)`. It is imported lazily inside the enabled branch. The bare `Bearer realm="InvenTree"[, error="invalid_token"]` stays as the fallback when the façade is off. `_quote` is removed. DOT joins parameters with `,` (no space). |
+| **F7** | README prerequisites: the proxy must replace `X-Forwarded-For` (Caddy does by default; nginx needs `$remote_addr`, not `$proxy_add_x_forwarded_for`), and gunicorn must not be reachable directly. The optional code change (keying on the last hop) was not made. |
+| **F8** | `auth/token.py: _check_code_grant` / `_check_refresh_grant` return `None` (DOT alone) unless the grant's or refresh token's application is in `clients.mcp_applications()` (`_is_mcp_application()`). |
+| **F9** | `authorize.get_context_data` adds `client_registered_dynamically`. `consent.html` shows a "self-registered, not verified" badge for DCR clients. |
+| **F10** | `authorize.get` accepts only `discovery.resource(request)` and its slash-less form (`_allowed_resources()`). Anything else gets an `invalid_target` redirect to the validated redirect URI, with `state`. `form_valid` refuses a tampered hidden `resource` with a 400 error page, not a redirect, because the posted redirect URI is not validated at that point. |
+| **F11** | `auth/cors.py: TrustedOriginCORSMixin.dispatch` uses `patch_vary_headers(response, ["Origin"])`. |
+| **F12** | `settings.py`: `setting_default(key)` (from `InvenTreeMCP.SETTINGS`), `plugin_setting(key)`, `plugin_setting_list(key)`. Used by `clients.trusted_client_hosts`, `cors.trusted_origins` and `settings_inject.desired_values`, which now calls `clients.trusted_client_hosts()`. `DEFAULT_TRUSTED_HOSTS`, `DEFAULT_TRUSTED_ORIGINS` and `_split_hosts` are removed. |
+| **F13** | `core.py SETTINGS`: `[int, MinValueValidator(1)]` for the three lifetimes and `UNUSED_CLIENT_RETENTION_DAYS`; `MinValueValidator(0)` for `REGISTER_RATE_LIMIT_PER_MINUTE`. |
+| **F14** | `auth/tasks.py: cleanup_stale_clients` docstring now says the registration token expires (injected 86400 s) and that the worker sync comes from the `pre_execute` hook. |
+| **F15** | `core.py: get_well_known_urls` lists the OAuth documents for the index (`request` given) only while `oauth_enabled()`. The redirect patterns (`request=None`) are unchanged. |
+| **F16** | `settings_inject`: `desired_values()` is memoised per process for `DESIRED_VALUES_TTL_SECONDS` (5 s) in `_memoised_desired_values()`. `invalidate()` clears the memo on `post_save` of `plugin.PluginSetting` / `plugin.PluginConfig` (lazy senders, connected in `connect_signals()`). Anonymous 401s no longer read the settings on every request. |
+| **F17** | Informational. README now documents that `openid-configuration` is an RFC 8414 alias without the OIDC-only fields, and that WP2 needs app integration (`ENABLE_PLUGINS_APP`). The CRLF to LF conversion of `core.py` from WP1 should be mentioned in the commit body; no other files were converted. |
+| **1.5.x discovery** | README has a new subsection, "InvenTree 1.5.x: reverse-proxy rewrites for discovery". It gives Caddy and nginx rewrites for the `oauth-authorization-server`, `openid-configuration` and `oauth-protected-resource/.../mcp` path-insertion URLs, plus the alias caveat. `auth/__init__.py: warn_if_discovery_needs_proxy()` logs one WARNING per process at the first façade request when `OAUTH_ENABLED` is on and `_well_known_compat.NATIVE_WELL_KNOWN` is false (new flag). The `OAUTH_ENABLED` setting description and the README settings table mention the rewrites. |
+| **Duplication (tests)** | `tests/oauth_helpers.py`: `mcp_call(access_token=None, method, path, **headers)` replaces `test_auth_flow._mcp` and `test_auth_discovery._post`. `consent_form_data(page)` replaces the three copies. `make_token_pair(app, user, *, expired, refresh, scope)` replaces `test_auth_token._pair` and `test_auth_clients._token`. `setUp` also calls `settings_inject.invalidate()`, because a test's rollback sends no signal. |
+| **Duplication (dev)** | `dev/oauth_smoke.py` now uses `Browser`, `browse(stop=...)` and `absolute` from `dev/authentik/sso_smoke.py`; its own `Session`/`NoRedirect` are gone. A new `--sso USER` mode submits the login bridge's SSO form (POST `provider/redirect`, `callback_url` = authorize URL), drives Authentik with `browse()`, and lands back on the authorize URL with a session. The admin password mode is still the default. Both modes now also check the RFC 8414 path-insertion URL, `approval_prompt=auto` (consent still shown), revocation, and an immediate refusal of the revoked refresh token. |
+| **dev/** | `dev/Caddyfile` has the rewrites from README. I added three lines: the `openid-configuration` one besides the two asked for. `dev/entrypoint.sh` has a `fix_checkout_ownership()` function. It runs after `pip install -e`, again after `invoke update`, and in a detached loop (every 10 s for 5 min) after start. The earlier single `find`/`chown` did not cover the later `plugins.txt` installs (`invoke update`, and InvenTree's registry at start-up): those wrote `inventree_mcp.egg-info/PKG-INFO` as root, and I reproduced this after a restart. |
+
+### New and changed tests (69 -> 96 in `inventree_mcp/tests/`)
+
+- `test_auth_token.py`:
+  - `test_revoke_endpoint_revokes` now asserts a 400 `invalid_grant` immediately after `/oauth/revoke/`, with no `_expire_grace_period()`.
+  - New: `test_refresh_after_revoke_all_mcp_tokens_is_refused` (the WP2 `block_user` path), `test_membership_gate_runs_for_rotated_tokens_too`, `test_unknown_original_scope_is_refused`, `test_empty_scope_parameter_keeps_the_original_scope`, `test_other_applications_are_left_to_dot` (F8).
+  - The rotation test also asserts DOT's in-grace re-serve of the same pair.
+- `test_auth_flow.py`: asserts refresh-token rotation and that the old access token gets 401. Then it revokes through `revocation_endpoint` and asserts that MCP answers 401 and that the revoked refresh token gets 400 immediately.
+- `test_auth_authorize.py`:
+  - `test_approval_prompt_auto_does_not_skip_consent` (a DCR client with an https redirect and a loopback DCR client, each holding a live token).
+  - `test_resource_must_be_the_mcp_endpoint`, `test_tampered_resource_on_consent_is_refused`, `test_dynamically_registered_client_is_marked_unverified`, `test_tampered_redirect_uri_is_never_redirected_to`, `test_tampered_client_id_cannot_take_this_redirect_uri`, `test_plain_pkce_redirects_with_invalid_request`.
+  - Login bridge `test_disabled_facade_answers_404`.
+  - New `SsoProviderTest`: the real `sso_provider_id()` / `_sso_app()` against allauth's app list, with settings-backed apps through `override_settings(SOCIALACCOUNT_PROVIDERS=…)`. It covers a single app (with and without a request), `LOGIN_ENABLE_SSO` off, two apps being ambiguous, `SSO_PROVIDER_ID` choosing one, a configured id that does not exist, no provider, and the bridge using the real provider.
+- `test_settings_inject.py`:
+  - `test_disabled_facade_view_restores_dot_settings`, `test_desired_values_are_memoised_between_saves` (F16).
+  - New `FreshProcessTest`. It resets `_last_applied` and DOT's settings, then covers plugin `__init__` while the registry holds no instance (`test_plugin_init_injects_while_the_registry_is_loading`), an inactive plugin injecting nothing, and `test_scheduled_task_sees_the_facade_values` (django-q `pre_execute`).
+- `test_auth_discovery.py`: `test_disabled_facade_restores_dot_settings_through_the_challenge`, plus new `WellKnownAdvertisementTest` (F15).
+
+The F1 tests were checked against the old behaviour: with the revoked-row branch short-circuited to DOT, `test_revoke_endpoint_revokes`, `test_refresh_after_revoke_all_mcp_tokens_is_refused` and `test_auth_flow` fail. With the fix they pass.
+
+### Verification
+
+Tests (InvenTree 1.5.7, DOT 3.4.0, after the final restart):
+
+```
+$ dev/test.sh inventree_mcp
+Ran 228 tests in 72.345s
+OK (skipped=3)          (the three WellKnownRedirectTest skips: no /.well-known/ plugin index on 1.5.7)
+
+$ dev/test.sh inventree_mcp.test_mcp
+Ran 132 tests in 19.611s
+OK
+```
+
+Lint:
+
+```
+$ uvx ruff@0.16.0 check --preview inventree_mcp                 -> All checks passed!
+$ uvx ruff@0.16.0 format --preview --check inventree_mcp        -> 50 files already formatted
+$ uvx ruff@0.16.0 check --preview --isolated inventree_mcp/tests -> All checks passed!
+$ uvx ruff@0.16.0 format --preview --isolated --check inventree_mcp/tests -> 8 files already formatted
+$ uvx ruff@0.16.0 check [--preview]  (repo root, as CI)          -> All checks passed!
+$ uvx ruff@0.17.0 check [--preview]  (repo root, CI's current)   -> All checks passed!
+```
+
+Rewritten discovery URL through the dev proxy, after `dev/compose.sh restart proxy`:
+
+```
+$ curl -i http://localhost:8080/.well-known/oauth-authorization-server/plugin/inventree-mcp
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: *
+Cache-Control: max-age=300
+Content-Type: application/json
+Via: 1.1 Caddy
+{"issuer": "http://localhost:8080/plugin/inventree-mcp", "authorization_endpoint": "http://localhost:8080/plugin/inventree-mcp/oauth/authorize/", ...}
+/.well-known/openid-configuration/plugin/inventree-mcp           -> 200 application/json
+/.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp   -> 200 application/json
+/.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp/  -> 200 application/json
+```
+
+Fresh worker process (`dev/compose.sh exec -T inventree-worker python src/backend/InvenTree/manage.py shell -c "…"`, `OAUTH_ENABLED` on):
+
+```
+A fresh process, after plugin load (__init__): REFRESH_TOKEN_EXPIRE_SECONDS=2592000 ACCESS_TOKEN_EXPIRE_SECONDS=3600 CIMD_ENABLED=True REFRESH_TOKEN_REUSE_PROTECTION=True
+B reset to InvenTree's DOT values: REFRESH_TOKEN_EXPIRE_SECONDS=None ACCESS_TOKEN_EXPIRE_SECONDS=36000 CIMD_ENABLED=False REFRESH_TOKEN_REUSE_PROTECTION=False
+C after django-q pre_execute: REFRESH_TOKEN_EXPIRE_SECONDS=2592000 ACCESS_TOKEN_EXPIRE_SECONDS=3600 CIMD_ENABLED=True REFRESH_TOKEN_REUSE_PROTECTION=True
+```
+
+In the review, line A read `None / 36000 / False`. A real task executed by the running qcluster (`async_task('builtins.eval', …)` reading `oauth2_settings` inside the task):
+
+```
+WORKER task (pid, REFRESH_TOKEN_EXPIRE_SECONDS, ACCESS_TOKEN_EXPIRE_SECONDS, CIMD_ENABLED) = (149, 2592000, 3600, True) ; shell pid 434
+```
+
+The server log shows the 1.5.x hint once per process:
+
+```
+WARNING inventree-mcp: OAuth sign-in is on, but this InvenTree version cannot serve /.well-known/oauth-authorization-server/plugin/inventree-mcp; add the reverse-proxy rewrites from the plugin README …
+```
+
+Smoke test, password mode (`python3 dev/oauth_smoke.py`):
+
+```
+[1] POST /mcp/ without token -> 401; WWW-Authenticate: Bearer realm="InvenTree",scope="g:read r:view:admin r:view:part_category r:view:part r:view:bom r:view:stock_location r:...
+[2] PRM -> 200; resource=http://localhost:8080/plugin/inventree-mcp/mcp/ authorization_servers=['http://localhost:8080/plugin/inventree-mcp']
+[3] AS metadata at /.well-known/oauth-authorization-server/plugin/inventree-mcp -> 200 application/json
+[3] AS metadata -> 200; issuer=http://localhost:8080/plugin/inventree-mcp token_endpoint=http://localhost:8080/plugin/inventree-mcp/oauth/token/
+[4] register -> 201; client_id=<40 chars>
+[5] authorize (anonymous) -> 302 to /plugin/inventree-mcp/oauth/login/
+[5] login bridge -> 200 (sso mode), csrftoken cookie set: True
+[6] allauth headless login as 'admin' -> 200
+[7] authorize (signed in) -> 200, consent page shown: True
+[7] approve -> 302 to http://127.0.0.1:43123/callback (code: True, state ok: True)
+[8] token -> 200; token_type=Bearer expires_in=3600 access_token=<30 chars> refresh_token=<30 chars> scopes=12
+[9] tools/list -> 200; 56 tools, e.g. ['describe_filters', 'make_web_link', 'list_attachments', 'get_attachment']
+[9b] authorize with approval_prompt=auto -> 200 (consent shown again: True)
+[10] refresh -> 200; expires_in=3600 refresh token rotated: True
+[11] tools/list with refreshed token -> 200; 56 tools
+[12] tools/list with the pre-refresh access token -> 401 (revoked by rotation)
+[13] revoke refresh token -> 200
+[13] tools/list with the revoked pair's access token -> 401
+[14] refresh with the just-revoked refresh token -> 400 invalid_grant
+OK: OAuth façade flow completed (password login)
+```
+
+Smoke test, SSO mode (`python3 dev/oauth_smoke.py --sso e2e-member`). Steps 1 to 5 and 7 to 14 are as above, all OK. The SSO part:
+
+```
+[6] bridge form: POST /api/auth/v1/auth/provider/redirect provider=authentik process=login callback_url=http://localhost:8080/plugin/inventree-mcp/oauth/authorize/
+[6] provider redirect -> 302 to http://authentik.localtest.me:19000/application/o/authorize/
+[6] Authentik as 'e2e-member' -> back on /plugin/inventree-mcp/oauth/authorize/ (page, 200)
+[7] authorize (signed in) -> 200, consent page shown: True
+...
+[14] refresh with the just-revoked refresh token -> 400 invalid_grant
+OK: OAuth façade flow completed (SSO as e2e-member)
+```
+
+`python3 dev/authentik/sso_smoke.py e2e-member` still passes after the import tidy-up (4 × PASS). After restarting the containers, nothing in the checkout outside `dev/data/` is owned by root. `inventree_mcp.egg-info/PKG-INFO` is `2017:2017`.
+
+### Deferred or not done
+
+- **F7, optional code part** (rate-limit key from the last `X-Forwarded-For` hop): not done. The README now documents the proxy requirement, and that is the fix the review asks for. Keying on a header hop the plugin cannot verify would add its own spoofing questions.
+- **Duplication, optional refactor of `MCPRegistrationView.post`** (inject `DCR_REGISTRATION_PERMISSION_CLASSES` and call `super().post()`): not done. The review rates the current form acceptable, and the refactor would add one more instance-wide DOT setting.
+- **F1 item 5** (report upstream to DOT that the grace period applies to revoked tokens, not only rotated ones): not done from here. It is worth filing with the WP6 upstream work.
+- Nothing else was deferred. F8, F9, F10, F11, F13, F15 and F16 were each well under half an hour and are all done.

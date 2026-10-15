@@ -94,7 +94,7 @@ def _is_valid_next(request, next_url: str) -> bool:
 class MCPLoginBridgeView(FacadeViewMixin, View):
     """``plugin:inventree-mcp:oauth-login``: sends the browser through SSO to ``next``."""
 
-    http_method_names = ["get"]
+    http_method_names = ("get",)
 
     @method_decorator(ensure_csrf_cookie)
     def get(self, request, *args, **kwargs):

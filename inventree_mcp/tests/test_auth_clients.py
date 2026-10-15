@@ -7,15 +7,11 @@ import datetime
 from django.test import Client, override_settings
 from django.utils import timezone
 from InvenTree.unit_test import InvenTreeTestCase
-from oauth2_provider.models import (
-    AccessToken,
-    RefreshToken,
-    get_application_model,
-)
+from oauth2_provider.models import get_application_model
 
 from ..auth import clients
 from ..auth.tasks import cleanup_stale_clients
-from .oauth_helpers import REDIRECT_URI, OAuthFacadeTestMixin, url
+from .oauth_helpers import REDIRECT_URI, OAuthFacadeTestMixin, make_token_pair, url
 
 Application = get_application_model()
 
@@ -187,32 +183,14 @@ class CleanupStaleClientsTest(OAuthFacadeTestMixin, InvenTreeTestCase):
             )
         return app
 
-    def _token(self, app, *, expired: bool = False, refresh: bool = False):
-        delta = datetime.timedelta(hours=-1 if expired else 1)
-        access = AccessToken.objects.create(
-            user=self.user,
-            application=app,
-            token=f"at-{app.pk}-{expired}-{refresh}",
-            expires=timezone.now() + delta,
-            scope="g:read",
-        )
-        if refresh:
-            RefreshToken.objects.create(
-                user=self.user,
-                application=app,
-                token=f"rt-{app.pk}",
-                access_token=access,
-            )
-        return access
-
     def test_deletes_only_unused_old_dcr_clients(self):
         unused = self._dcr_app("unused")  # only DOT's registration token
         expired = self._dcr_app("expired-token")
-        self._token(expired, expired=True)
+        make_token_pair(expired, self.user, expired=True, refresh=False)
         live_access = self._dcr_app("live-access")
-        self._token(live_access)
+        make_token_pair(live_access, self.user, refresh=False)
         live_refresh = self._dcr_app("live-refresh")
-        self._token(live_refresh, expired=True, refresh=True)
+        make_token_pair(live_refresh, self.user, expired=True)
         recent = self._dcr_app("recent", old=False)
 
         cimd = self.create_cimd_application()

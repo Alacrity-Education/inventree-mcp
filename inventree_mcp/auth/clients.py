@@ -34,13 +34,12 @@ from oauth2_provider.views.dynamic_client_registration import (
     _validation_error_description,
 )
 
-from ..settings import get_plugin_setting
+from ..settings import get_plugin_setting, plugin_setting_list
 from . import FacadeViewMixin
 from .cors import TrustedOriginCORSMixin, trusted_origins
 
 logger = logging.getLogger("inventree")
 
-DEFAULT_TRUSTED_HOSTS = "claude.ai,claude.com,.anthropic.com"
 DEFAULT_CLIENT_NAME = "MCP client"
 RATE_LIMIT_WINDOW_SECONDS = 60
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -48,8 +47,7 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 def trusted_client_hosts() -> list[str]:
     """CIMD host allowlist from TRUSTED_CLIENT_HOSTS (Django ALLOWED_HOSTS syntax)."""
-    value = get_plugin_setting("TRUSTED_CLIENT_HOSTS", DEFAULT_TRUSTED_HOSTS)
-    return [host.strip() for host in value.split(",") if host.strip()]
+    return plugin_setting_list("TRUSTED_CLIENT_HOSTS")
 
 
 def mcp_applications():

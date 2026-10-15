@@ -131,17 +131,15 @@ granted (read-only scopes while **Read Only** is on).
   advertised URLs use the public origin.
 - InvenTree's CORS whitelist (`cors.whitelist`) containing `https://claude.ai` and
   `https://claude.com` (browser preflights to `/plugin/` are answered by InvenTree's CORS middleware).
-- Plugin settings: **Enable OAuth Sign-in** (`OAUTH_ENABLED`) on; URL integration and schedule
-  integration enabled for plugins.
-- InvenTree 1.5.x only: clients look up the authorization-server metadata at the RFC 8414 location
-  `/.well-known/oauth-authorization-server/plugin/inventree-mcp`, which 1.5.x does not let plugins
-  serve (newer InvenTree redirects it to the plugin automatically). Add a reverse-proxy rewrite,
-  e.g. for Caddy:
-
-  ```
-  rewrite /.well-known/oauth-authorization-server/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/oauth-authorization-server
-  rewrite /.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp* /plugin/inventree-mcp/.well-known/oauth-protected-resource
-  ```
+- Plugin settings: **Enable OAuth Sign-in** (`OAUTH_ENABLED`) on; URL integration, schedule
+  integration and app integration (`ENABLE_PLUGINS_APP`, needed for the plugin's models from the
+  next releases on) enabled for plugins.
+- A reverse proxy that **replaces** `X-Forwarded-For` with the client address instead of appending
+  to it, and gunicorn not reachable directly. InvenTree takes the client IP from the *first*
+  `X-Forwarded-For` entry, which a client can set itself when the proxy appends; the registration
+  rate limit (`REGISTER_RATE_LIMIT_PER_MINUTE`) is per client IP. Caddy replaces the header by
+  default (as long as `trusted_proxies` is not configured); with nginx use
+  `proxy_set_header X-Forwarded-For $remote_addr;`, not `$proxy_add_x_forwarded_for`.
 
 **How it works:** a `401` from the MCP endpoint carries `WWW-Authenticate: Bearer
 resource_metadata="…"`. The protected-resource metadata names the issuer
@@ -150,6 +148,47 @@ revocation endpoints under `/plugin/inventree-mcp/oauth/`. These are thin subcla
 django-oauth-toolkit's own views; clients register dynamically (RFC 7591) or identify with a client ID
 metadata document URL from a trusted host. Tokens are ordinary InvenTree OAuth2 tokens (visible in
 the admin under *Django OAuth Toolkit*). InvenTree's own `/o/` endpoints are not changed.
+
+### InvenTree 1.5.x: reverse-proxy rewrites for discovery
+
+MCP clients look up the authorization-server metadata at the RFC 8414 location
+`/.well-known/oauth-authorization-server/plugin/inventree-mcp`. InvenTree 1.5.x does not let plugins
+serve anything under `/.well-known/` (it answers with a redirect to the login page, and Claude Code
+gives up on the HTML it gets). Newer InvenTree versions (with plugin `/.well-known/` support,
+inventree/InvenTree#12698) redirect these paths to the plugin by themselves; on 1.5.x add the
+rewrites below to the reverse proxy. While they are missing, the plugin logs a warning
+("cannot serve /.well-known/oauth-authorization-server/...") at the first OAuth request.
+
+Caddy (inside the site block, before `reverse_proxy`):
+
+```
+rewrite /.well-known/oauth-authorization-server/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/oauth-authorization-server
+rewrite /.well-known/openid-configuration/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/openid-configuration
+rewrite /.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp* /plugin/inventree-mcp/.well-known/oauth-protected-resource
+```
+
+nginx (inside the `server` block that proxies to InvenTree):
+
+```
+location = /.well-known/oauth-authorization-server/plugin/inventree-mcp {
+    rewrite ^ /plugin/inventree-mcp/.well-known/oauth-authorization-server last;
+}
+location = /.well-known/openid-configuration/plugin/inventree-mcp {
+    rewrite ^ /plugin/inventree-mcp/.well-known/openid-configuration last;
+}
+location ~ ^/\.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp/?$ {
+    rewrite ^ /plugin/inventree-mcp/.well-known/oauth-protected-resource last;
+}
+```
+
+The first line is the one Claude Code needs. The `openid-configuration` line serves clients that
+probe the OpenID form, and the protected-resource line clients that do not follow the
+`resource_metadata` URL of the `401` challenge (Claude does); both are harmless otherwise.
+
+The `openid-configuration` document is an alias of the RFC 8414 authorization-server metadata.
+It is not a full OpenID Connect discovery document (no `jwks_uri`, `subject_types_supported` or
+`id_token_signing_alg_values_supported`; the plugin issues no ID tokens), so a strict OpenID
+Connect client rejects it. MCP clients only read the OAuth fields.
 
 ## Configuration
 
@@ -165,7 +204,7 @@ OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `OAUTH_ENABLED` | `False` | Serve OAuth discovery and the OAuth endpoints. Off: the endpoints answer 404 and the 401 challenge carries no `resource_metadata`. |
+| `OAUTH_ENABLED` | `False` | Serve OAuth discovery and the OAuth endpoints. Off: the endpoints answer 404 and the 401 challenge carries no `resource_metadata`. InvenTree 1.5.x also needs the [proxy rewrites](#inventree-15x-reverse-proxy-rewrites-for-discovery). |
 | `TRUSTED_CLIENT_HOSTS` | `claude.ai,claude.com,.anthropic.com` | Hosts whose client ID metadata documents (`https` client IDs) are accepted, Django `ALLOWED_HOSTS` syntax. |
 | `TRUSTED_CLIENT_ORIGINS` | `https://claude.ai,https://claude.com` | Browser origins allowed to call register / token / revoke (CORS). |
 | `AUTO_APPROVE_TRUSTED_CLIENTS` | `True` | Skip consent for trusted-host clients, never for loopback redirect URIs. |
@@ -180,7 +219,9 @@ OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
 
 The lifetime settings are injected into django-oauth-toolkit at runtime and therefore apply to
 **every** OAuth2 application on the instance while `OAUTH_ENABLED` is on (InvenTree has no
-configuration hook for them). Turning `OAUTH_ENABLED` off restores InvenTree's defaults.
+configuration hook for them). Every InvenTree process (web workers, background workers) applies them
+at start-up and picks up changes within a few seconds. Turning `OAUTH_ENABLED` off restores
+InvenTree's defaults.
 
 ## Authentication
 

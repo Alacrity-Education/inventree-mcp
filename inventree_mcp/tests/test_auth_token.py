@@ -18,7 +18,7 @@ from oauth2_provider.models import (
 
 from ..auth import membership, policy
 from ..auth.token import MCPTokenView
-from .oauth_helpers import OAuthFacadeTestMixin, url
+from .oauth_helpers import OAuthFacadeTestMixin, make_token_pair, url
 
 Application = get_application_model()
 
@@ -94,6 +94,13 @@ class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertNotEqual(rotated["access_token"], tokens["access_token"])
         self.assertEqual(self.mcp_call(rotated["access_token"]).status_code, 200)
         self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
+        # Within DOT's grace period a rotated token is re-served the same pair
+        # (a client retrying after a lost response), nothing new is minted.
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["access_token"], rotated["access_token"])
+        self.assertEqual(response.json()["refresh_token"], rotated["refresh_token"])
 
         # Past DOT's grace period (REFRESH_TOKEN_GRACE_PERIOD_SECONDS=120) the old
         # refresh token is rejected, and reuse protection revokes the whole family.
@@ -174,12 +181,77 @@ class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
-        # DOT keeps accepting a revoked refresh token for
-        # REFRESH_TOKEN_GRACE_PERIOD_SECONDS (120 s); after that it is refused.
-        self._expire_grace_period()
-        self.assertEqual(
-            self.refresh(self.client_id, tokens["refresh_token"]).status_code, 400
+        # Refused immediately: DOT's grace period would otherwise mint a new,
+        # unscoped pair for a token that was revoked rather than rotated.
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+        self.assertFalse(
+            AccessToken.objects.filter(
+                user=self.user, application__client_id=self.client_id
+            ).exists()
         )
+
+    def test_refresh_after_revoke_all_mcp_tokens_is_refused(self):
+        """The path WP2's block_user() relies on."""
+        tokens = self._tokens()
+
+        membership.revoke_all_mcp_tokens(self.user)
+
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+
+    def test_membership_gate_runs_for_rotated_tokens_too(self):
+        tokens = self._tokens()
+        self.assertEqual(
+            self.refresh(self.client_id, tokens["refresh_token"]).status_code, 200
+        )
+
+        with patch(
+            "inventree_mcp.auth.membership.refresh_grant_allowed",
+            return_value=(False, "invalid_grant"),
+        ) as gate:
+            response = self.refresh(self.client_id, tokens["refresh_token"])
+
+        gate.assert_called_once_with(self.user)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+
+    def test_unknown_original_scope_is_refused(self):
+        tokens = self._tokens()
+        checksum = hashlib.sha256(tokens["access_token"].encode()).hexdigest()
+        AccessToken.objects.filter(token_checksum=checksum).delete()
+
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+
+    def test_empty_scope_parameter_keeps_the_original_scope(self):
+        tokens = self._tokens(scope="g:read r:view:part")
+
+        response = self.refresh(self.client_id, tokens["refresh_token"], scope="")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["scope"], "g:read r:view:part")
+
+    def test_other_applications_are_left_to_dot(self):
+        """No policy hook (and no revocation) for tokens of non-MCP applications."""
+        manual = Application.objects.create(
+            name="manual",
+            client_type=Application.CLIENT_CONFIDENTIAL,
+            authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
+            redirect_uris="https://client.example/callback",
+        )
+        _access, refresh_token = make_token_pair(manual, self.user, scope="a:staff")
+
+        with patch("inventree_mcp.auth.policy.effective_scopes", return_value=set()):
+            response = self.refresh(manual.client_id, refresh_token.token)
+
+        self.assertEqual(response.status_code, 401)  # DOT: invalid_client, no secret
+        refresh_token.refresh_from_db()
+        self.assertIsNone(refresh_token.revoked)
 
     def test_cors_for_trusted_origin_only(self):
         """TrustedOriginCORSMixin, called on the view directly.
@@ -242,19 +314,6 @@ class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 class RevokeAllMcpTokensTest(OAuthFacadeTestMixin, InvenTreeTestCase):
     """membership.revoke_all_mcp_tokens() touches only façade applications."""
 
-    def _pair(self, app, suffix: str):
-        access = AccessToken.objects.create(
-            user=self.user,
-            application=app,
-            token=f"at-{suffix}",
-            expires=timezone.now() + datetime.timedelta(hours=1),
-            scope="g:read",
-        )
-        refresh = RefreshToken.objects.create(
-            user=self.user, application=app, token=f"rt-{suffix}", access_token=access
-        )
-        return access, refresh
-
     def test_only_facade_tokens_are_revoked(self):
         dcr = Application.objects.create(
             name="dcr",
@@ -270,15 +329,10 @@ class RevokeAllMcpTokensTest(OAuthFacadeTestMixin, InvenTreeTestCase):
             authorization_grant_type=Application.GRANT_AUTHORIZATION_CODE,
             redirect_uris="https://client.example/callback",
         )
-        dcr_access, dcr_refresh = self._pair(dcr, "dcr")
-        cimd_access, cimd_refresh = self._pair(cimd, "cimd")
-        manual_access, manual_refresh = self._pair(manual, "manual")
-        lone_access = AccessToken.objects.create(
-            user=self.user,
-            application=dcr,
-            token="at-lone",
-            expires=timezone.now() + datetime.timedelta(hours=1),
-        )
+        dcr_access, dcr_refresh = make_token_pair(dcr, self.user)
+        cimd_access, cimd_refresh = make_token_pair(cimd, self.user)
+        manual_access, manual_refresh = make_token_pair(manual, self.user)
+        lone_access, _ = make_token_pair(dcr, self.user, refresh=False)
 
         count = membership.revoke_all_mcp_tokens(self.user)
 

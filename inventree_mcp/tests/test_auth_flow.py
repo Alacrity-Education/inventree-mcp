@@ -2,8 +2,9 @@
 
 This is the regression test later work packages must keep green: 401 with
 challenge -> protected-resource metadata -> authorization-server metadata ->
-register -> authorize (session) -> consent -> token -> MCP call -> refresh ->
-MCP call.
+register -> authorize (session) -> consent -> token -> MCP call -> refresh
+(rotation, old access token refused) -> MCP call -> revoke -> MCP call and
+refresh both refused at once.
 """
 
 from __future__ import annotations
@@ -16,7 +17,13 @@ from urllib.parse import urlencode, urlparse
 from django.test import Client, override_settings
 from InvenTree.unit_test import InvenTreeTestCase
 
-from .oauth_helpers import MCP_URL, OAuthFacadeTestMixin, mcp_body, pkce_pair, query
+from .oauth_helpers import (
+    MCP_URL,
+    OAuthFacadeTestMixin,
+    consent_form_data,
+    pkce_pair,
+    query,
+)
 
 REDIRECT_URI = "http://127.0.0.1:43123/callback"
 
@@ -32,21 +39,11 @@ class OAuthFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 
     roles: ClassVar[list[str]] = ["part.view"]
 
-    def _mcp(self, token: str | None = None):
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
-        return Client(enforce_csrf_checks=True).post(
-            MCP_URL,
-            data=mcp_body("tools/list"),
-            content_type="application/json",
-            HTTP_ACCEPT="application/json, text/event-stream",
-            **headers,
-        )
-
     def test_full_flow(self):
         agent = Client()  # the MCP client (no cookies needed)
 
         # 1. Unauthenticated MCP call -> 401 with the discovery challenge.
-        response = self._mcp()
+        response = self.mcp_call()
         self.assertEqual(response.status_code, 401)
         prm_url = re.search(
             r'resource_metadata="([^"]+)"', response["WWW-Authenticate"]
@@ -110,8 +107,9 @@ class OAuthFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         page = browser.get(authorize)
         self.assertEqual(page.status_code, 200)
         self.assertTrue(page.context["loopback_redirect"])
-        form = {k: v for k, v in page.context["form"].initial.items() if v is not None}
-        response = browser.post(authorize, data=form | {"allow": "Authorize"})
+        response = browser.post(
+            authorize, data=consent_form_data(page) | {"allow": "Authorize"}
+        )
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response["Location"].startswith(REDIRECT_URI))
         params = query(response["Location"])
@@ -133,7 +131,7 @@ class OAuthFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         tokens = response.json()
 
         # 8. MCP call with the access token.
-        response = self._mcp(tokens["access_token"])
+        response = self.mcp_call(tokens["access_token"])
         self.assertEqual(response.status_code, 200, response.content)
         names = {tool["name"] for tool in response.json()["result"]["tools"]}
         self.assertIn("list_parts", names)
@@ -150,9 +148,35 @@ class OAuthFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertEqual(response.status_code, 200, response.content)
         refreshed = response.json()
         self.assertNotEqual(refreshed["access_token"], tokens["access_token"])
+        self.assertNotEqual(refreshed["refresh_token"], tokens["refresh_token"])
 
-        response = self._mcp(refreshed["access_token"])
+        response = self.mcp_call(refreshed["access_token"])
         self.assertEqual(response.status_code, 200, response.content)
         self.assertIn(
             "list_parts", {t["name"] for t in response.json()["result"]["tools"]}
         )
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
+        # 10. Revoke (RFC 7009): the access token stops working, and the revoked
+        #     refresh token is refused at once (no grace-period re-issue).
+        response = agent.post(
+            _path(asm["revocation_endpoint"]),
+            data={
+                "token": refreshed["refresh_token"],
+                "token_type_hint": "refresh_token",
+                "client_id": client_id,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.mcp_call(refreshed["access_token"]).status_code, 401)
+
+        response = agent.post(
+            _path(asm["token_endpoint"]),
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refreshed["refresh_token"],
+                "client_id": client_id,
+            },
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["error"], "invalid_grant")

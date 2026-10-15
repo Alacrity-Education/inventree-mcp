@@ -8,10 +8,9 @@ Sets global settings for plugins and SSO, makes sure the dev admin account works
 
 import json
 
+from common.models import InvenTreeSetting
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
-
-from common.models import InvenTreeSetting
 
 # Authentik group -> InvenTree group (a plain literal: authentik/sso_smoke.py reads it with ast to derive its expectations)
 SSO_GROUP_MAP = {'inventree-users': 'Users', 'inventree-mcp': 'MCP Users'}

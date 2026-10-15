@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import json
 import secrets
@@ -12,7 +13,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from django.core.cache import cache
 from django.test import Client
 from django.urls import reverse
-from oauth2_provider.models import get_application_model
+from django.utils import timezone
+from oauth2_provider.models import (
+    get_access_token_model,
+    get_application_model,
+    get_refresh_token_model,
+)
 from plugin import registry
 
 from ..auth import settings_inject
@@ -53,6 +59,36 @@ def mcp_body(method: str, request_id: int = 1, params: dict | None = None) -> st
     })
 
 
+def consent_form_data(page) -> dict[str, str]:
+    """The consent form's hidden fields, as the rendered page would post them back."""
+    return {k: v for k, v in page.context["form"].initial.items() if v is not None}
+
+
+def make_token_pair(
+    application, user, *, expired: bool = False, refresh: bool = True, scope="g:read"
+):
+    """An AccessToken (live or expired) and, unless refresh=False, its RefreshToken.
+
+    Returns (access_token, refresh_token or None). Token values are random.
+    """
+    access = get_access_token_model().objects.create(
+        user=user,
+        application=application,
+        token=f"at-{secrets.token_urlsafe(16)}",
+        expires=timezone.now() + datetime.timedelta(hours=-1 if expired else 1),
+        scope=scope,
+    )
+    if not refresh:
+        return access, None
+    refresh_token = get_refresh_token_model().objects.create(
+        user=user,
+        application=application,
+        token=f"rt-{secrets.token_urlsafe(16)}",
+        access_token=access,
+    )
+    return access, refresh_token
+
+
 class OAuthFacadeTestMixin:
     """Activates the plugin with OAUTH_ENABLED on; restores DOT's settings afterwards."""
 
@@ -74,6 +110,7 @@ class OAuthFacadeTestMixin:
         super().setUp()
         self.plugin = registry.get_plugin("inventree-mcp")
         self.set_setting("OAUTH_ENABLED", True)
+        settings_inject.invalidate()  # the previous test's rollback sends no signal
         cache.delete("inventree_mcp:dcr:127.0.0.1")
 
     def set_setting(self, key: str, value: Any) -> None:
@@ -146,8 +183,7 @@ class OAuthFacadeTestMixin:
         """Load the consent page and post it back approved; returns the POST response."""
         page = client.get(authorize_url)
         self.assertEqual(page.status_code, 200, page.content)
-        data = {k: v for k, v in page.context["form"].initial.items() if v is not None}
-        data.update({"allow": "Authorize"} | overrides)
+        data = consent_form_data(page) | {"allow": "Authorize"} | overrides
         return client.post(authorize_url, data=data)
 
     def obtain_code(
@@ -192,12 +228,20 @@ class OAuthFacadeTestMixin:
             **(headers or {}),
         )
 
-    def mcp_call(self, access_token: str, method: str = "tools/list") -> Any:
-        """Call the MCP endpoint with a bearer token."""
+    @staticmethod
+    def mcp_call(
+        access_token: str | None = None,
+        method: str = "tools/list",
+        path: str = MCP_URL,
+        **headers,
+    ) -> Any:
+        """Call the MCP endpoint, with a bearer token when given (or raw *headers*)."""
+        if access_token:
+            headers["HTTP_AUTHORIZATION"] = f"Bearer {access_token}"
         return Client(enforce_csrf_checks=True).post(
-            MCP_URL,
+            path,
             data=mcp_body(method),
             content_type="application/json",
             HTTP_ACCEPT="application/json, text/event-stream",
-            HTTP_AUTHORIZATION=f"Bearer {access_token}",
+            **headers,
         )

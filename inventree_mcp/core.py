@@ -3,13 +3,14 @@
 import logging
 from typing import ClassVar
 
+from django.core.validators import MinValueValidator
 from django.urls import reverse_lazy
 from plugin import InvenTreePlugin
 from plugin.mixins import AppMixin, ScheduleMixin, SettingsMixin, UrlsMixin
 
 from . import PLUGIN_VERSION
 from ._well_known_compat import WellKnownMixin
-from .auth import facade_supported
+from .auth import facade_supported, oauth_enabled
 
 logger = logging.getLogger("inventree")
 
@@ -57,7 +58,7 @@ class InvenTreeMCP(
         },
         "OAUTH_ENABLED": {
             "name": "Enable OAuth Sign-in",
-            "description": "Serve OAuth discovery and the OAuth endpoints under /plugin/inventree-mcp/, so MCP clients such as Claude can connect by signing in through the browser. Changes DOT token lifetimes for the whole instance (see the lifetime settings).",
+            "description": "Serve OAuth discovery and the OAuth endpoints under /plugin/inventree-mcp/, so MCP clients such as Claude can connect by signing in through the browser. Changes DOT token lifetimes for the whole instance (see the lifetime settings). InvenTree 1.5.x also needs the reverse-proxy rewrites from the plugin README for /.well-known/ discovery.",
             "validator": bool,
             "default": False,
         },
@@ -80,19 +81,19 @@ class InvenTreeMCP(
         "ACCESS_TOKEN_LIFETIME_SECONDS": {
             "name": "Access Token Lifetime (seconds)",
             "description": "Lifetime of OAuth access tokens. Applies to every OAuth application on this instance.",
-            "validator": int,
+            "validator": [int, MinValueValidator(1)],
             "default": 3600,
         },
         "REFRESH_TOKEN_LIFETIME_DAYS": {
             "name": "Refresh Token Lifetime (days)",
             "description": "Idle lifetime of OAuth refresh tokens. Applies to every OAuth application on this instance.",
-            "validator": int,
+            "validator": [int, MinValueValidator(1)],
             "default": 30,
         },
         "AUTH_CODE_LIFETIME_SECONDS": {
             "name": "Authorization Code Lifetime (seconds)",
             "description": "Lifetime of OAuth authorization codes. Applies to every OAuth application on this instance.",
-            "validator": int,
+            "validator": [int, MinValueValidator(1)],
             "default": 600,
         },
         "ALLOW_LOCALHOST_LOOPBACK": {
@@ -104,13 +105,13 @@ class InvenTreeMCP(
         "REGISTER_RATE_LIMIT_PER_MINUTE": {
             "name": "Registration Rate Limit",
             "description": "Maximum client registrations per minute and client IP (0 disables the limit).",
-            "validator": int,
+            "validator": [int, MinValueValidator(0)],
             "default": 30,
         },
         "UNUSED_CLIENT_RETENTION_DAYS": {
             "name": "Unused Client Retention (days)",
             "description": "Dynamically registered clients without a live token are deleted after this many days.",
-            "validator": int,
+            "validator": [int, MinValueValidator(1)],
             "default": 90,
         },
         "OAUTH_FORCE_SSO": {
@@ -136,15 +137,23 @@ class InvenTreeMCP(
     }
 
     def __init__(self):
-        """Initialise the plugin and inject the OAuth façade's DOT settings."""
+        """Initialise the plugin and inject the OAuth façade's DOT settings.
+
+        Runs in every process that loads the plugin registry (web, worker,
+        management commands). The signal receivers keep the settings in sync
+        afterwards, including in django-q worker processes (see settings_inject).
+        """
         super().__init__()
 
         if facade_supported():
-            try:
-                from .auth import settings_inject
+            from .auth import settings_inject
 
+            settings_inject.connect_signals()
+            try:
                 settings_inject.apply()
-            except Exception:  # noqa: BLE001 - the database may not be ready yet; views re-apply on first use
+            except Exception:
+                # The database may not be ready yet (e.g. during migrations);
+                # views, the challenge and the task hook re-apply on first use.
                 logger.debug(
                     "inventree-mcp: DOT settings not injected at load", exc_info=True
                 )
@@ -180,7 +189,10 @@ class InvenTreeMCP(
         """
         urls = [("mcp-server-card", reverse_lazy(f"plugin:{self.slug}:server-card"))]
 
-        if facade_supported():
+        # The redirect patterns are built at URL load (request=None) and must
+        # cover a façade switched on later; the /.well-known/ index (a request)
+        # lists the documents only while they are served.
+        if facade_supported() and (request is None or oauth_enabled()):
             urls += [
                 (
                     "oauth-protected-resource",

@@ -18,10 +18,16 @@ from django.views import View
 
 from . import FacadeViewMixin, oauth_enabled, policy, settings_inject
 
+try:
+    from oauth2_provider.views import OAuthProtectedResourceMetadataView
+except ImportError:  # pragma: no cover - DOT < 3.4: the façade URLs are not registered
+    OAuthProtectedResourceMetadataView = View
+
 URL_NAMESPACE = "plugin:inventree-mcp"
 PRM_MARKER = "/.well-known/oauth-protected-resource"
 DOCUMENTATION_URL = "https://github.com/inventree/inventree-mcp"
 METADATA_MAX_AGE_SECONDS = 300
+REALM = "InvenTree"
 
 
 def _absolute(request: HttpRequest, name: str) -> str:
@@ -39,78 +45,92 @@ def resource(request: HttpRequest) -> str:
     return _absolute(request, "mcp-endpoint")
 
 
-def _quote(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
 def challenge_header(request: HttpRequest, *, invalid_token: bool) -> str:
     """Value for the ``WWW-Authenticate`` header of a 401 from the MCP endpoint.
 
     ``resource_metadata`` and ``scope`` are only advertised while the façade
     is on; ``error="invalid_token"`` is added when a credential was presented.
+    The header is built by DOT's ``build_bearer_challenge`` (DOT >= 3.4, only
+    imported when the façade is supported); without the façade it is the bare
+    ``Bearer realm="InvenTree"``.
     """
-    params = [("realm", "InvenTree")]
+    settings_inject.ensure_applied()
 
-    if oauth_enabled():
-        settings_inject.ensure_applied()
-        params += [
-            ("resource_metadata", _absolute(request, "oauth-protected-resource")),
-            ("scope", " ".join(policy.mcp_scopes_available())),
-        ]
+    if not oauth_enabled():
+        return f'Bearer realm="{REALM}"' + (
+            ', error="invalid_token"' if invalid_token else ""
+        )
 
+    from oauth2_provider.www_authenticate import build_bearer_challenge
+
+    oauth2_error = {"scope": " ".join(policy.mcp_scopes_available())}
     if invalid_token:
-        params.append(("error", "invalid_token"))
+        oauth2_error["error"] = "invalid_token"
+    return build_bearer_challenge(
+        request,
+        oauth2_error=oauth2_error,
+        realm=REALM,
+        resource_metadata_url=_absolute(request, "oauth-protected-resource"),
+    )
 
-    return "Bearer " + ", ".join(f'{key}="{_quote(value)}"' for key, value in params)
 
-
-class _MetadataView(FacadeViewMixin, View):
+class _MetadataResponseMixin:
     """Anonymous JSON metadata document, readable cross-origin and cacheable."""
 
-    http_method_names = ["get", "head", "options"]
+    http_method_names = ("get", "head", "options")
 
-    def document(self, request: HttpRequest) -> dict:  # pragma: no cover - abstract
-        raise NotImplementedError
-
-    def _with_headers(self, response):
+    def dispatch(self, request: HttpRequest, *args, **kwargs):
+        """Add the CORS and caching headers to every answer."""
+        response = super().dispatch(request, *args, **kwargs)
         response["Access-Control-Allow-Origin"] = "*"
         response["Cache-Control"] = f"max-age={METADATA_MAX_AGE_SECONDS}"
         return response
-
-    def get(self, request: HttpRequest, *args, **kwargs) -> JsonResponse:
-        """Serve the metadata document."""
-        return self._with_headers(JsonResponse(self.document(request)))
 
     def options(self, request: HttpRequest, *args, **kwargs):
         """Answer CORS preflights (e.g. a client adding MCP-Protocol-Version)."""
         response = super().options(request, *args, **kwargs)
         response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
         response["Access-Control-Allow-Headers"] = "*"
-        return self._with_headers(response)
+        return response
 
 
-class ProtectedResourceMetadataView(_MetadataView):
-    """RFC 9728 protected-resource metadata for the MCP endpoint."""
+class ProtectedResourceMetadataView(
+    FacadeViewMixin, _MetadataResponseMixin, OAuthProtectedResourceMetadataView
+):
+    """RFC 9728 protected-resource metadata for the MCP endpoint (DOT's view, per resource)."""
 
-    def document(self, request: HttpRequest) -> dict:
-        """Build the protected-resource metadata document."""
-        return {
-            "resource": resource(request),
-            "authorization_servers": [issuer(request)],
-            "scopes_supported": policy.mcp_scopes_available(),
-            "bearer_methods_supported": ["header"],
-            "resource_name": "InvenTree MCP",
-            "resource_documentation": DOCUMENTATION_URL,
-        }
+    def get_resource(self, request: HttpRequest) -> str:
+        """The MCP endpoint's absolute URL."""
+        return resource(request)
+
+    def get_authorization_servers(self, request: HttpRequest) -> list[str]:
+        """The façade's issuer."""
+        return [issuer(request)]
+
+    def get_scopes_supported(self) -> list[str]:
+        """The MCP scopes, in their stable advertised order."""
+        return policy.mcp_scopes_available()
+
+    def get_resource_name(self) -> str:
+        """Human-readable name of the resource."""
+        return "InvenTree MCP"
+
+    def get_resource_documentation(self) -> str:
+        """The plugin's documentation."""
+        return DOCUMENTATION_URL
 
 
-class AuthorizationServerMetadataView(_MetadataView):
-    """RFC 8414 authorization-server metadata for the façade (also served as openid-configuration)."""
+class AuthorizationServerMetadataView(FacadeViewMixin, _MetadataResponseMixin, View):
+    """RFC 8414 authorization-server metadata for the façade (also served as openid-configuration).
 
-    def document(self, request: HttpRequest) -> dict:
-        """Build the authorization-server metadata document."""
+    Built here rather than by subclassing DOT's OAuthServerMetadataView, which
+    hard-codes its own ``oauth2_provider:`` URL names and DCR_ENABLED.
+    """
+
+    def get(self, request: HttpRequest, *args, **kwargs) -> JsonResponse:
+        """Serve the authorization-server metadata document."""
         auth_methods = ["none", "client_secret_basic", "client_secret_post"]
-        return {
+        return JsonResponse({
             "issuer": issuer(request),
             "authorization_endpoint": _absolute(request, "oauth-authorize"),
             "token_endpoint": _absolute(request, "oauth-token"),
@@ -125,4 +145,4 @@ class AuthorizationServerMetadataView(_MetadataView):
             "scopes_supported": policy.mcp_scopes_available(),
             "client_id_metadata_document_supported": True,
             "service_documentation": DOCUMENTATION_URL,
-        }
+        })

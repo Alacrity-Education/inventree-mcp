@@ -20,10 +20,16 @@ fi
 # (it cannot exec the command yet, so run it in a subshell with a no-op command).
 ./init.sh true
 
+# We run as root on the bind-mounted checkout: hand what root wrote there (inventree_mcp.egg-info, __pycache__)
+# back to the checkout's owner. pip writes egg-info here, and so do the later plugins.txt installs.
+fix_checkout_ownership() {
+    find "$PLUGIN_DIR" -xdev \( -name .git -prune \) -o \
+        \( ! -uid "$(stat -c %u "$PLUGIN_DIR")" -exec chown -h --reference="$PLUGIN_DIR" {} + \) 2>/dev/null || true
+}
+
 echo "dev-entrypoint: installing the plugin (editable) and django_slowtests"
 pip install --quiet --disable-pip-version-check -e "$PLUGIN_DIR" "django_slowtests==1.1.1"
-# We run as root on the bind-mounted checkout; hand what pip just wrote (egg-info) back to the checkout's owner.
-find "$PLUGIN_DIR" -xdev \( -name .git -prune \) -o \( ! -uid "$(stat -c %u "$PLUGIN_DIR")" -exec chown -h --reference="$PLUGIN_DIR" {} + \) || true
+fix_checkout_ownership
 
 # InvenTree 1.5.7 (stable) bug: CustomSocialAccountAdapter.save_user() receives the allauth SocialLogin object but sets
 # the "_is_registering" marker on it instead of on the User, so users.models.sync_user_email_address still creates the
@@ -48,6 +54,12 @@ fi
 if [[ "${DEV_RUN_UPDATE:-0}" == "1" ]]; then
     echo "dev-entrypoint: invoke update"
     invoke update --skip-backup --no-frontend
+    fix_checkout_ownership  # invoke update reinstalls plugins.txt (-e the checkout): PKG-INFO is rewritten as root
 fi
+
+# InvenTree's plugin registry may install plugins.txt once more when it loads in the server or worker process
+# (plugins file hash check), again rewriting egg-info as root after this script has exec'd. Keep fixing the
+# ownership for the first five minutes in a detached background loop.
+( for _ in $(seq 30); do sleep 10; fix_checkout_ownership; done ) </dev/null >/dev/null 2>&1 &
 
 exec ./init.sh "$@"

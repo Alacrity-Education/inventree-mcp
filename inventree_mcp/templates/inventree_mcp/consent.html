@@ -8,6 +8,11 @@
       Client from <strong>{{ client_host }}</strong>
       {% if client_trusted %}<span class="badge ok">trusted</span>{% else %}<span class="badge warn">not verified</span>{% endif %}
     </p>
+  {% elif client_registered_dynamically %}
+    <p>
+      <span class="badge warn">self-registered, not verified</span>
+      The client chose this name itself when it registered; InvenTree cannot confirm who runs it.
+    </p>
   {% endif %}
 
   {% if loopback_redirect %}

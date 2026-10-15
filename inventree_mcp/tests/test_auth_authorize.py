@@ -5,24 +5,31 @@ from __future__ import annotations
 from unittest.mock import patch
 from urllib.parse import quote, urlparse
 
+from common.settings import set_global_setting
 from django.contrib.auth import get_user_model
 from django.contrib.sessions.backends.db import SessionStore
 from django.test import Client, RequestFactory, override_settings
 from InvenTree.unit_test import InvenTreeTestCase
-from oauth2_provider.models import get_grant_model
+from oauth2_provider.models import get_application_model, get_grant_model
 
+from ..auth import policy
 from ..auth.authorize import MCPAuthorizationView
+from ..auth.login_bridge import sso_provider_id
 from .oauth_helpers import (
     LOOPBACK_REDIRECT_URI,
+    MCP_URL,
     REDIRECT_URI,
     TRUSTED_CIMD_CLIENT_ID,
     TRUSTED_REDIRECT_URI,
     OAuthFacadeTestMixin,
+    consent_form_data,
+    make_token_pair,
     pkce_pair,
     query,
     url,
 )
 
+Application = get_application_model()
 Grant = get_grant_model()
 
 
@@ -42,7 +49,7 @@ class AuthorizeTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         kwargs.setdefault("challenge", self.challenge)
         return self.authorize_url(**kwargs)
 
-    def assertErrorPage(self, response, reason: str, status: int):  # noqa: N802
+    def assertErrorPage(self, response, reason: str, status: int):
         self.assertEqual(response.status_code, status, response.content)
         self.assertTemplateUsed(response, "inventree_mcp/error.html")
         self.assertEqual(response.context["reason"], reason)
@@ -94,9 +101,8 @@ class AuthorizeTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 
     def test_deny_redirects_with_access_denied(self):
         page = self.browser.get(self._authorize())
-        data = {k: v for k, v in page.context["form"].initial.items() if v is not None}
 
-        response = self.browser.post(self._authorize(), data=data)
+        response = self.browser.post(self._authorize(), data=consent_form_data(page))
 
         self.assertEqual(response.status_code, 302)
         params = query(response["Location"])
@@ -119,6 +125,83 @@ class AuthorizeTest(OAuthFacadeTestMixin, InvenTreeTestCase):
             self.browser, self._authorize(), code_challenge_method="plain"
         )
         self.assertErrorPage(response, "invalid_request", 400)
+
+    def test_tampered_redirect_uri_is_never_redirected_to(self):
+        response = self.approve(
+            self.browser, self._authorize(), redirect_uri="https://attacker.example/cb"
+        )
+        self.assertErrorPage(response, "client", 400)
+
+    def test_tampered_client_id_cannot_take_this_redirect_uri(self):
+        other = self.register(redirect_uris=["https://other.example/cb"]).json()
+        response = self.approve(
+            self.browser, self._authorize(), client_id=other["client_id"]
+        )
+        self.assertErrorPage(response, "client", 400)
+        self.assertFalse(
+            Grant.objects.filter(application__client_id=other["client_id"]).exists()
+        )
+
+    def test_plain_pkce_redirects_with_invalid_request(self):
+        response = self.browser.get(
+            self._authorize(code_challenge_method="plain", challenge="x" * 43)
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response["Location"].startswith(REDIRECT_URI))
+        self.assertEqual(query(response["Location"])["error"], "invalid_request")
+
+    def test_approval_prompt_auto_does_not_skip_consent(self):
+        """DOT skips consent for approval_prompt=auto when a live token exists (review F2)."""
+        loopback_client = self.register(redirect_uris=[LOOPBACK_REDIRECT_URI]).json()
+        all_scopes = " ".join(policy.mcp_scopes_available())
+
+        for client_id, redirect_uri in (
+            (self.client_id, REDIRECT_URI),
+            (loopback_client["client_id"], "http://127.0.0.1:43123/callback"),
+        ):
+            with self.subTest(redirect_uri=redirect_uri):
+                application = Application.objects.get(client_id=client_id)
+                make_token_pair(application, self.user, scope=all_scopes)
+
+                response = self.browser.get(
+                    self._authorize(
+                        client_id=client_id,
+                        redirect_uri=redirect_uri,
+                        approval_prompt="auto",
+                    )
+                )
+
+                self.assertEqual(response.status_code, 200, response.get("Location"))
+                self.assertTemplateUsed(response, "inventree_mcp/consent.html")
+
+    def test_resource_must_be_the_mcp_endpoint(self):
+        for resource in (
+            f"http://testserver{MCP_URL}",
+            f"http://testserver{MCP_URL}".rstrip("/"),
+        ):
+            with self.subTest(resource=resource):
+                response = self.browser.get(self._authorize(resource=resource))
+                self.assertEqual(response.status_code, 200)
+
+        response = self.browser.get(
+            self._authorize(resource="https://other.example/api/")
+        )
+        self.assertEqual(response.status_code, 302)
+        params = query(response["Location"])
+        self.assertTrue(response["Location"].startswith(REDIRECT_URI))
+        self.assertEqual(params["error"], "invalid_target")
+        self.assertEqual(params["state"], "xyz-state")
+
+    def test_tampered_resource_on_consent_is_refused(self):
+        response = self.approve(
+            self.browser, self._authorize(), resource="https://other.example/api/"
+        )
+        self.assertErrorPage(response, "invalid_request", 400)
+
+    def test_dynamically_registered_client_is_marked_unverified(self):
+        response = self.browser.get(self._authorize())
+        self.assertTrue(response.context["client_registered_dynamically"])
+        self.assertContains(response, "self-registered, not verified")
 
     def test_unknown_client_renders_error_page(self):
         response = self.browser.get(self._authorize(client_id="no-such-client"))
@@ -282,6 +365,11 @@ class LoginBridgeTest(OAuthFacadeTestMixin, InvenTreeTestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertTemplateUsed(response, "inventree_mcp/error.html")
 
+    def test_disabled_facade_answers_404(self):
+        self.set_setting("OAUTH_FORCE_SSO", True)
+        self.set_setting("OAUTH_ENABLED", False)
+        self.assertEqual(self._get(self.next).status_code, 404)
+
     def test_signed_in_user_is_sent_to_next(self):
         browser = Client()
         browser.force_login(self.user)
@@ -290,3 +378,65 @@ class LoginBridgeTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response["Location"], self.next)
+
+
+def _oidc_apps(*provider_ids: str) -> dict:
+    """SOCIALACCOUNT_PROVIDERS with one settings-backed openid_connect app per id."""
+    return {
+        "openid_connect": {
+            "APPS": [
+                {
+                    "provider_id": provider_id,
+                    "name": provider_id.title(),
+                    "client_id": f"client-{provider_id}",
+                    "secret": "not-a-secret",
+                    "settings": {"server_url": f"https://{provider_id}.example/"},
+                }
+                for provider_id in provider_ids
+            ]
+        }
+    }
+
+
+@override_settings(PLUGIN_TESTING_SETUP=True)
+class SsoProviderTest(OAuthFacadeTestMixin, InvenTreeTestCase):
+    """login_bridge.sso_provider_id() / _sso_app() against allauth's real app list."""
+
+    def setUp(self):
+        super().setUp()
+        set_global_setting("LOGIN_ENABLE_SSO", True)
+        self.request = RequestFactory().get("/")
+
+    def test_single_openid_connect_app_is_used(self):
+        with self.settings(SOCIALACCOUNT_PROVIDERS=_oidc_apps("authentik")):
+            self.assertEqual(sso_provider_id(self.request), "authentik")
+            self.assertEqual(sso_provider_id(None), "authentik")
+
+    def test_sso_login_disabled(self):
+        set_global_setting("LOGIN_ENABLE_SSO", False)
+        with self.settings(SOCIALACCOUNT_PROVIDERS=_oidc_apps("authentik")):
+            self.assertIsNone(sso_provider_id(self.request))
+
+    def test_several_apps_are_ambiguous_unless_configured(self):
+        with self.settings(SOCIALACCOUNT_PROVIDERS=_oidc_apps("one", "two")):
+            self.assertIsNone(sso_provider_id(self.request))
+
+            self.set_setting("SSO_PROVIDER_ID", "two")
+            self.assertEqual(sso_provider_id(self.request), "two")
+
+    def test_configured_provider_must_exist(self):
+        self.set_setting("SSO_PROVIDER_ID", "missing")
+        with self.settings(SOCIALACCOUNT_PROVIDERS=_oidc_apps("authentik")):
+            self.assertIsNone(sso_provider_id(self.request))
+
+    def test_no_provider_configured(self):
+        with self.settings(SOCIALACCOUNT_PROVIDERS={}):
+            self.assertIsNone(sso_provider_id(self.request))
+
+    def test_bridge_uses_the_real_provider(self):
+        with self.settings(SOCIALACCOUNT_PROVIDERS=_oidc_apps("authentik")):
+            response = Client().get(
+                url("oauth-login"), {"next": url("oauth-authorize")}
+            )
+        self.assertEqual(response.context["mode"], "sso")
+        self.assertEqual(response.context["provider_id"], "authentik")

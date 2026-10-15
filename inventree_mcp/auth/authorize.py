@@ -11,6 +11,10 @@ validation, PKCE, code issuance and the consent form round trip):
 - PKCE with S256 is required, regardless of the instance-wide PKCE_REQUIRED;
 - consent is skipped for trusted CIMD clients (claude.ai, ...) unless the
   redirect URI is a loopback one, which any local program could listen on;
+  DOT's ``approval_prompt=auto`` shortcut (no consent when the user holds a
+  live token for the client) is disabled, it would skip consent for any
+  client, including loopback and self-registered ones;
+- RFC 8707 ``resource`` values must name this server's MCP endpoint;
 - fatal client errors (unknown client, unregistered redirect URI) render the
   plugin's error page and never redirect.
 """
@@ -28,11 +32,12 @@ from oauth2_provider.models import get_application_model
 from oauth2_provider.oauth2_validators import is_valid_resource_uri
 from oauth2_provider.settings import oauth2_settings
 from oauth2_provider.views import AuthorizationView
-from oauthlib.oauth2.rfc6749.errors import InvalidRequestError
+from oauthlib.oauth2.rfc6749.errors import CustomOAuth2Error, InvalidRequestError
 
 from ..settings import get_plugin_setting
 from . import FacadeViewMixin, policy
 from .clients import is_loopback_redirect, is_trusted_client
+from .discovery import resource as mcp_resource
 
 logger = logging.getLogger("inventree")
 
@@ -94,6 +99,12 @@ def human_duration(seconds: int | None) -> str:
     return f"{seconds} seconds"
 
 
+def _allowed_resources(request) -> set[str]:
+    """RFC 8707 resource indicators this server issues tokens for: the MCP endpoint, with or without slash."""
+    uri = mcp_resource(request)
+    return {uri, uri.rstrip("/")}
+
+
 def _uses_s256(data: dict) -> bool:
     return bool(data.get("code_challenge")) and (
         data.get("code_challenge_method") == PKCE_METHOD
@@ -137,6 +148,19 @@ class MCPAuthorizationView(FacadeViewMixin, AuthorizationView):
         if not scopes:
             return self.render_denied("no_mcp_permission")
 
+        foreign = self._foreign_resources(request.GET.getlist("resource"))
+        if foreign:
+            return self.error_response(
+                self._invalid_target_error(credentials, foreign[0]), application
+            )
+
+        # DOT's approval_prompt=auto (from the query or REQUEST_APPROVAL_PROMPT)
+        # skips consent for any client the user already holds a live token
+        # for; skipping consent is _may_skip_consent()'s decision alone.
+        query = request.GET.copy()
+        query["approval_prompt"] = "force"
+        request.GET = query
+
         if self._may_skip_consent(request, application, credentials["redirect_uri"]):
             # RFC 8707 resource indicators, as AuthorizationView.get() handles them
             # (accepted duplication). Invalid values fall through to DOT's get(),
@@ -172,6 +196,21 @@ class MCPAuthorizationView(FacadeViewMixin, AuthorizationView):
             and not request.GET.get("prompt")
         )
 
+    def _foreign_resources(self, resources) -> list[str]:
+        allowed = _allowed_resources(self.request)
+        return [uri for uri in resources if uri not in allowed]
+
+    @staticmethod
+    def _invalid_target_error(credentials: dict, uri: str) -> OAuthToolkitError:
+        return OAuthToolkitError(
+            error=CustomOAuth2Error(
+                error="invalid_target",
+                description=f"The resource '{uri}' is not served by this authorization server.",
+                state=credentials.get("state"),
+            ),
+            redirect_uri=credentials["redirect_uri"],
+        )
+
     @staticmethod
     def _pkce_error(credentials: dict) -> OAuthToolkitError:
         return OAuthToolkitError(
@@ -194,6 +233,11 @@ class MCPAuthorizationView(FacadeViewMixin, AuthorizationView):
                 return self.render_denied(reason)
 
             if not _uses_s256(form.cleaned_data):
+                return render_error(self.request, "invalid_request", 400)
+
+            # The hidden resource field can be tampered with; the redirect URI
+            # posted alongside is not validated yet, so no error redirect.
+            if self._foreign_resources(form.cleaned_data.get("resource", "").split()):
                 return render_error(self.request, "invalid_request", 400)
 
             scopes = policy.narrow(
@@ -222,6 +266,8 @@ class MCPAuthorizationView(FacadeViewMixin, AuthorizationView):
                 urlparse(client_id).hostname if is_cimd_client_id(client_id) else None
             ),
             "client_trusted": bool(application) and is_trusted_client(application),
+            "client_registered_dynamically": bool(application)
+            and application.registration_source == application.RegistrationSource.DCR,
             "loopback_redirect": is_loopback_redirect(redirect_uri),
             "access_token_lifetime": human_duration(
                 oauth2_settings.ACCESS_TOKEN_EXPIRE_SECONDS

@@ -21,12 +21,13 @@ def cleanup_stale_clients() -> int:
     up. A DCR application is deleted when its ``updated`` timestamp is older
     than UNUSED_CLIENT_RETENTION_DAYS and it holds no unexpired access token
     and no unrevoked refresh token. The registration access token DOT issues
-    with every DCR client (scope DCR_REGISTRATION_SCOPE, never expiring) does
-    not count as use. CIMD and manually created applications are never touched.
+    with every DCR client (scope DCR_REGISTRATION_SCOPE, expiring after the
+    injected DCR_REGISTRATION_TOKEN_EXPIRE_SECONDS) does not count as use. CIMD and manually created applications are never touched.
 
-    Also re-syncs the injected DOT settings in this (worker) process, so
-    InvenTree's daily DOT maintenance task (clear_expired) sees the façade's
-    refresh-token lifetime.
+    The worker process already runs with the façade's DOT settings: the
+    django-q pre_execute receiver (settings_inject.connect_signals()) syncs
+    them before every task, including InvenTree's daily DOT maintenance
+    (clear_expired). ensure_applied() here covers a direct call.
     """
     if not facade_supported():
         return 0

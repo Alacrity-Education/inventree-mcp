@@ -18,10 +18,10 @@ so an OAuth client flow can stop at its own redirect_uri instead of fetching it.
 """
 from __future__ import annotations
 
+import ast
 import http.cookiejar
 import json
 import os
-import ast
 import subprocess
 import sys
 import urllib.error
@@ -30,8 +30,9 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+# the shared constants
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bootstrap import DEV_PASSWORD, USERS, public_url  # noqa: E402  (the shared constants)
+from bootstrap import DEV_PASSWORD, USERS, public_url
 
 HERE = Path(__file__).resolve().parent
 DEV = HERE.parent

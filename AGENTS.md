@@ -32,8 +32,9 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
 
 - `context.py` - contextvar carrying the authenticated Django user into tool execution.
 - `proxy.py` - `call_view()`, the permission boundary described above.
-- `settings.py` - `get_plugin_setting()` for this plugin's own settings (`REQUIRE_AUTH`,
-  `MCP_READ_ONLY`).
+- `settings.py` - `get_plugin_setting(key, default)` for this plugin's own settings (coerced to
+  `type(default)`, fail-safe; read from the database while the registry is still loading),
+  `plugin_setting(key)` / `plugin_setting_list(key)` with the defaults declared in `core.SETTINGS`.
 - `mcp_server.py` - the `MCPServer` instance; imports `tools/*` for their `@mcp.tool()` side effect.
 - `mcp_transport.py` - Django view bridging Streamable HTTP onto the MCP server.
 - `oauth2_bridge.py` - lets `call_view()` present an OAuth2-authenticated request's real token to
@@ -53,14 +54,19 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
 - `templates/inventree_mcp/` - server-rendered OAuth pages: `base.html`, `consent.html`,
   `login_bridge.html`, `error.html`.
 - `auth/__init__.py` - `facade_supported()` (DOT >= 3.4 feature detection), `oauth_enabled()`,
-  `FacadeViewMixin` (404 while `OAUTH_ENABLED` is off, then `settings_inject.ensure_applied()`).
+  `FacadeViewMixin` (`settings_inject.ensure_applied()`, then 404 while `OAUTH_ENABLED` is off),
+  the one-time warning when InvenTree 1.5.x needs the proxy rewrites.
 - `auth/urls.py` - façade URL patterns (`oauth-*`, `.well-known/*` names under
   `plugin:inventree-mcp:`).
-- `auth/discovery.py` - protected-resource and authorization-server metadata views, `issuer()`,
-  `resource()`, `challenge_header()` (the `WWW-Authenticate` value used by `mcp_transport.py`).
+- `auth/discovery.py` - protected-resource metadata (subclass of DOT's
+  `OAuthProtectedResourceMetadataView`) and authorization-server metadata views, `issuer()`,
+  `resource()`, `challenge_header()` (DOT's `build_bearer_challenge`; the `WWW-Authenticate` value
+  used by `mcp_transport.py`).
 - `auth/settings_inject.py` - merges CIMD, lifetimes and refresh-token reuse protection into
   `settings.OAUTH2_PROVIDER` at runtime (`apply()`, `ensure_applied()`); restores InvenTree's
-  values while the façade is off.
+  values while the façade is off. Applied at plugin load (settings read from the database), by every
+  façade view and challenge, and before every django-q task (`connect_signals()`: `pre_execute`);
+  desired values memoised for a few seconds, dropped on `PluginSetting` saves.
 - `auth/cors.py` - `trusted_origins()`, `TrustedOriginCORSMixin` for register/token/revoke.
 - `auth/clients.py` - `MCPRegistrationView` (DOT's DCR helpers + rate limit),
   `is_trusted_client()`, `is_loopback_redirect()`, `mcp_applications()`.
@@ -118,4 +124,7 @@ ruff check --preview inventree_mcp
 ruff format --preview inventree_mcp
 ```
 
-`--preview` matches `.pre-commit-config.yaml`, which pins `ruff==0.12.0`.
+`--preview` matches `.pre-commit-config.yaml`, which pins ruff `v0.16.0` (CI installs the latest
+ruff). Run the pinned version with `uvx ruff@0.16.0 check --preview inventree_mcp` and
+`uvx ruff@0.16.0 format --preview inventree_mcp`. `tests/` is excluded by the repo config; check it
+with `--isolated`.

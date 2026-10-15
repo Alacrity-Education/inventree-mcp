@@ -100,7 +100,7 @@ class Api:
 
     def get_or_create(self, path: str, lookup: dict, body: dict):
         found = self.find(path, **lookup)
-        return found if found else self.call("POST", path, body)
+        return found or self.call("POST", path, body)
 
 
 def wait_ready(base: str, seconds: int = 300) -> None:

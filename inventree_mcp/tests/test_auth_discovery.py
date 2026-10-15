@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from django.test import Client, override_settings
+from django.test import Client, RequestFactory, override_settings
 from django.urls import NoReverseMatch, reverse
 from InvenTree.unit_test import InvenTreeTestCase
+from oauth2_provider.settings import oauth2_settings
 
 from ..auth import policy
-from .oauth_helpers import MCP_URL, OAuthFacadeTestMixin, mcp_body, url
+from .oauth_helpers import MCP_URL, OAuthFacadeTestMixin, url
 
 PRM_PATH = "/plugin/inventree-mcp/.well-known/oauth-protected-resource"
 ASM_PATH = "/plugin/inventree-mcp/.well-known/oauth-authorization-server"
@@ -153,17 +154,8 @@ class WellKnownRedirectTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 class ChallengeHeaderTest(OAuthFacadeTestMixin, InvenTreeTestCase):
     """WWW-Authenticate on the MCP endpoint's 401 responses."""
 
-    def _post(self, **headers):
-        return Client(enforce_csrf_checks=True).post(
-            MCP_URL,
-            data=mcp_body("tools/list"),
-            content_type="application/json",
-            HTTP_ACCEPT="application/json, text/event-stream",
-            **headers,
-        )
-
     def test_no_credential_gets_the_discovery_challenge(self):
-        response = self._post()
+        response = self.mcp_call()
 
         self.assertEqual(response.status_code, 401)
         self.assertIn("error", response.json())  # JSON-RPC body kept
@@ -175,19 +167,14 @@ class ChallengeHeaderTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 
     def test_url_without_trailing_slash_also_gets_the_challenge(self):
         """Claude Code drops the trailing slash of the configured MCP URL."""
-        response = Client(enforce_csrf_checks=True).post(
-            MCP_URL.rstrip("/"),
-            data=mcp_body("tools/list"),
-            content_type="application/json",
-            HTTP_ACCEPT="application/json, text/event-stream",
-        )
+        response = self.mcp_call(path=MCP_URL.rstrip("/"))
         self.assertEqual(response.status_code, 401)
         self.assertIn("resource_metadata=", response["WWW-Authenticate"])
 
     def test_presented_credential_adds_invalid_token(self):
         for credential in ("Bearer not-a-token", "Token not-a-token"):
             with self.subTest(credential=credential):
-                response = self._post(HTTP_AUTHORIZATION=credential)
+                response = self.mcp_call(HTTP_AUTHORIZATION=credential)
                 self.assertEqual(response.status_code, 401)
                 header = response["WWW-Authenticate"]
                 self.assertIn('error="invalid_token"', header)
@@ -196,7 +183,48 @@ class ChallengeHeaderTest(OAuthFacadeTestMixin, InvenTreeTestCase):
     def test_disabled_facade_challenge_has_no_discovery(self):
         self.set_setting("OAUTH_ENABLED", False)
 
-        response = self._post()
+        response = self.mcp_call()
 
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response["WWW-Authenticate"], 'Bearer realm="InvenTree"')
+
+    def test_disabled_facade_restores_dot_settings_through_the_challenge(self):
+        """ensure_applied() runs before the OAUTH_ENABLED check (review F3)."""
+        self.mcp_call()
+        self.assertIs(oauth2_settings.CIMD_ENABLED, True)
+
+        self.set_setting("OAUTH_ENABLED", False)
+        response = self.mcp_call(HTTP_AUTHORIZATION="Bearer not-a-token")
+
+        self.assertEqual(
+            response["WWW-Authenticate"],
+            'Bearer realm="InvenTree", error="invalid_token"',
+        )
+        self.assertIs(oauth2_settings.CIMD_ENABLED, False)
+        self.assertEqual(oauth2_settings.ACCESS_TOKEN_EXPIRE_SECONDS, 36000)
+
+
+@override_settings(PLUGIN_TESTING_SETUP=True)
+class WellKnownAdvertisementTest(OAuthFacadeTestMixin, InvenTreeTestCase):
+    """InvenTreeMCP.get_well_known_urls() (review F15)."""
+
+    def _names(self, request):
+        return [name for name, _url in self.plugin.get_well_known_urls(request)]
+
+    def test_redirect_patterns_always_cover_the_oauth_documents(self):
+        self.set_setting("OAUTH_ENABLED", False)
+        self.assertEqual(
+            self._names(None),
+            [
+                "mcp-server-card",
+                "oauth-protected-resource",
+                "oauth-authorization-server",
+            ],
+        )
+
+    def test_index_lists_oauth_documents_only_while_served(self):
+        request = RequestFactory().get("/.well-known/")
+        self.assertIn("oauth-authorization-server", self._names(request))
+
+        self.set_setting("OAUTH_ENABLED", False)
+        self.assertEqual(self._names(request), ["mcp-server-card"])
