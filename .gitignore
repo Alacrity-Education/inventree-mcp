@@ -166,6 +166,7 @@ dev/data/
 dev/.env
 dev/authentik/.bootstrap.json
 
-# Frontend (built output lives in inventree_mcp/static/ and is committed)
+# Frontend (built output in inventree_mcp/static/ is generated and git-ignored via inventree_mcp/.gitignore;
+# dev/up.sh, CI and the release build create it)
 frontend/node_modules
 frontend/dist

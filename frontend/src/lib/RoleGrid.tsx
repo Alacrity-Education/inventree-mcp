@@ -16,7 +16,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FLAGS, type Flag, type RuleSet } from './api';
 
 export const SHADOW_TOOLTIP =
-  'No effect: MCP access never exceeds interactive access';
+  'This group grants no interactive access for this flag. It takes effect only for members who hold it through another group, or for tables this role shares with another role.';
 
 const COLUMNS: { flag: Flag; label: string }[] = [
   { flag: 'can_view', label: 'View' },
@@ -32,7 +32,8 @@ export interface RoleGridProps {
   onSave?: (rows: RuleSet[]) => void | Promise<void>;
   /**
    * Interactive rows to compare against. A cell that is granted in `rows`
-   * but not in the matching shadow row (by name) is flagged as having no effect.
+   * but not in the matching shadow row (by name) is flagged: it adds nothing
+   * within this group alone, but can take effect through the member's other groups.
    */
   shadowRows?: RuleSet[];
   title?: string;
@@ -138,7 +139,7 @@ export function RoleGrid({
                         onChange={() => onToggle(rule.name, flag)}
                       />
                       {shadow && (
-                        <Tooltip label={SHADOW_TOOLTIP}>
+                        <Tooltip label={SHADOW_TOOLTIP} multiline maw={320}>
                           <IconAlertTriangle
                             size={16}
                             color='var(--mantine-color-yellow-6)'

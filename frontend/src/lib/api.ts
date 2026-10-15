@@ -98,6 +98,8 @@ export interface McpStatus {
 export interface RevokeResult {
   users: number;
   tokens: number;
+  /** True above the synchronous limit: the revocation is still pending and `tokens` is the count at queueing time. */
+  queued?: boolean;
 }
 
 /** Accept both plain arrays and DRF paginated `{results: []}` payloads. */
@@ -122,7 +124,7 @@ export function httpStatus(error: unknown): number | undefined {
   return (error as any)?.response?.status;
 }
 
-/** The plugin API answers 404 while the backend wiring is missing. */
+/** The plugin API answers 404 when the plugin API is not reachable (plugin or URL integration off, older plugin). */
 export function isNotWired(error: unknown): boolean {
   return httpStatus(error) === 404;
 }

@@ -148,7 +148,9 @@ function GroupPane({ api, group }: Readonly<{ api: Api; group: number }>) {
     () => getGroup(api, group),
     [api, group]
   );
-  const [revokeKey, setRevokeKey] = useState(0);
+  // bumped to reload the Members table (effective access, connection counts)
+  const [membersKey, setMembersKey] = useState(0);
+  const refreshMembers = useCallback(() => setMembersKey((k) => k + 1), []);
 
   const saveCore = useCallback(
     async (rows: RuleSet[]) => {
@@ -156,23 +158,29 @@ function GroupPane({ api, group }: Readonly<{ api: Api; group: number }>) {
         for (const row of rows) await patchCoreRuleSet(api, row);
         notifyOk('Updated', 'Group roles updated');
         detail.reload();
+        refreshMembers();
       } catch (error) {
         notifyError('Saving roles failed', error);
         throw error;
       }
     },
-    [api, detail.reload]
+    [api, detail.reload, refreshMembers]
   );
 
   const revoke = useCallback(async () => {
     try {
       const r = await revokeGroupTokens(api, group);
-      notifyOk('Revoked', `Revoked ${r.tokens} token(s) of ${r.users} user(s)`);
-      setRevokeKey((k) => k + 1);
+      notifyOk(
+        r.queued ? 'Queued' : 'Revoked',
+        r.queued
+          ? `Revocation queued for ${r.users} members`
+          : `Revoked ${r.tokens} token(s) of ${r.users} user(s)`
+      );
+      refreshMembers();
     } catch (error) {
       notifyError('Revoking MCP tokens failed', error);
     }
-  }, [api, group]);
+  }, [api, group, refreshMembers]);
 
   if (detail.error)
     return <ApiErrorAlert error={detail.error} plugin={false} />;
@@ -207,7 +215,12 @@ function GroupPane({ api, group }: Readonly<{ api: Api; group: number }>) {
             <Title order={5}>MCP Roles</Title>
           </Accordion.Control>
           <Accordion.Panel>
-            <McpRolesEditor api={api} group={g.pk} interactiveRows={g.roles} />
+            <McpRolesEditor
+              api={api}
+              group={g.pk}
+              interactiveRows={g.roles}
+              onChanged={refreshMembers}
+            />
           </Accordion.Panel>
         </Accordion.Item>
         <Accordion.Item value='members'>
@@ -215,7 +228,7 @@ function GroupPane({ api, group }: Readonly<{ api: Api; group: number }>) {
             <Title order={5}>Members</Title>
           </Accordion.Control>
           <Accordion.Panel>
-            <MembersTable key={revokeKey} api={api} members={g.users} />
+            <MembersTable key={membersKey} api={api} members={g.users} />
           </Accordion.Panel>
         </Accordion.Item>
       </Accordion>
@@ -242,8 +255,11 @@ function GroupsPage({
     <Stack p='md'>
       <Title order={2}>MCP Access</Title>
       <Text c='dimmed'>
-        MCP access of a user is the intersection of the group's interactive
-        roles and its MCP roles.
+        A member's MCP access is their interactive roles (across all their
+        groups) intersected with the MCP roles of their groups, per table. A
+        warning mark on an MCP flag means this group grants no interactive
+        access for it: the flag takes effect only for members who hold the role
+        through another group, or for tables shared with another role.
       </Text>
       {!!groups.error && <ApiErrorAlert error={groups.error} plugin={false} />}
       <Grid gap='lg'>

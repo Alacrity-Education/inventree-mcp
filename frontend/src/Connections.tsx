@@ -3,7 +3,6 @@ import {
   type InvenTreePluginContext
 } from '@inventreedb/ui';
 import {
-  Alert,
   Badge,
   Button,
   Card,
@@ -203,8 +202,17 @@ function ConnectionsCard({
   );
 }
 
-function ConnectCard({ url }: Readonly<{ url: string }>) {
-  const command = `claude mcp add --transport http inventree ${url}`;
+function connectCommand(url: string, oauthEnabled: boolean): string {
+  return oauthEnabled
+    ? `claude mcp add --transport http inventree ${url}`
+    : `claude mcp add --transport http inventree ${url} --header "Authorization: Token <your-api-token>"`;
+}
+
+function ConnectCard({
+  url,
+  oauthEnabled
+}: Readonly<{ url: string; oauthEnabled: boolean }>) {
+  const command = connectCommand(url, oauthEnabled);
   const copy = (value: string, label: string) => (
     <CopyButton value={value}>
       {({ copied, copy: doCopy }) => (
@@ -236,16 +244,26 @@ function ConnectCard({ url }: Readonly<{ url: string }>) {
           <Code>{command}</Code>
           {copy(command, 'Copy command')}
         </Group>
-        <Text fw={600}>claude.ai</Text>
-        <List type='ordered' size='sm'>
-          <List.Item>
-            Open Settings, then Connectors, and choose Add custom connector.
-          </List.Item>
-          <List.Item>Paste the MCP URL above and save.</List.Item>
-          <List.Item>
-            Click Connect and sign in to InvenTree when asked.
-          </List.Item>
-        </List>
+        {oauthEnabled ? (
+          <>
+            <Text fw={600}>claude.ai</Text>
+            <List type='ordered' size='sm'>
+              <List.Item>
+                Open Settings, then Connectors, and choose Add custom connector.
+              </List.Item>
+              <List.Item>Paste the MCP URL above and save.</List.Item>
+              <List.Item>
+                Click Connect and sign in to InvenTree when asked.
+              </List.Item>
+            </List>
+          </>
+        ) : (
+          <Text size='sm' c='dimmed'>
+            OAuth sign-in is off on this server, so clients authenticate with an
+            InvenTree API token. Create one in your account settings and replace{' '}
+            <Code>&lt;your-api-token&gt;</Code> in the command.
+          </Text>
+        )}
       </Stack>
     </Card>
   );
@@ -255,9 +273,6 @@ function ConnectionsPage({
   context
 }: Readonly<{ context: InvenTreePluginContext }>) {
   const status = useAsync(() => getStatus(context.api), [context.api]);
-  const url =
-    status.data?.mcp_url ||
-    `${window.location.origin}/plugin/inventree-mcp/mcp/`;
 
   return (
     <Stack p='md'>
@@ -274,11 +289,11 @@ function ConnectionsPage({
       )}
       <PermissionsCard context={context} />
       <ConnectionsCard context={context} />
-      <ConnectCard url={url} />
-      {status.data && !status.data.oauth_enabled && (
-        <Alert color='gray'>
-          OAuth connections are disabled on this server.
-        </Alert>
+      {status.data && (
+        <ConnectCard
+          url={status.data.mcp_url}
+          oauthEnabled={status.data.oauth_enabled}
+        />
       )}
     </Stack>
   );

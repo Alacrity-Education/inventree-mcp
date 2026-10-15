@@ -41,4 +41,4 @@ Shared code (`src/lib/`): `api.ts` (typed wrappers over `context.api` for the pl
 
 ## Acceptance
 
-Both pages reachable and functional in the dev environment; nav items present; built assets committed; tests green; report `docs/plans/WP4-report.md`; one commit `WP4: MCP permissions and connections pages`.
+Both pages reachable and functional in the dev environment; nav items present; built assets generated and git-ignored (built by `dev/up.sh`, CI and before `python -m build`); tests green; report `docs/plans/WP4-report.md`; one commit `WP4: MCP permissions and connections pages`.

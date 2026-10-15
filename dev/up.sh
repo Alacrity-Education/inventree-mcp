@@ -50,15 +50,42 @@ MSG
 hosts_warning
 
 # --- 1b. frontend bundles (build output, git-ignored: inventree_mcp/static/) ---------------------------------------
-# Built on the host (node + npm) when Groups.js is missing or older than any file under frontend/src or its build config;
-# the server container collects inventree_mcp/static/ into /static/plugins/inventree-mcp/ when it starts.
+# Built on the host (node + npm) when Groups.js is missing or older than any frontend source or build config (src,
+# package.json, package-lock.json, tsconfig*.json, biome.json, vite.config.ts); the server container collects
+# inventree_mcp/static/ into /static/plugins/inventree-mcp/ when it starts. A missing npm or a failed build only warns:
+# the stack still comes up, without the plugin pages (which need InvenTree 1.6+ anyway).
 FRONTEND_DIR="$REPO_DIR/frontend"
 BUNDLE="$REPO_DIR/inventree_mcp/static/Groups.js"
+FRONTEND_TEST="inventree_mcp.tests.test_ui.UiFeatureMethodsTest.test_bundles_are_built"
+frontend_warning() {
+    echo "WARNING: $1; the plugin pages will not be available, and $FRONTEND_TEST will fail (dev/test.sh)" >&2
+}
 if [[ -d "$FRONTEND_DIR" ]]; then
-    if [[ ! -f "$BUNDLE" ]] || [[ -n "$(find "$FRONTEND_DIR/src" "$FRONTEND_DIR/package.json" "$FRONTEND_DIR/vite.config.ts" -type f -newer "$BUNDLE" -print -quit)" ]]; then
-        command -v npm >/dev/null || die "npm is not installed, needed to build the plugin frontend (frontend/)"
-        log "building the plugin frontend (npm ci && npm run build)"
-        (cd "$FRONTEND_DIR" && npm ci && npm run build) || die "frontend build failed"
+    stale=0
+    if [[ ! -f "$BUNDLE" ]]; then
+        stale=1
+    elif [[ -n "$(find "$FRONTEND_DIR/src" "$FRONTEND_DIR/package.json" "$FRONTEND_DIR/package-lock.json" \
+            "$FRONTEND_DIR/vite.config.ts" "$FRONTEND_DIR/biome.json" "$FRONTEND_DIR"/tsconfig*.json \
+            -type f -newer "$BUNDLE" -print -quit)" ]]; then
+        stale=1
+    fi
+    if [[ "$stale" == 1 ]]; then
+        if ! command -v npm >/dev/null; then
+            frontend_warning "npm is not installed, so the plugin frontend (frontend/) was not built"
+        else
+            log "building the plugin frontend"
+            build_ok=1
+            # npm ci only when node_modules is missing or older than the lock file (a full network reinstall)
+            if [[ ! -d "$FRONTEND_DIR/node_modules" || "$FRONTEND_DIR/package-lock.json" -nt "$FRONTEND_DIR/node_modules" ]]; then
+                (cd "$FRONTEND_DIR" && npm ci) || build_ok=0
+            fi
+            if [[ "$build_ok" == 1 ]]; then
+                (cd "$FRONTEND_DIR" && npm run build) || build_ok=0
+            fi
+            if [[ "$build_ok" == 0 ]]; then
+                frontend_warning "the frontend build failed (output above)"
+            fi
+        fi
     fi
 else
     echo "WARNING: frontend/ is missing, the plugin pages will not be available" >&2

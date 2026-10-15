@@ -4,7 +4,7 @@ import { IconAlertCircle, IconPlugOff } from '@tabler/icons-react';
 import { type ReactNode, useState } from 'react';
 import { errorMessage, isNotWired } from './api';
 
-/** Error display; a 404 from the plugin API means the backend is not wired yet. */
+/** Error display; a 404 from the plugin API means the MCP API is not reachable on this server. */
 export function ApiErrorAlert({
   error,
   plugin = true
@@ -16,8 +16,9 @@ export function ApiErrorAlert({
         icon={<IconPlugOff />}
         title='MCP API not available'
       >
-        The MCP plugin API answered 404. The plugin backend is probably not
-        wired up yet (or this InvenTree runs an older plugin version).
+        The MCP permission API is not available on this server. The plugin may
+        be disabled, URL integration may be off, or the installed plugin version
+        may be older than this page.
       </Alert>
     );
   }
