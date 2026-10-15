@@ -69,6 +69,8 @@ def desired_values() -> dict[str, Any]:
             "oauth2_provider.cimd.HostAllowlistCIMDPermission",
         ),
         "CIMD_ALLOWED_HOSTS": trusted_client_hosts(),
+        # keeps only the grant types DOT maps (claude.ai's document lists more)
+        "CIMD_METADATA_FETCHER": "inventree_mcp.auth.clients.ClientMetadataFetcher",
         "ALLOW_LOCALHOST_LOOPBACK": plugin_setting("ALLOW_LOCALHOST_LOOPBACK"),
         "ACCESS_TOKEN_EXPIRE_SECONDS": plugin_setting("ACCESS_TOKEN_LIFETIME_SECONDS"),
         "REFRESH_TOKEN_EXPIRE_SECONDS": plugin_setting("REFRESH_TOKEN_LIFETIME_DAYS")

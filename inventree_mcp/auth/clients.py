@@ -15,6 +15,11 @@ from django.db import transaction
 from django.http import HttpRequest, JsonResponse
 from django.http.request import validate_host
 from django.views import View
+from oauth2_provider.cimd import (
+    GRANT_TYPE_MAP,
+    IGNORED_GRANT_TYPES,
+    SafeMetadataFetcher,
+)
 from oauth2_provider.models import get_application_model
 from oauth2_provider.views import DynamicClientRegistrationView
 
@@ -44,6 +49,36 @@ LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 def trusted_client_hosts() -> list[str]:
     """CIMD host allowlist from TRUSTED_CLIENT_HOSTS (Django ALLOWED_HOSTS syntax)."""
     return plugin_setting_list("TRUSTED_CLIENT_HOSTS")
+
+
+class ClientMetadataFetcher(SafeMetadataFetcher):
+    """DOT's metadata fetcher, keeping only the grant types DOT can map.
+
+    claude.ai's client metadata document declares ``authorization_code``,
+    ``refresh_token`` and ``urn:ietf:params:oauth:grant-type:jwt-bearer``.
+    django-oauth-toolkit 3.4 ignores ``refresh_token`` but requires exactly one
+    other grant type, so it refuses the document and the client shows up as
+    unknown. RFC 7591 lets a server ignore grant types it does not support
+    (KINA does the same): values DOT has no mapping for are dropped, but only
+    when a mapped one remains, so a document without any usable grant type is
+    still refused by DOT. Set as ``CIMD_METADATA_FETCHER`` (settings_inject).
+    """
+
+    def fetch(self, client_id):
+        data, max_age = super().fetch(client_id)
+        grants = data.get("grant_types")
+        if isinstance(grants, list):
+            known = [
+                g for g in grants if g in GRANT_TYPE_MAP or g in IGNORED_GRANT_TYPES
+            ]
+            if len(known) != len(grants) and any(g in GRANT_TYPE_MAP for g in known):
+                logger.info(
+                    "inventree-mcp: client %s declares unsupported grant types %s, ignored",
+                    client_id,
+                    sorted(set(grants) - set(known)),
+                )
+                data = {**data, "grant_types": known}
+        return data, max_age
 
 
 def mcp_applications():

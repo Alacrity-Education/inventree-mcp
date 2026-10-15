@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import datetime
+from unittest.mock import patch
 
 from django.test import Client, override_settings
 from django.utils import timezone
 from InvenTree.unit_test import InvenTreeTestCase
+from oauth2_provider import cimd
 from oauth2_provider.models import get_application_model
+from oauth2_provider.settings import oauth2_settings
 
-from ..auth import clients
+from ..auth import clients, settings_inject
 from ..auth.tasks import cleanup_stale_clients
 from .oauth_helpers import REDIRECT_URI, OAuthFacadeTestMixin, make_token_pair, url
 
@@ -218,3 +221,60 @@ class CleanupStaleClientsTest(OAuthFacadeTestMixin, InvenTreeTestCase):
 
         self.assertEqual(cleanup_stale_clients(), 0)
         self.assertTrue(Application.objects.filter(pk=app.pk).exists())
+
+
+CLAUDE_AI_DOCUMENT = {
+    "client_id": "https://claude.ai/oauth/mcp-oauth-client-metadata",
+    "client_name": "Claude",
+    "client_uri": "https://claude.ai",
+    "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+    "grant_types": [
+        "authorization_code",
+        "refresh_token",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    ],
+    "response_types": ["code"],
+    "token_endpoint_auth_method": "none",
+}
+
+
+class ClientMetadataFetcherTest(OAuthFacadeTestMixin, InvenTreeTestCase):
+    """claude.ai's metadata document (as served on 2026-10-16) must resolve to a client."""
+
+    def setUp(self):
+        super().setUp()
+        settings_inject.ensure_applied()  # no request in these tests triggers it
+
+    def fetch_returning(self, document):
+        return patch.object(
+            cimd.SafeMetadataFetcher, "fetch", return_value=(document, 300)
+        )
+
+    def test_fetcher_is_injected(self):
+        self.assertIs(oauth2_settings.CIMD_METADATA_FETCHER, clients.ClientMetadataFetcher)
+
+    def test_claude_ai_document_resolves(self):
+        with self.fetch_returning(CLAUDE_AI_DOCUMENT):
+            application = cimd._fetch_validate_upsert(CLAUDE_AI_DOCUMENT["client_id"])
+        self.assertEqual(application.registration_source, "cimd")
+        self.assertEqual(application.client_type, "public")
+        self.assertEqual(application.authorization_grant_type, "authorization-code")
+        self.assertIn("https://claude.ai/api/mcp/auth_callback", application.redirect_uris)
+        self.assertTrue(clients.is_trusted_client(application))
+
+    def test_unknown_grant_types_are_dropped_only_next_to_a_mapped_one(self):
+        fetcher = clients.ClientMetadataFetcher()
+        with self.fetch_returning(CLAUDE_AI_DOCUMENT):
+            data, _max_age = fetcher.fetch(CLAUDE_AI_DOCUMENT["client_id"])
+        self.assertEqual(data["grant_types"], ["authorization_code", "refresh_token"])
+
+        only_unknown = {**CLAUDE_AI_DOCUMENT, "grant_types": ["urn:ietf:params:oauth:grant-type:jwt-bearer"]}
+        with self.fetch_returning(only_unknown):
+            data, _max_age = fetcher.fetch(CLAUDE_AI_DOCUMENT["client_id"])
+        self.assertEqual(data["grant_types"], only_unknown["grant_types"])  # untouched: DOT refuses it
+        with self.fetch_returning(only_unknown), self.assertRaises(cimd.CIMDError):
+            cimd._fetch_validate_upsert(CLAUDE_AI_DOCUMENT["client_id"])
+
+        two_mapped = {**CLAUDE_AI_DOCUMENT, "grant_types": ["authorization_code", "implicit"]}
+        with self.fetch_returning(two_mapped), self.assertRaises(cimd.CIMDError):
+            cimd._fetch_validate_upsert(CLAUDE_AI_DOCUMENT["client_id"])

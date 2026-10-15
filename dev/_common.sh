@@ -30,6 +30,8 @@ require_running() {
 # The containers run as root and write into the bind-mounted checkout (egg-info, migrations, bytecode). Hand
 # everything under the plugin checkout that is not owned by the host user back to the host uid/gid.
 fix_ownership() {
+    # deploy/ holds deployment data (a Postgres data directory, a data volume) owned by their containers' users
     dc exec -T -u root inventree-server find "$PLUGIN_DIR_IN_CONTAINER" -xdev \
-        \( -name .git -prune \) -o \( ! -uid "$HOST_UID" -exec chown -h "$HOST_UID:$HOST_GID" {} + \) || true
+        \( -name .git -o -path "$PLUGIN_DIR_IN_CONTAINER/deploy" \) -prune -o \
+        \( ! -uid "$HOST_UID" -exec chown -h "$HOST_UID:$HOST_GID" {} + \) || true
 }

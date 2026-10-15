@@ -38,7 +38,7 @@ require_app() { app_running || die "the test image container is not running, run
 
 # root wrote egg-info (and anything else) into the bind mount: hand it back to the host user
 fix_mount_ownership() {
-    docker exec "$APP" find "$PLUGIN_MOUNT" -xdev \( -name .git -prune \) -o \
+    docker exec "$APP" find "$PLUGIN_MOUNT" -xdev \( -name .git -o -path "$PLUGIN_MOUNT/deploy" \) -prune -o \
         \( ! -uid "$HOST_UID" -exec chown -h "$HOST_UID:$HOST_GID" {} + \) || true
 }
 

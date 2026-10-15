@@ -23,7 +23,7 @@ fi
 # We run as root on the bind-mounted checkout: hand what root wrote there (inventree_mcp.egg-info, __pycache__)
 # back to the checkout's owner. pip writes egg-info here, and so do the later plugins.txt installs.
 fix_checkout_ownership() {
-    find "$PLUGIN_DIR" -xdev \( -name .git -prune \) -o \
+    find "$PLUGIN_DIR" -xdev \( -name .git -o -path "$PLUGIN_DIR/deploy" \) -prune -o \
         \( ! -uid "$(stat -c %u "$PLUGIN_DIR")" -exec chown -h --reference="$PLUGIN_DIR" {} + \) 2>/dev/null || true
 }
 

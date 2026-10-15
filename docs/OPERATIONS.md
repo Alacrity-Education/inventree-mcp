@@ -213,6 +213,15 @@ proxy that appends to `X-Forwarded-For` every client shares the proxy's address.
 **Intermittent 403/404 on `/plugin/...` after changing plugin integration settings.** Restart the web and worker
 processes.
 
+**"Unknown client. This client is not registered or not trusted."** The authorize endpoint could not resolve
+the `client_id`. For a client metadata URL (claude.ai, Claude Code) the plugin logs
+`authorization refused (invalid_client) ... client https://claude.ai/...` at WARNING and django-oauth-toolkit logs
+the reason at INFO (`CIMD resolution failed for ...`): the document could not be fetched (egress, DNS, the host is
+not in `TRUSTED_CLIENT_HOSTS`), or it was refused. A refused document is backed off for 60 seconds before it is
+fetched again. Up to 0.4.0 claude.ai's own document was refused because it declares a JWT bearer grant type next to
+`authorization_code` and the toolkit requires exactly one; the plugin's `ClientMetadataFetcher` now ignores grant
+types the toolkit cannot map, as RFC 7591 permits.
+
 ## 7. Logging and privacy
 
 What the plugin guarantees (checked by e2e scenario 9 on every run):

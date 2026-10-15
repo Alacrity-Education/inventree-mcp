@@ -2,3 +2,4 @@
 data/
 pgdata/
 restore/
+image/*.whl

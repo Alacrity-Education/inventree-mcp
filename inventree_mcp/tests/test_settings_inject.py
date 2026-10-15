@@ -41,6 +41,10 @@ class SettingsInjectTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertIs(oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION, True)
         self.assertEqual(oauth2_settings.REFRESH_TOKEN_GRACE_PERIOD_SECONDS, 120)
         self.assertIs(oauth2_settings.ALLOW_LOCALHOST_LOOPBACK, True)
+        self.assertEqual(
+            values["CIMD_METADATA_FETCHER"],
+            "inventree_mcp.auth.clients.ClientMetadataFetcher",
+        )
         self.assertNotIn("DCR_ENABLED", values)
         self.assertNotIn("OIDC_ISS_ENDPOINT", values)
         self.assertIs(oauth2_settings.DCR_ENABLED, False)

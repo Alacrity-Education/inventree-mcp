@@ -55,6 +55,13 @@ config_changed="$(cat data/.config-changed)"; rm -f data/.config-changed
 # --- 3. image, database, cache -------------------------------------------------------------------------------------
 log "building the image (base image + plugin wheel)"
 dc build --quiet inventree-server
+# The Postgres data directory must belong to the image's postgres user (uid 999); tools that hand the checkout back
+# to the host user (the dev stack's scripts prune deploy/, other tools may not) would otherwise break every connection.
+if [[ -d pgdata ]] && docker run --rm -v "$HERE/pgdata:/d" alpine sh -c 'find /d ! -user 999 -print -quit | grep -q .'; then
+    log "repairing the ownership of pgdata/ (postgres uid 999)"
+    docker run --rm -v "$HERE/pgdata:/d" alpine sh -c 'find /d ! -user 999 -exec chown 999:999 {} +'
+    [[ -n "$(dc ps -q --status running db 2>/dev/null || true)" ]] && dc restart db
+fi
 log "starting database and cache"
 dc up -d --wait --wait-timeout 300 db cache
 dc exec -T db psql -U "${DB_USER:-inventree}" -v ON_ERROR_STOP=1 -Atc \

@@ -290,10 +290,15 @@ class MCPAuthorizationView(FacadeViewMixin, AuthorizationView):
             return super().error_response(error, application, **kwargs)
 
         oauthlib_error = error.oauthlib_error
-        logger.info(
-            "inventree-mcp: authorization refused (%s) for user id %s",
+        client_id = self.request.GET.get("client_id", "")
+        # A client_id URL names a public document (claude.ai, ...): logging it
+        # is safe and tells the operator which client was refused. DOT logs
+        # why a document was refused at INFO ("CIMD resolution failed").
+        logger.warning(
+            "inventree-mcp: authorization refused (%s) for user id %s, client %s",
             oauthlib_error.error,
             self.request.user.pk,
+            client_id if is_cimd_client_id(client_id) else "(registered id)",
         )
         return render_error(
             self.request,
