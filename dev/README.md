@@ -20,6 +20,7 @@ dev/compose.sh <args>     # docker compose against the stack, from any directory
 python3 dev/authentik/bootstrap.py set-groups e2e-member inventree-users   # change a test user's Authentik groups
 python3 dev/authentik/bootstrap.py                     # full bootstrap again: restores the intended memberships
 python3 dev/authentik/sso_smoke.py                     # scripted SSO round trip for the four test users
+python3 dev/e2e/run.py                                 # the end-to-end suite (go-live checklist), see below
 dev/down.sh               # stop (keeps volumes and data)
 dev/down.sh -v            # stop and delete volumes and dev/data/ (fresh start next time)
 ```
@@ -35,10 +36,15 @@ The pages ("MCP Access" for staff, "MCP" for everybody) are React bundles built 
 `inventree_mcp/static/` (git-ignored build output; never edit it by hand).
 
 ```bash
-dev/up.sh                              # builds them first when Groups.js is missing or older than frontend/src
+dev/up.sh                              # builds them first when Groups.js is missing or older than a frontend source
 (cd frontend && npm ci && npm run build)   # rebuild by hand (also: npm run lint, npm test, npm run check:bundles)
 dev/compose.sh restart inventree-server inventree-worker
 ```
+
+The `up.sh` frontend step warns and continues when npm is missing or the build fails (then
+`test_ui.UiFeatureMethodsTest.test_bundles_are_built` fails); `npm ci` runs only when `node_modules` is missing or
+older than `package-lock.json`; the staleness check covers `src/`, `package.json`, `package-lock.json`,
+`tsconfig*.json`, `biome.json` and `vite.config.ts`.
 
 InvenTree copies the plugin's static tree to `dev/data/static/plugins/inventree-mcp/` (Caddy serves it as
 `/static/plugins/inventree-mcp/`) when the plugin registry loads, so a restart of the server container is the step that
@@ -47,17 +53,20 @@ them). Check with `curl -I http://localhost:8080/static/plugins/inventree-mcp/Gr
 afterwards (the plain `Groups.js` names are cached, core prefers the hashed copies when it builds the URLs).
 A build removes the old hashed files (`--emptyOutDir`) but the copy in `dev/data/static/` keeps them, which is harmless.
 
-Plugin pages (routes) need an InvenTree newer than 1.5.7 (core PR #12900, in `inventree/inventree:latest`). On the
+Plugin pages (routes) need InvenTree 1.6.0 or later (core PR #12900; not yet released, the `inventree/inventree:latest`
+image) and *Enable interface integration*. On the
 default 1.5.7 stack the plugin therefore offers no pages and no navigation entries (the "MCP Roles" group panel is
 ready for the core change that requests group panels). To try the pages set `INVENTREE_TAG=latest` and
 `DEMO_DATASET_REF=WORKTREE` in `dev/.env`, then `dev/down.sh -v && dev/up.sh`.
 
-Headless-browser check of both pages (`dev/ui_smoke.py`, screenshots in `docs/plans/screenshots/`); the host python is
-usually externally managed, so use a virtualenv:
+Headless-browser check of both pages (`dev/ui_smoke.py`): it creates and deletes a scratch group and revokes its own
+admin API token; screenshots (`docs/plans/screenshots/`) only with `--screenshots`; on a host without plugin routes it
+runs the API part and exits with status 3 (skipped). The host python is usually externally managed, so use a
+virtualenv:
 
 ```bash
 python3 -m venv /tmp/pw && /tmp/pw/bin/pip install playwright && /tmp/pw/bin/playwright install chromium
-/tmp/pw/bin/python dev/ui_smoke.py [--base-url http://localhost:8080]
+/tmp/pw/bin/python dev/ui_smoke.py [--base-url http://localhost:8080] [--screenshots]
 ```
 
 Hot reload with InvenTree's `plugin_dev` block (`plugin_dev: {slug: inventree-mcp, host: http://localhost:5174}` in
@@ -108,7 +117,8 @@ API token for curl: `curl -s -u admin:admin http://localhost:8080/api/user/token
 | `authentik/sso_smoke.py` | scripted SSO login round trip; importable: `sso_login(username)`, `browse(..., stop=...)`, `Browser` |
 | `configure_inventree.py` | global settings, groups `Users` and `MCP Users` (MCP roles: view on every role; admin is a member) (run by `up.sh`) |
 | `oauth_smoke.py`, `membership_e2e.py`, `permissions_e2e.py` | live checks: OAuth façade, membership re-checks, MCP permission set |
-| `ui_smoke.py` | headless-browser check of the plugin pages (see Frontend) |
+| `e2e/run.py` | the end-to-end suite: one runner for the ten go-live scenarios, built on the scripts above (see below) |
+| `ui_smoke.py` | headless-browser check of the plugin pages with a scratch group (see Frontend) |
 | `data/` | InvenTree data dir (config, static, media, secret key), git-ignored |
 
 Why an entrypoint wrapper: the image's `init.sh` only prepares directories and `config.yaml`; it never runs
@@ -116,6 +126,44 @@ Why an entrypoint wrapper: the image's `init.sh` only prepares directories and `
 `django_slowtests==1.1.1` (needed by `manage.py test`) in both server and worker containers on every start, runs
 `invoke update` on the server, then execs the original `init.sh`. It also patches one line of InvenTree 1.5.7
 (see Known issues).
+
+## End-to-end suite
+
+`dev/e2e/run.py` (standard library only, host python) drives the running stack through the go-live checklist of
+`docs/OPERATIONS.md`, one function per scenario, and prints `PASS` / `FAIL` / `SKIP` lines (plus the step lines of
+the scripts it reuses); the exit code is 1 when a scenario failed.
+
+```bash
+python3 dev/e2e/run.py --list          # the ten scenarios
+python3 dev/e2e/run.py                 # all of them (about 4 minutes; scenario 4 stops and starts authentik-server)
+python3 dev/e2e/run.py --only 6 --only clients   # by number or name, repeatable
+python3 dev/e2e/run.py --skip-outage   # everything but scenario 4
+```
+
+| # | Scenario |
+|---|---|
+| 1 | discovery: `401` challenge, protected-resource and authorization-server metadata, the proxy rewrites (core `/.well-known/` redirects are SKIPped on 1.5.x), CORS on metadata and machine endpoints |
+| 2 | e2e-member connects through the login bridge and Authentik; paginated and detail tool calls with the OAuth token and with an API token; refresh with a fresh check (no upstream call) and with an aged check (upstream token rotated) |
+| 3 | removed from `inventree-mcp` in Authentik: blocked; back in the group, an SSO login lifts the block |
+| 4 | Authentik stopped: grace, `invalid_grant` past it, nothing revoked, recovery with the same refresh token |
+| 5 | e2e-interactive and e2e-guest get *No MCP access*, e2e-nonmember is refused by Authentik |
+| 6 | MCP view on parts only: tool list and calls narrowed, `/api/stock/` still readable with an API token |
+| 7 | clearing an MCP flag revokes the live refresh token |
+| 8 | untrusted CIMD client and unregistered redirect URI: error page, never a redirect; a simulated trusted CIMD client (an application row created through `dev/shell.sh`): consent kept for loopback, skipped for `https` |
+| 9 | the server, worker and proxy logs of the run hold no test user address and none of the run's tokens and codes |
+| 10 | `claude mcp add` / `claude mcp list` ("Needs authentication") / `claude mcp remove` (SKIP with the manual steps when `claude` is not installed) |
+
+It switches on `OAUTH_ENABLED` and `MEMBERSHIP_ENFORCED` and sets `MCP_REQUIRED_GROUPS=MCP Users` for the run, and
+restores in `finally` blocks what it changes: the plugin settings, the Authentik groups of the test users, the MCP
+roles of "MCP Users", e2e-member's block state, its API tokens, the OAuth clients it registered, the simulated CIMD
+row, and `authentik-server` (started again). Tokens and codes are never printed (lengths or hash prefixes only); all
+HTTP traffic of the run is recorded in memory so scenario 9 can grep the logs for them.
+
+Scenario 9 reports `WARN` (not `FAIL`) for Authentik authorization codes in InvenTree core's request lines of the SSO
+callback (gunicorn's access log, django-structlog at `INVENTREE_LOG_LEVEL=INFO`); that is core logging, not the plugin,
+see `docs/OPERATIONS.md` §7. Its proxy check fails while `Caddyfile` logs the authorize redirect's `Location`
+header unfiltered (see Troubleshooting). On a stack where the plugin's code is newer than the database (a migration not applied
+yet) the Django-shell helpers fail: run `dev/up.sh` or restart the server first.
 
 ## Authentik reachability
 
@@ -148,8 +196,10 @@ and the test run leave behind (egg-info, `inventree_mcp/migrations/`) back to yo
   (`up.sh` does this by itself when `configure_inventree.py` changed a setting).
 - First start is slow: migrations plus `invoke update`; the healthcheck allows up to ~12 minutes.
 - Logs of a failed demo import: `dev/data/import.log`.
-- The proxy log strips the OAuth `code` and `state` query parameters; `inventree-server`/`inventree-worker` logs and
-  `dev/logs.sh --dump` are what to grep for leaked secrets.
+- The proxy log strips the OAuth `code` and `state` request query parameters, but not the logged `Location` response
+  header, which carries the plugin's authorization codes (`302` to the client's redirect URI); e2e scenario 9 fails on
+  that until the Caddyfile filters `resp_headers>Location` as well (see `docs/OPERATIONS.md` §7). `dev/logs.sh --dump`
+  is what to grep for leaked secrets (`dev/e2e/run.py` scenario 9 does it for the server, worker and proxy logs).
 
 ## Known issues
 

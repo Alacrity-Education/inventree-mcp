@@ -8,7 +8,7 @@ An MCP (Model Context Protocol) server for InvenTree, exposed as an InvenTree pl
 clients (Claude, other MCP-aware agents) query InvenTree inventory data over a Streamable HTTP
 endpoint.
 
-## Design
+## What it is
 
 Every tool is a thin wrapper around InvenTree's own REST API view classes (see
 [`inventree_mcp/proxy.py`](inventree_mcp/proxy.py)), dispatched as the authenticated caller - MCP
@@ -27,9 +27,13 @@ serializers and views (not hand-maintained), so they can't drift as InvenTree ev
 client sees is also filtered to what the calling user can actually use - though every call is still
 permission-checked in full regardless of what was advertised.
 
-## Setup
+Users connect Claude by signing in through the browser ([Connect with OAuth](#connect-with-oauth)), with the
+instance's single sign-on and its group-based access control; scripts keep using InvenTree API tokens. What a user
+may do through MCP is a second set of roles per group ([Two permission sets](#two-permission-sets)), and group
+membership at the identity provider is re-checked while a connection lives
+([Membership re-checks](#membership-re-checks)).
 
-### 1. Install the plugin
+## Install
 
 Install via the InvenTree plugin manager, or via pip:
 
@@ -37,19 +41,90 @@ Install via the InvenTree plugin manager, or via pip:
 pip install inventree-mcp
 ```
 
-Then enable the plugin under **Admin > Plugins**, and configure its settings (see
-Configuration below).
+Then enable the plugin under **Admin > Plugins**, switch on URL, app, schedule and interface integration for plugins
+(`ENABLE_PLUGINS_URL`, `ENABLE_PLUGINS_APP`, `ENABLE_PLUGINS_SCHEDULE`, `ENABLE_PLUGINS_INTERFACE`), run
+`invoke migrate`, restart InvenTree, and configure the plugin's settings ([Plugin settings](#plugin-settings)).
 
-### 2. Connect: OAuth sign-in (recommended) or an API token
+A user reaches MCP only through the **MCP roles** of their groups, which start empty: grant them first (see
+[Two permission sets](#two-permission-sets)).
 
-With **Enable OAuth Sign-in** turned on (see [Connect with OAuth](#connect-with-oauth)), MCP clients
-such as Claude connect by signing in through the browser and need no token at all. Otherwise,
-create an InvenTree API token for your MCP client and configure it as below.
+## Connect
 
-Either way, a user reaches MCP only through the **MCP roles** of their groups, which start empty:
-grant them first (see [Two permission sets](#two-permission-sets)).
+### Connect with OAuth
 
-### 3. Configure your MCP client
+The plugin can act as an OAuth 2.1 authorization server for its MCP endpoint, so a user connects
+Claude (claude.ai, Claude Desktop, Claude Code) by signing in to InvenTree in the browser. Tokens
+are issued and renewed automatically; nothing is copied by hand.
+
+**Connect from Claude:**
+
+- claude.ai / Claude Desktop: *Settings > Connectors > Add custom connector*, URL
+  `https://<your-inventree-server>/plugin/inventree-mcp/mcp/`.
+- Claude Code: `claude mcp add --transport http inventree https://<your-inventree-server>/plugin/inventree-mcp/mcp/`,
+  then run `/mcp` inside Claude Code and choose *Authenticate*.
+
+**What the user sees:** the browser opens InvenTree. Without a session it goes straight to the
+single sign-on provider (e.g. Authentik) and comes back. Claude's web clients from trusted hosts are
+approved without a consent page; other clients, and every client that receives the result on a
+local port (Claude Code), show a consent page with the client, the signed-in user, the permissions
+and the token lifetimes. Access is the user's InvenTree permissions, limited to the OAuth scopes
+granted (read-only scopes while **Read Only** is on).
+
+The OAuth endpoints need `OAUTH_ENABLED` on and the prerequisites under [Administration](#administration); on
+InvenTree 1.5.x also the [reverse-proxy rewrites](#inventree-15x-reverse-proxy-rewrites-for-discovery).
+
+**How it works:** a `401` from the MCP endpoint carries `WWW-Authenticate: Bearer
+resource_metadata="…"`. The protected-resource metadata names the issuer
+`https://<server>/plugin/inventree-mcp`, whose metadata lists the authorize, token, registration and
+revocation endpoints under `/plugin/inventree-mcp/oauth/`. These are thin subclasses of
+django-oauth-toolkit's own views; clients register dynamically (RFC 7591) or identify with a client ID
+metadata document URL from a trusted host. Tokens are ordinary InvenTree OAuth2 tokens (visible in
+the admin under *Django OAuth Toolkit*). InvenTree's own `/o/` endpoints are not changed.
+
+#### InvenTree 1.5.x: reverse-proxy rewrites for discovery
+
+MCP clients look up the authorization-server metadata at the RFC 8414 location
+`/.well-known/oauth-authorization-server/plugin/inventree-mcp`. InvenTree 1.5.x does not let plugins
+serve anything under `/.well-known/` (it answers with a redirect to the login page, and Claude Code
+gives up on the HTML it gets). Newer InvenTree versions (with plugin `/.well-known/` support,
+inventree/InvenTree#12698) redirect these paths to the plugin by themselves; on 1.5.x add the
+rewrites below to the reverse proxy. While they are missing, the plugin logs a warning
+("cannot serve /.well-known/oauth-authorization-server/...") at the first OAuth request.
+
+Caddy (inside the site block, before `reverse_proxy`):
+
+```
+rewrite /.well-known/oauth-authorization-server/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/oauth-authorization-server
+rewrite /.well-known/openid-configuration/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/openid-configuration
+rewrite /.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp* /plugin/inventree-mcp/.well-known/oauth-protected-resource
+```
+
+nginx (inside the `server` block that proxies to InvenTree):
+
+```
+location = /.well-known/oauth-authorization-server/plugin/inventree-mcp {
+    rewrite ^ /plugin/inventree-mcp/.well-known/oauth-authorization-server last;
+}
+location = /.well-known/openid-configuration/plugin/inventree-mcp {
+    rewrite ^ /plugin/inventree-mcp/.well-known/openid-configuration last;
+}
+location ~ ^/\.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp/?$ {
+    rewrite ^ /plugin/inventree-mcp/.well-known/oauth-protected-resource last;
+}
+```
+
+The first line is the one Claude Code needs. The `openid-configuration` line serves clients that
+probe the OpenID form, and the protected-resource line clients that do not follow the
+`resource_metadata` URL of the `401` challenge (Claude does); both are harmless otherwise.
+
+The `openid-configuration` document is an alias of the RFC 8414 authorization-server metadata.
+It is not a full OpenID Connect discovery document (no `jwks_uri`, `subject_types_supported` or
+`id_token_signing_alg_values_supported`; the plugin issues no ID tokens), so a strict OpenID
+Connect client rejects it. MCP clients only read the OAuth fields.
+
+### Scripts and other clients: API tokens
+
+Create an InvenTree API token for the script or MCP client and send it with every request.
 
 The endpoint is `<your-inventree-server>/plugin/inventree-mcp/mcp/`, using Streamable HTTP
 transport with an `Authorization: Token <token>` header.
@@ -104,27 +179,30 @@ In a setup where the server is running a self-signed certificate, you may need t
 }
 ```
 
-## Connect with OAuth
+### Authentication
 
-The plugin can act as an OAuth 2.1 authorization server for its MCP endpoint, so a user connects
-Claude (claude.ai, Claude Desktop, Claude Code) by signing in to InvenTree in the browser. Tokens
-are issued and renewed automatically; nothing is copied by hand.
+Access follows the calling user's normal InvenTree role assignments, intersected with the MCP roles
+of their groups ([Two permission sets](#two-permission-sets)). Supported auth methods:
 
-**Connect from Claude:**
+- An InvenTree API token: `Authorization: Token <token>`.
+- Basic auth (username/password), only with `MCP_ALLOW_BASIC_AUTH` on.
+- An OAuth2 bearer token: `Authorization: Bearer <token>`, from the OAuth sign-in above or any other
+  InvenTree OAuth2 application (always cut to the user's MCP roles). A scoped token (e.g.
+  `r:view:part`) narrows access *below* the underlying user's roles - useful for issuing an agent a tightly-scoped token without creating a
+  separate low-privilege user.
 
-- claude.ai / Claude Desktop: *Settings > Connectors > Add custom connector*, URL
-  `https://<your-inventree-server>/plugin/inventree-mcp/mcp/`.
-- Claude Code: `claude mcp add --transport http inventree https://<your-inventree-server>/plugin/inventree-mcp/mcp/`,
-  then run `/mcp` inside Claude Code and choose *Authenticate*.
+Session/cookie auth is not supported (not meaningful for a machine client).
 
-**What the user sees:** the browser opens InvenTree. Without a session it goes straight to the
-single sign-on provider (e.g. Authentik) and comes back. Claude's web clients from trusted hosts are
-approved without a consent page; other clients, and every client that receives the result on a
-local port (Claude Code), show a consent page with the client, the signed-in user, the permissions
-and the token lifetimes. Access is the user's InvenTree permissions, limited to the OAuth scopes
-granted (read-only scopes while **Read Only** is on).
+## Administration
 
-**Prerequisites:**
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) is the operator's guide: the go-live checklist (each item with the
+end-to-end scenario that proves it), the Authentik and InvenTree prerequisites in detail, recommended production
+values for every setting, the membership outcomes with the log lines and reason codes operators see, failure modes
+and what to do, logging and privacy, and the list of things that went wrong once.
+
+### Prerequisites
+
+InvenTree:
 
 - InvenTree >= 1.5 (django-oauth-toolkit >= 3.4); older versions keep working without the OAuth
   endpoints.
@@ -146,70 +224,16 @@ granted (read-only scopes while **Read Only** is on).
   rate limit (`REGISTER_RATE_LIMIT_PER_MINUTE`) is per client IP. Caddy replaces the header by
   default (as long as `trusted_proxies` is not configured); with nginx use
   `proxy_set_header X-Forwarded-For $remote_addr;`, not `$proxy_add_x_forwarded_for`.
+- On InvenTree 1.5.x, the [reverse-proxy rewrites for discovery](#inventree-15x-reverse-proxy-rewrites-for-discovery).
+- On InvenTree 1.5.x (checked on 1.5.7), the first SSO login of every new user ends in a `500` (a core bug fixed by
+  InvenTree PR #12842, in no released 1.5.x tag yet); see `docs/OPERATIONS.md` §3.
+- A running background worker (the hourly membership sweep, background re-checks, revocations of large groups) and
+  interface integration (`ENABLE_PLUGINS_INTERFACE`) plus an InvenTree with plugin pages for the [GUI](#gui).
+  Restart InvenTree after switching plugin integration settings.
+- In production, InvenTree's default log level (`WARNING`) and an access log without query strings
+  ([Logs and privacy](#logs-and-privacy)).
 
-**How it works:** a `401` from the MCP endpoint carries `WWW-Authenticate: Bearer
-resource_metadata="…"`. The protected-resource metadata names the issuer
-`https://<server>/plugin/inventree-mcp`, whose metadata lists the authorize, token, registration and
-revocation endpoints under `/plugin/inventree-mcp/oauth/`. These are thin subclasses of
-django-oauth-toolkit's own views; clients register dynamically (RFC 7591) or identify with a client ID
-metadata document URL from a trusted host. Tokens are ordinary InvenTree OAuth2 tokens (visible in
-the admin under *Django OAuth Toolkit*). InvenTree's own `/o/` endpoints are not changed.
-
-### Membership re-checks
-
-Signing in proves the user's group membership at the SSO provider once. Because Claude keeps a
-connection alive with refresh tokens for weeks, the plugin keeps proving it (`MEMBERSHIP_ENFORCED`,
-on by default):
-
-| Check point | When | What happens |
-|---|---|---|
-| SSO login | every login through the MCP sign-in provider | InvenTree's group sync runs as usual; the plugin records the check and the login. It lifts a block only when the user is active and in `MCP_REQUIRED_GROUPS`; otherwise the block stays. |
-| Token refresh | when the last check is older than `MEMBERSHIP_RECHECK_INTERVAL_MINUTES` (60) | Synchronous re-check before the token is rotated. A refusal is `invalid_grant`, which makes Claude ask the user to sign in again. |
-| MCP request | every request, any credential | Blocked users get `401` with the OAuth challenge. Users who are inactive, outside `MCP_REQUIRED_GROUPS` or without any MCP role get `403` "No MCP permission". OAuth access tokens need nothing more (they live an hour and are re-checked at refresh). Requests with an InvenTree API token or Basic auth queue a background re-check when the last one is stale (the request never waits), and follow the refresh grant's windows: they get `401` (challenge `Bearer realm="InvenTree"` only) when the last re-check found the provider unreachable and the last successful check is older than `MEMBERSHIP_GRACE_HOURS`, or when there is no upstream refresh token and the last login is older than `RELOGIN_INTERVAL_HOURS`. InvenTree's own `/api/` is never affected. |
-| Hourly sweep | users holding a live MCP refresh token or API token | Background re-check of everyone who is due, see below for its time budget. |
-
-The re-check redeems the user's upstream refresh token, which allauth stored at the login
-(`SocialToken`, *Social application tokens* in the admin), at the provider's token endpoint, stores
-the rotated token on the same row, verifies the new ID token against the provider's keys, and feeds
-the `groups` claim (`SSO_GROUP_KEY`) to InvenTree's own SSO group sync (`SSO_GROUP_MAP`,
-`SSO_REMOVE_GROUPS`), exactly as a login does. The synced user is then judged by the plugin's
-policy. Identity refusals block the user: inactive, not in one of the `MCP_REQUIRED_GROUPS`, or the
-provider refused the grant. A user whose identity is confirmed but whose groups grant no MCP access
-(for example, no MCP ruleset) is not blocked: only their MCP tokens are revoked.
-
-| Outcome | Effect |
-|---|---|
-| Still a member | Check recorded; the refresh proceeds. |
-| Not in `MCP_REQUIRED_GROUPS` (`revoked_reason` `not_in_required_groups`), the provider answers `invalid_grant` (user removed, disabled, grant revoked or expired), or the InvenTree user is inactive | User blocked: every MCP token revoked, the upstream token deleted, `401` on MCP, the authorize page says *Access revoked*. The next SSO login lifts the block once the user is active and back in a required group; an admin can lift it with `unblock_user`. |
-| Member without MCP permission | Check recorded, the user's MCP tokens revoked, the refresh refused with `invalid_grant`. No block, the upstream token is kept; the next authorize works as soon as an MCP permission is granted. |
-| Provider unreachable (timeout, connection error, 5xx, malformed answer, unverifiable ID token) | Refreshes keep working while the last successful check is younger than `MEMBERSHIP_GRACE_HOURS` (4); after that `invalid_grant`, but nothing is revoked or rotated, and the same refresh token works again once the provider is back. After a timeout, connection error or 5xx the plugin does not call that provider again for 60 seconds; re-checks in that window count as unreachable at once. |
-| No upstream refresh token (password login, or the provider issued none because `offline_access` was not granted) | Refreshes keep working while the last login to InvenTree is younger than `RELOGIN_INTERVAL_HOURS` (24), then `invalid_grant`. A warning per user and hour names the cause. The user is not queued for another background re-check within the re-check interval. This is the degraded mode, not the design. |
-
-API tokens and Basic credentials follow the same two windows on the MCP endpoint, judged by the last
-recorded re-check (see the check-point table). Service accounts that use an API token with
-`MEMBERSHIP_ENFORCED` on therefore need an upstream refresh token, or an interactive login within
-`RELOGIN_INTERVAL_HOURS`.
-
-Every call to the provider has a 5 second timeout, re-checks of one user are serialised, and the logs
-carry only user ids, the provider host and reason codes (never tokens, claims or addresses). The
-state is visible in the admin under *MCP user states* (`membership_checked_at`, `access_revoked_at`,
-`revoked_reason`, `last_recheck_error`).
-
-The hourly sweep runs as one background task. django-q kills a task after InvenTree's
-`background.timeout` (`INVENTREE_BACKGROUND_TIMEOUT`, 90 seconds by default), and one re-check can
-take up to about 20 seconds when the provider is slow. The sweep therefore starts no new re-check
-after 60 seconds and queues the remaining users as a continuation task. Raising
-`background.timeout` gives it more room; lowering it below about 85 seconds risks a sweep being killed
-in the middle of a re-check. A re-check holds a database row lock for the user while it talks to the
-provider; replacing that with a short lease is planned hardening.
-
-The plugin keeps short-lived markers in Django's cache: the provider back-off, the "re-check queued"
-marker of each user, the "no upstream token" warning marker and the provider's discovery document.
-With InvenTree's global cache (Redis) they are shared by all processes. Without it every web and
-background worker process has its own, so the back-off and the markers apply per process and the
-hourly warning can appear once per process.
-
-**Authentik (or any OIDC provider) prerequisites:**
+Authentik (or any OIDC provider):
 
 - `offline_access` selected on the provider and requested by InvenTree
   (`social_providers.openid_connect.SCOPE: [openid, profile, email, offline_access]` in
@@ -231,46 +255,47 @@ hourly warning can appear once per process.
 Instances where MCP users sign in with local passwords only should turn `MEMBERSHIP_ENFORCED` off,
 otherwise their connections end `RELOGIN_INTERVAL_HOURS` after each login.
 
-### InvenTree 1.5.x: reverse-proxy rewrites for discovery
+### Plugin settings
 
-MCP clients look up the authorization-server metadata at the RFC 8414 location
-`/.well-known/oauth-authorization-server/plugin/inventree-mcp`. InvenTree 1.5.x does not let plugins
-serve anything under `/.well-known/` (it answers with a redirect to the login page, and Claude Code
-gives up on the HTML it gets). Newer InvenTree versions (with plugin `/.well-known/` support,
-inventree/InvenTree#12698) redirect these paths to the plugin by themselves; on 1.5.x add the
-rewrites below to the reverse proxy. While they are missing, the plugin logs a warning
-("cannot serve /.well-known/oauth-authorization-server/...") at the first OAuth request.
+Under **Settings > Plugin Settings**:
 
-Caddy (inside the site block, before `reverse_proxy`):
+- **Require Authentication** (`REQUIRE_AUTH`, default `True`): reject unauthenticated requests.
+  Only disable for local testing.
+- **Read Only** (`MCP_READ_ONLY`, default `True`): block all write actions via MCP, regardless of
+  the calling user's permissions. A plugin-wide kill switch, independent of per-user roles.
+- **Log Tool Calls** (`MCP_LOG_TOOL_CALLS`, default `False`): log every tool call for debugging.
+- **Superusers Bypass MCP Roles** (`MCP_SUPERUSER_FULL_ACCESS`, default `False`): superusers get every
+  MCP scope regardless of their groups' MCP roles ([Two permission sets](#two-permission-sets)).
+- **Allow Basic Authentication** (`MCP_ALLOW_BASIC_AUTH`, default `False`): accept username and
+  password on the MCP endpoint. Off: OAuth and InvenTree API tokens only.
 
-```
-rewrite /.well-known/oauth-authorization-server/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/oauth-authorization-server
-rewrite /.well-known/openid-configuration/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/openid-configuration
-rewrite /.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp* /plugin/inventree-mcp/.well-known/oauth-protected-resource
-```
+OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
 
-nginx (inside the `server` block that proxies to InvenTree):
+| Setting | Default | Meaning |
+|---|---|---|
+| `OAUTH_ENABLED` | `False` | Serve OAuth discovery and the OAuth endpoints. Off: the endpoints answer 404 and the 401 challenge carries no `resource_metadata`. InvenTree 1.5.x also needs the [proxy rewrites](#inventree-15x-reverse-proxy-rewrites-for-discovery). |
+| `TRUSTED_CLIENT_HOSTS` | `claude.ai,claude.com,.anthropic.com` | Hosts whose client ID metadata documents (`https` client IDs) are accepted, Django `ALLOWED_HOSTS` syntax. |
+| `TRUSTED_CLIENT_ORIGINS` | `https://claude.ai,https://claude.com` | Browser origins allowed to call register / token / revoke (CORS). |
+| `AUTO_APPROVE_TRUSTED_CLIENTS` | `True` | Skip consent for trusted-host clients, never for loopback redirect URIs. |
+| `ACCESS_TOKEN_LIFETIME_SECONDS` | `3600` | Access token lifetime. |
+| `REFRESH_TOKEN_LIFETIME_DAYS` | `30` | Refresh token idle lifetime (rotated on every use). |
+| `AUTH_CODE_LIFETIME_SECONDS` | `600` | Authorization code lifetime. |
+| `ALLOW_LOCALHOST_LOOPBACK` | `True` | Accept `http://localhost` redirect URIs on any port, like `127.0.0.1`. |
+| `REGISTER_RATE_LIMIT_PER_MINUTE` | `30` | Client registrations per minute and IP (`0` disables). |
+| `UNUSED_CLIENT_RETENTION_DAYS` | `90` | Daily cleanup of registered clients without a live token. |
+| `OAUTH_FORCE_SSO` | `True` | Send the browser straight to the SSO provider when it has no InvenTree session. |
+| `SSO_PROVIDER_ID` | empty | allauth provider id to sign in with and to re-check membership at; empty selects the single configured `openid_connect` provider. |
+| `MEMBERSHIP_ENFORCED` | `True` | Re-check group membership at the SSO provider and block users who lost it ([Membership re-checks](#membership-re-checks)). Off: no re-checks and no new blocks; existing blocks still apply until an SSO login that passes the identity checks or `unblock_user`. |
+| `MEMBERSHIP_RECHECK_INTERVAL_MINUTES` | `60` | How old the last check may be before a refresh re-checks. |
+| `MEMBERSHIP_GRACE_HOURS` | `4` | How long refreshes keep working while the provider is unreachable. |
+| `RELOGIN_INTERVAL_HOURS` | `24` | Without an upstream refresh token, how long after the last login refreshes keep working. |
+| `MCP_REQUIRED_GROUPS` | empty | Comma separated InvenTree group names (case-insensitive); when set, a user must be in one of them to connect and to keep the connection, with any credential (OAuth, API token, Basic). |
 
-```
-location = /.well-known/oauth-authorization-server/plugin/inventree-mcp {
-    rewrite ^ /plugin/inventree-mcp/.well-known/oauth-authorization-server last;
-}
-location = /.well-known/openid-configuration/plugin/inventree-mcp {
-    rewrite ^ /plugin/inventree-mcp/.well-known/openid-configuration last;
-}
-location ~ ^/\.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp/?$ {
-    rewrite ^ /plugin/inventree-mcp/.well-known/oauth-protected-resource last;
-}
-```
-
-The first line is the one Claude Code needs. The `openid-configuration` line serves clients that
-probe the OpenID form, and the protected-resource line clients that do not follow the
-`resource_metadata` URL of the `401` challenge (Claude does); both are harmless otherwise.
-
-The `openid-configuration` document is an alias of the RFC 8414 authorization-server metadata.
-It is not a full OpenID Connect discovery document (no `jwks_uri`, `subject_types_supported` or
-`id_token_signing_alg_values_supported`; the plugin issues no ID tokens), so a strict OpenID
-Connect client rejects it. MCP clients only read the OAuth fields.
+The lifetime settings are injected into django-oauth-toolkit at runtime and therefore apply to
+**every** OAuth2 application on the instance while `OAUTH_ENABLED` is on (InvenTree has no
+configuration hook for them). Every InvenTree process (web workers, background workers) applies them
+at start-up and picks up changes within a few seconds of its next request or task. Turning
+`OAUTH_ENABLED` off, or deactivating the plugin, restores InvenTree's defaults.
 
 ## Two permission sets
 
@@ -351,79 +376,124 @@ OAuth tokens are refused on the plugin API by InvenTree's middleware (`401`; it 
 and API tokens only); the views additionally require `a:staff` for the staff endpoints, which MCP
 tokens never carry.
 
-## Configuration
+## Membership re-checks
 
-Under **Settings > Plugin Settings**:
+Signing in proves the user's group membership at the SSO provider once. Because Claude keeps a
+connection alive with refresh tokens for weeks, the plugin keeps proving it (`MEMBERSHIP_ENFORCED`,
+on by default):
 
-- **Require Authentication** (`REQUIRE_AUTH`, default `True`): reject unauthenticated requests.
-  Only disable for local testing.
-- **Read Only** (`MCP_READ_ONLY`, default `True`): block all write actions via MCP, regardless of
-  the calling user's permissions. A plugin-wide kill switch, independent of per-user roles.
-- **Log Tool Calls** (`MCP_LOG_TOOL_CALLS`, default `False`): log every tool call for debugging.
-- **Superusers Bypass MCP Roles** (`MCP_SUPERUSER_FULL_ACCESS`, default `False`): superusers get every
-  MCP scope regardless of their groups' MCP roles ([Two permission sets](#two-permission-sets)).
-- **Allow Basic Authentication** (`MCP_ALLOW_BASIC_AUTH`, default `False`): accept username and
-  password on the MCP endpoint. Off: OAuth and InvenTree API tokens only.
-
-OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
-
-| Setting | Default | Meaning |
+| Check point | When | What happens |
 |---|---|---|
-| `OAUTH_ENABLED` | `False` | Serve OAuth discovery and the OAuth endpoints. Off: the endpoints answer 404 and the 401 challenge carries no `resource_metadata`. InvenTree 1.5.x also needs the [proxy rewrites](#inventree-15x-reverse-proxy-rewrites-for-discovery). |
-| `TRUSTED_CLIENT_HOSTS` | `claude.ai,claude.com,.anthropic.com` | Hosts whose client ID metadata documents (`https` client IDs) are accepted, Django `ALLOWED_HOSTS` syntax. |
-| `TRUSTED_CLIENT_ORIGINS` | `https://claude.ai,https://claude.com` | Browser origins allowed to call register / token / revoke (CORS). |
-| `AUTO_APPROVE_TRUSTED_CLIENTS` | `True` | Skip consent for trusted-host clients, never for loopback redirect URIs. |
-| `ACCESS_TOKEN_LIFETIME_SECONDS` | `3600` | Access token lifetime. |
-| `REFRESH_TOKEN_LIFETIME_DAYS` | `30` | Refresh token idle lifetime (rotated on every use). |
-| `AUTH_CODE_LIFETIME_SECONDS` | `600` | Authorization code lifetime. |
-| `ALLOW_LOCALHOST_LOOPBACK` | `True` | Accept `http://localhost` redirect URIs on any port, like `127.0.0.1`. |
-| `REGISTER_RATE_LIMIT_PER_MINUTE` | `30` | Client registrations per minute and IP (`0` disables). |
-| `UNUSED_CLIENT_RETENTION_DAYS` | `90` | Daily cleanup of registered clients without a live token. |
-| `OAUTH_FORCE_SSO` | `True` | Send the browser straight to the SSO provider when it has no InvenTree session. |
-| `SSO_PROVIDER_ID` | empty | allauth provider id to sign in with and to re-check membership at; empty selects the single configured `openid_connect` provider. |
-| `MEMBERSHIP_ENFORCED` | `True` | Re-check group membership at the SSO provider and block users who lost it ([Membership re-checks](#membership-re-checks)). Off: no re-checks and no new blocks; existing blocks still apply until an SSO login that passes the identity checks or `unblock_user`. |
-| `MEMBERSHIP_RECHECK_INTERVAL_MINUTES` | `60` | How old the last check may be before a refresh re-checks. |
-| `MEMBERSHIP_GRACE_HOURS` | `4` | How long refreshes keep working while the provider is unreachable. |
-| `RELOGIN_INTERVAL_HOURS` | `24` | Without an upstream refresh token, how long after the last login refreshes keep working. |
-| `MCP_REQUIRED_GROUPS` | empty | Comma separated InvenTree group names (case-insensitive); when set, a user must be in one of them to connect and to keep the connection, with any credential (OAuth, API token, Basic). |
+| SSO login | every login through the MCP sign-in provider | InvenTree's group sync runs as usual; the plugin records the check and the login. It lifts a block only when the user is active and in `MCP_REQUIRED_GROUPS`; otherwise the block stays. |
+| Token refresh | when the last check is older than `MEMBERSHIP_RECHECK_INTERVAL_MINUTES` (60) | Synchronous re-check before the token is rotated. A refusal is `invalid_grant`, which makes Claude ask the user to sign in again. |
+| MCP request | every request, any credential | Blocked users get `401` with the OAuth challenge. Users who are inactive, outside `MCP_REQUIRED_GROUPS` or without any MCP role get `403` "No MCP permission". OAuth access tokens need nothing more (they live an hour and are re-checked at refresh). Requests with an InvenTree API token or Basic auth queue a background re-check when the last one is stale (the request never waits), and follow the refresh grant's windows: they get `401` (challenge `Bearer realm="InvenTree"` only) when the last re-check found the provider unreachable and the last successful check is older than `MEMBERSHIP_GRACE_HOURS`, or when there is no upstream refresh token and the last login is older than `RELOGIN_INTERVAL_HOURS`. InvenTree's own `/api/` is never affected. |
+| Hourly sweep | users holding a live MCP refresh token or API token | Background re-check of everyone who is due, see below for its time budget. |
 
-The lifetime settings are injected into django-oauth-toolkit at runtime and therefore apply to
-**every** OAuth2 application on the instance while `OAUTH_ENABLED` is on (InvenTree has no
-configuration hook for them). Every InvenTree process (web workers, background workers) applies them
-at start-up and picks up changes within a few seconds of its next request or task. Turning
-`OAUTH_ENABLED` off, or deactivating the plugin, restores InvenTree's defaults.
+The re-check redeems the user's upstream refresh token, which allauth stored at the login
+(`SocialToken`, *Social application tokens* in the admin), at the provider's token endpoint, stores
+the rotated token on the same row, verifies the new ID token against the provider's keys, and feeds
+the `groups` claim (`SSO_GROUP_KEY`) to InvenTree's own SSO group sync (`SSO_GROUP_MAP`,
+`SSO_REMOVE_GROUPS`), exactly as a login does. The synced user is then judged by the plugin's
+policy. Identity refusals block the user: inactive, not in one of the `MCP_REQUIRED_GROUPS`, or the
+provider refused the grant. A user whose identity is confirmed but whose groups grant no MCP access
+(for example, no MCP ruleset) is not blocked: only their MCP tokens are revoked.
 
-## Authentication
+| Outcome | Effect |
+|---|---|
+| Still a member | Check recorded; the refresh proceeds. |
+| Not in `MCP_REQUIRED_GROUPS` (`revoked_reason` `not_in_required_groups`), the provider answers `invalid_grant` (user removed, disabled, grant revoked or expired), or the InvenTree user is inactive | User blocked: every MCP token revoked, the upstream token deleted, `401` on MCP, the authorize page says *Access revoked*. The next SSO login lifts the block once the user is active and back in a required group; an admin can lift it with `unblock_user`. |
+| Member without MCP permission | Check recorded, the user's MCP tokens revoked, the refresh refused with `invalid_grant`. No block, the upstream token is kept; the next authorize works as soon as an MCP permission is granted. |
+| Provider unreachable (timeout, connection error, 5xx, malformed answer, unverifiable ID token) | Refreshes keep working while the last successful check is younger than `MEMBERSHIP_GRACE_HOURS` (4); after that `invalid_grant`, but nothing is revoked or rotated, and the same refresh token works again once the provider is back. After a timeout, connection error or 5xx the plugin does not call that provider again for 60 seconds; re-checks in that window count as unreachable at once. |
+| No upstream refresh token (password login, or the provider issued none because `offline_access` was not granted) | Refreshes keep working while the last login to InvenTree is younger than `RELOGIN_INTERVAL_HOURS` (24), then `invalid_grant`. A warning per user and hour names the cause. The user is not queued for another background re-check within the re-check interval. This is the degraded mode, not the design. |
 
-Access follows the calling user's normal InvenTree role assignments, intersected with the MCP roles
-of their groups ([Two permission sets](#two-permission-sets)). Supported auth methods:
+API tokens and Basic credentials follow the same two windows on the MCP endpoint, judged by the last
+recorded re-check (see the check-point table). Service accounts that use an API token with
+`MEMBERSHIP_ENFORCED` on therefore need an upstream refresh token, or an interactive login within
+`RELOGIN_INTERVAL_HOURS`.
 
-- An InvenTree API token: `Authorization: Token <token>`.
-- Basic auth (username/password), only with `MCP_ALLOW_BASIC_AUTH` on.
-- An OAuth2 bearer token: `Authorization: Bearer <token>`, from the OAuth sign-in above or any other
-  InvenTree OAuth2 application (always cut to the user's MCP roles). A scoped token (e.g.
-  `r:view:part`) narrows access *below* the underlying user's roles - useful for issuing an agent a tightly-scoped token without creating a
-  separate low-privilege user.
+Every call to the provider has a 5 second timeout, re-checks of one user are serialised, and the logs
+carry only user ids, the provider host and reason codes (never tokens, claims or addresses). The
+state is kept per user in the plugin's `MCPUserState` model (`membership_checked_at`, `access_revoked_at`,
+`revoked_reason`, `last_recheck_error`); staff admins read it through `GET api/status/?user=<pk>` (see the API table
+under [Two permission sets](#two-permission-sets)). The model is not registered in the Django admin.
 
-Session/cookie auth is not supported (not meaningful for a machine client).
+The hourly sweep runs as one background task. django-q kills a task after InvenTree's
+`background.timeout` (`INVENTREE_BACKGROUND_TIMEOUT`, 90 seconds by default), and one re-check can
+take up to about 20 seconds when the provider is slow. The sweep therefore starts no new re-check
+after 60 seconds and queues the remaining users as a continuation task. Raising
+`background.timeout` gives it more room; lowering it below about 85 seconds risks a sweep being killed
+in the middle of a re-check. A re-check holds a database row lock for the user while it talks to the
+provider; replacing that with a short lease is planned hardening.
+
+The plugin keeps short-lived markers in Django's cache: the provider back-off, the "re-check queued"
+marker of each user, the "no upstream token" warning marker and the provider's discovery document.
+With InvenTree's global cache (Redis) they are shared by all processes. Without it every web and
+background worker process has its own, so the back-off and the markers apply per process and the
+hourly warning can appear once per process.
+
+## Logs and privacy
+
+The plugin logs to InvenTree's `inventree` logger with the prefix `inventree-mcp:`: user ids, the provider host,
+application ids and reason codes, never tokens, codes, keys or e-mail addresses (checked by e2e scenario 9). Three
+things outside the plugin need the operator: InvenTree's gunicorn access log and, at log level `INFO`, its request log
+record the SSO callback's query string (the identity provider's one-time authorization code); a reverse proxy that
+logs response headers records the plugin's own codes in the `Location` header of the authorize redirect; core's SSO
+group sync and `MCP_LOG_TOOL_CALLS` log usernames. [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (§5, §7) lists the log
+lines and the mitigations.
 
 ## GUI
 
-The plugin adds two pages to the InvenTree web interface (InvenTree newer than 1.5.7, which introduced plugin pages;
-on 1.5.7 the plugin offers no pages and no navigation entries, everything else works).
+The plugin adds two pages to the InvenTree web interface. They need InvenTree 1.6.0 or later (plugin routes, core PR
+#12900; not yet released, the `latest` image) and the global setting *Enable interface integration*
+(`ENABLE_PLUGINS_INTERFACE`); on 1.5.7 the plugin offers no pages and no navigation entries, everything else works.
 
 - **MCP Access** (`/web/plugin/inventree-mcp/groups`, staff only): pick a group on the left. Accordions show the
   group's interactive roles (the same grid as the core group drawer, saved to core), its **MCP Roles** (what MCP
   clients may do for its members; saved through the plugin API, "Copy from roles" and "Clear" buttons, a warning mark
-  on flags that grant more than the interactive role and therefore have no effect), and its members with their
-  effective MCP access and connection count. "Revoke MCP tokens for this group" signs the members' MCP clients out.
+  on an MCP flag whose group grants no interactive access for it: the flag only takes effect for members who hold
+  that role through another group, or for tables shared with another role, because a member's MCP access is their
+  interactive roles across all groups intersected with the MCP roles of their groups, per table), and its members
+  with their effective MCP access and connection count. "Revoke MCP tokens for this group" signs the members' MCP
+  clients out; above 20 members it reports "Revocation queued for N members" (the work runs in the background).
 - **MCP** (`/web/plugin/inventree-mcp/connections`, every user): status (OAuth enabled, whether you may connect and
   why not, membership check), your effective MCP permissions, your connected clients with a revoke button, and the
-  connection instructions (MCP URL, `claude mcp add`, claude.ai steps).
+  connection instructions: the MCP URL with the OAuth command `claude mcp add --transport http inventree <url>` and
+  the claude.ai steps when OAuth is enabled, otherwise the API-token variant
+  `claude mcp add --transport http inventree <url> --header "Authorization: Token <your-api-token>"` with a note that
+  OAuth sign-in is off.
 
 A group panel "MCP Roles" (`Panel.js:renderMCPRolesPanel`) is registered for `target_model == "group"` as the entry
-point for a future core group drawer.
+point for a future core group drawer; core's group drawer requests plugin panels only with `docs/upstream/` patch 3.
 
-The pages are React bundles built from `frontend/` into `inventree_mcp/static/` (generated, git-ignored, never edited by
-hand): `cd frontend && npm ci && npm run build`. A source checkout installed with pip needs that build first; a missing
+The pages are React bundles built from `frontend/` into `inventree_mcp/static/` (generated and git-ignored, never
+edited by hand; built by `dev/up.sh`, CI and before `python -m build`): `cd frontend && npm ci && npm run build`. A source checkout installed with pip needs that build first; a missing
 build is logged as a warning and the pages are left out. See `dev/README.md` for the dev stack and `dev/ui_smoke.py`.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Claude Code: `JSON Parse error: Unrecognized token '<'` | InvenTree 1.5.x without the [reverse-proxy rewrites](#inventree-15x-reverse-proxy-rewrites-for-discovery) |
+| The client gets a `401` without `resource_metadata` | `OAUTH_ENABLED` is off |
+| *Unknown client* page | untrusted `https` client ID (`TRUSTED_CLIENT_HOSTS`) or a redirect URI the client did not register |
+| *No MCP access* page, `403` "No MCP permission" | none of the user's groups grants an MCP role, or the user is outside `MCP_REQUIRED_GROUPS` |
+| *Access revoked* page, `401` "Access revoked, sign in to InvenTree again." | the user is blocked; the next SSO login lifts it once they are back in a required group |
+| Users signed out every day | no upstream refresh token: `offline_access` missing at the provider or in `SCOPE` |
+| API token gets `401` "MCP access suspended …" | provider unreachable past `MEMBERSHIP_GRACE_HOURS`, or no upstream token and no login within `RELOGIN_INTERVAL_HOURS` (service accounts: see OPERATIONS §6) |
+| `500` at the first SSO login on InvenTree 1.5.x | core bug fixed by InvenTree PR #12842, see OPERATIONS §3 |
+| Intermittent `403`/`404` on `/plugin/...` | restart InvenTree after switching plugin integration settings |
+| `429` on registration | `REGISTER_RATE_LIMIT_PER_MINUTE` per client IP; check that the proxy replaces `X-Forwarded-For` |
+| No *MCP* / *MCP Access* pages | InvenTree before 1.6.0 has no plugin pages, *Enable interface integration* is off, or the frontend bundles were not built |
+
+More in [`docs/OPERATIONS.md`](docs/OPERATIONS.md) §6 (failure modes) and §8 (things that went wrong once).
+
+## Development
+
+- [`AGENTS.md`](AGENTS.md): code layout and the rules for changes (tool code never touches the ORM, OAuth state stays
+  in django-oauth-toolkit, lint commands).
+- [`dev/README.md`](dev/README.md): a disposable InvenTree with this checkout installed, demo data and SSO against a
+  disposable Authentik, all in Docker: `dev/up.sh`, then `dev/test.sh` for the plugin's test suite inside InvenTree.
+- End-to-end suite against that stack: `python3 dev/e2e/run.py` (`--list`, `--only N`, `--skip-outage`). It runs the
+  go-live checklist of [`docs/OPERATIONS.md`](docs/OPERATIONS.md) as ten scenarios, prints PASS/FAIL lines, exits
+  non-zero on a failure and restores everything it changes.
+- Frontend: `frontend/` (React), built into `inventree_mcp/static/` with `npm ci && npm run build`.
