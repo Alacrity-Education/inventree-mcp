@@ -1,4 +1,8 @@
-"""Scheduled tasks of the OAuth façade (registered through ScheduleMixin in core.py)."""
+"""Background tasks of the auth package.
+
+Scheduled through ScheduleMixin in core.py: cleanup_stale_clients (daily),
+membership_sweep (hourly). Queued on demand by mcp_transport.py: recheck_user.
+"""
 
 from __future__ import annotations
 
@@ -66,3 +70,81 @@ def cleanup_stale_clients() -> int:
         stale.delete()
     logger.info("inventree-mcp: deleted %s stale DCR clients", count)
     return count
+
+
+def recheck_user(user_id: int) -> str:
+    """Background membership re-check of one user (queued by mcp_transport.py); returns the outcome."""
+    from django.contrib.auth import get_user_model
+
+    from . import membership
+
+    user = get_user_model().objects.filter(pk=user_id).first()
+    if user is None:
+        return "missing"
+    return membership.recheck(user).value
+
+
+def membership_sweep() -> dict[str, int]:
+    """Re-check users who hold MCP access but are due (hourly, via ScheduleMixin).
+
+    Candidates are users with an unrevoked refresh token of a façade
+    application (clients.mcp_applications()) or an active InvenTree API
+    token, who are not blocked and whose last check is older than
+    MEMBERSHIP_RECHECK_INTERVAL_MINUTES. Logs one line with counts only.
+    """
+    from django.contrib.auth import get_user_model
+    from django.db.models import Q
+
+    from . import membership
+
+    counts: dict[str, int] = {}
+    if not membership.enforced():
+        logger.info("inventree-mcp: membership sweep skipped (not enforced)")
+        return counts
+
+    from users.models import ApiToken
+
+    from ..models import MCPUserState
+
+    today = timezone.now().date()
+    holds_access = Exists(
+        ApiToken.objects.filter(user=OuterRef("pk"), revoked=False).filter(
+            Q(expiry__isnull=True) | Q(expiry__gte=today)
+        )
+    )
+    if facade_supported():
+        from oauth2_provider.models import get_refresh_token_model
+
+        from .clients import mcp_applications
+
+        holds_access |= Exists(
+            get_refresh_token_model().objects.filter(
+                user=OuterRef("pk"),
+                revoked__isnull=True,
+                application__in=mcp_applications(),
+            )
+        )
+    # Not "mcp_state__..." from User: InvenTree registers plugin apps after the
+    # User model's reverse relations are built, so that lookup is unavailable
+    # in running processes (it only works in the test runner).
+    blocked = MCPUserState.objects.filter(
+        user=OuterRef("pk"), access_revoked_at__isnull=False
+    )
+    users = get_user_model().objects.filter(holds_access).exclude(Exists(blocked))
+
+    for user in users.iterator():
+        if not membership.recheck_due(user):
+            counts["not_due"] = counts.get("not_due", 0) + 1
+            continue
+        try:
+            outcome = membership.recheck(user).value
+        except Exception:  # noqa: BLE001 - one user's failure must not stop the sweep
+            outcome = "error"
+        counts[outcome] = counts.get(outcome, 0) + 1
+
+    logger.info(
+        "inventree-mcp: membership sweep: %s",
+        ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+        or "no users",
+    )
+    return counts

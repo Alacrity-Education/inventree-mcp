@@ -30,43 +30,11 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from ..settings import get_plugin_setting
 from . import FacadeViewMixin
 from .authorize import render_error
+from .sso import sso_provider_id
 
 TEMPLATE = "inventree_mcp/login_bridge.html"
 #: allauth headless (browser client) endpoint, mounted by InvenTree under /api/auth/.
 PROVIDER_REDIRECT_URL_NAME = "browser:socialaccount:redirect_to_provider"
-OIDC_PROVIDER = "openid_connect"
-
-
-def _sso_app(request):
-    """The allauth SocialApp the bridge signs in with, or None."""
-    from allauth.socialaccount.adapter import get_adapter
-    from common.settings import get_global_setting
-
-    if not get_global_setting("LOGIN_ENABLE_SSO", create=False):
-        return None
-
-    adapter = get_adapter()
-    configured = get_plugin_setting("SSO_PROVIDER_ID", "")
-    if configured:
-        apps = [
-            app
-            for app in adapter.list_apps(request)
-            if (app.provider_id or app.provider) == configured
-        ]
-    else:
-        apps = adapter.list_apps(request, provider=OIDC_PROVIDER)
-
-    return apps[0] if len(apps) == 1 else None
-
-
-def sso_provider_id(request) -> str | None:
-    """allauth provider id for MCP sign-in.
-
-    SSO_PROVIDER_ID when set, else the single configured ``openid_connect``
-    app; None when SSO login is disabled (LOGIN_ENABLE_SSO) or ambiguous.
-    """
-    app = _sso_app(request)
-    return (app.provider_id or app.provider) if app else None
 
 
 def _provider_name(request, provider_id: str) -> str:

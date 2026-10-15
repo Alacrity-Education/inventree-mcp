@@ -117,8 +117,10 @@ class MCPTokenView(FacadeViewMixin, TrustedOriginCORSMixin, TokenView):
         accepts a revoked refresh token, and when it was revoked rather than
         rotated (no successor access token) it mints a brand-new, unscoped
         token pair. So a revoked row goes to DOT only when it was rotated (DOT
-        then re-serves the pair it already issued) or when the grace period is
-        over (DOT refuses it and applies reuse protection to the family).
+        then re-serves the pair it already issued, after the membership gate)
+        or when the grace period is over (DOT refuses it and applies reuse
+        protection to the family). Revoked rows are sorted out before the
+        membership gate, so a dead token never triggers an upstream re-check.
         """
         raw_token = request.POST.get("refresh_token", "")
         if not raw_token:
@@ -140,6 +142,21 @@ class MCPTokenView(FacadeViewMixin, TrustedOriginCORSMixin, TokenView):
             return None  # DOT answers invalid_grant, or it is not an MCP client
 
         user = refresh_token.user
+        rotated_in_grace = False
+        if refresh_token.revoked is not None:
+            # A dead token never reaches the membership gate (and so never
+            # triggers an upstream call): only a rotation inside the grace
+            # window, which DOT answers by re-serving the pair it already
+            # issued, goes on to the gate.
+            if not self._revoked_within_grace(refresh_token):
+                return None  # DOT refuses it and applies reuse protection
+            if not self._has_successor(refresh_token):
+                self._revoke_family(refresh_token)
+                return _refused(
+                    "revoked", user.pk, "The refresh token was revoked. Sign in again."
+                )
+            rotated_in_grace = True
+
         ok, code = membership.refresh_grant_allowed(user)
         if not ok:
             logger.info(
@@ -149,16 +166,8 @@ class MCPTokenView(FacadeViewMixin, TrustedOriginCORSMixin, TokenView):
                 code or "invalid_grant", "Access was revoked. Sign in again."
             )
 
-        if refresh_token.revoked is not None:
-            if self._revoked_within_grace(refresh_token) and not (
-                get_access_token_model()
-                .objects.filter(source_refresh_token=refresh_token)
-                .exists()
-            ):
-                return _refused(
-                    "revoked", user.pk, "The refresh token was revoked. Sign in again."
-                )
-            return None  # rotation inside the grace window, or reuse: DOT
+        if rotated_in_grace:
+            return None  # DOT re-serves the existing pair
 
         requested = _scope_list(request.POST.get("scope")) or self._original_scopes(
             raw_token, refresh_token
@@ -184,6 +193,45 @@ class MCPTokenView(FacadeViewMixin, TrustedOriginCORSMixin, TokenView):
         post["scope"] = " ".join(scopes)
         request.POST = post
         return None
+
+    @staticmethod
+    def _has_successor(refresh_token) -> bool:
+        """Whether a revoked row was rotated: its successor access token still exists.
+
+        Exactly DOT's re-serve condition in _save_bearer_token. A revocation
+        (RefreshToken.revoke(), /oauth/revoke/) or the successor's own rotation
+        deletes that access token.
+        """
+        return (
+            get_access_token_model()
+            .objects.filter(source_refresh_token=refresh_token)
+            .exists()
+        )
+
+    @staticmethod
+    def _revoke_family(refresh_token) -> None:
+        """DOT's reuse protection, applied inside the grace window too.
+
+        A revoked token without a successor is either plainly revoked (the rest
+        of its family is revoked already, so this is a no-op) or a stale
+        rotated token replayed after its successor was itself rotated, which a
+        legitimate client cannot do: revoke the family, as DOT does past the
+        window (OAuth2Validator.validate_refresh_token).
+        """
+        if not (
+            oauth2_settings.REFRESH_TOKEN_REUSE_PROTECTION
+            and refresh_token.token_family
+        ):
+            return
+        family = get_refresh_token_model().objects.filter(
+            token_family=refresh_token.token_family, revoked__isnull=True
+        )
+        for related in family:
+            related.revoke()
+        logger.info(
+            "inventree-mcp: revoked token reused, token family of user id %s revoked",
+            refresh_token.user_id,
+        )
 
     @staticmethod
     def _revoked_within_grace(refresh_token) -> bool:

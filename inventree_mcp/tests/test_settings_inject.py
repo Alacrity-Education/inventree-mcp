@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from django.conf import settings
+from django.core.signals import request_started
 from django.test import Client, override_settings
 from django_q.signals import pre_execute
 from InvenTree.unit_test import InvenTreeTestCase
@@ -102,6 +103,29 @@ class SettingsInjectTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         with patch.object(settings_inject.time, "monotonic", return_value=later):
             settings_inject.ensure_applied()
         self.assertEqual(oauth2_settings.ACCESS_TOKEN_EXPIRE_SECONDS, 777)
+
+    def test_any_request_resyncs_after_the_memo_expires(self):
+        """R3: a web worker serving only /api/ or /o/ still follows a change from another process."""
+        settings_inject.connect_signals()
+        self.set_setting("ACCESS_TOKEN_LIFETIME_SECONDS", 1000)
+        settings_inject.ensure_applied()
+
+        PluginSetting.objects.filter(
+            plugin=self.plugin.plugin_config(), key="ACCESS_TOKEN_LIFETIME_SECONDS"
+        ).update(value="777")  # no signal, like another process
+
+        later = settings_inject.time.monotonic() + 60
+        with patch.object(settings_inject.time, "monotonic", return_value=later):
+            self.assertEqual(Client().get("/api/").status_code, 200)
+        self.assertEqual(oauth2_settings.ACCESS_TOKEN_EXPIRE_SECONDS, 777)
+        self.assertIn(
+            "inventree_mcp.settings_inject.request_started",
+            {
+                receiver_key[0]
+                for receiver_key, *_rest in request_started.receivers
+                if isinstance(receiver_key[0], str)
+            },
+        )
 
 
 def _forget_injection():

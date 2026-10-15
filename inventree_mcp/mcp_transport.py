@@ -31,9 +31,11 @@ SessionAuthentication.authenticate() ran, purely from that middleware.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from asgiref.sync import async_to_sync
+from django.core.cache import cache
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.urls import path
 from django.views.decorators.csrf import csrf_exempt
@@ -45,6 +47,7 @@ from rest_framework.authentication import BasicAuthentication
 from rest_framework.views import APIView
 from users.authentication import ApiTokenAuthentication, ExtendedOAuth2Authentication
 
+from .auth import membership
 from .auth.discovery import challenge_header
 from .context import reset_current_user, set_current_user
 from .mcp_server import mcp
@@ -54,6 +57,8 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping
 
     from starlette.types import Scope
+
+logger = logging.getLogger("inventree")
 
 _REQUEST_TIMEOUT_SECONDS = 60.0
 
@@ -174,6 +179,35 @@ def _auth_error_response(
     return response
 
 
+def _queue_membership_recheck(user) -> None:
+    """Queue a background membership re-check for a long-lived credential (ApiToken, Basic).
+
+    OAuth access tokens are short-lived and re-checked at refresh; ApiTokens
+    and passwords are not, so their requests queue tasks.recheck_user when the
+    last check is stale. Never makes the request wait; a short cache marker
+    keeps a burst of requests from queueing (and de-duplicating) repeatedly.
+    """
+    try:
+        if not membership.recheck_due(user):
+            return
+        if not cache.add(f"inventree_mcp:recheck_queued:{user.pk}", True, 60):
+            return
+        from InvenTree.tasks import offload_task
+
+        offload_task(
+            "inventree_mcp.auth.tasks.recheck_user",
+            user.pk,
+            force_async=True,
+            check_duplicates=True,
+        )
+    except Exception:  # a re-check must never fail an MCP request (logged below)
+        logger.warning(
+            "inventree-mcp: could not queue a membership re-check for user id %s",
+            user.pk,
+            exc_info=True,
+        )
+
+
 class MCPView(APIView):
     """DRF view handling MCP Streamable HTTP transport requests.
 
@@ -222,6 +256,15 @@ class MCPView(APIView):
         is_oauth2 = isinstance(
             drf_request.successful_authenticator, OAuth2Authentication
         )
+
+        if user is not None and user.is_authenticated:
+            if membership.is_blocked(user):
+                return _auth_error_response(
+                    request, 401, "Access revoked, sign in to InvenTree again."
+                )
+            if not is_oauth2:
+                _queue_membership_recheck(user)
+
         token = set_current_user(user, drf_request.auth if is_oauth2 else None)
         try:
             # async_to_sync (rather than a hand-rolled event loop) is what lets

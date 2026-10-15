@@ -14,7 +14,7 @@ from oauth2_provider.models import get_application_model, get_grant_model
 
 from ..auth import policy
 from ..auth.authorize import MCPAuthorizationView
-from ..auth.login_bridge import sso_provider_id
+from ..auth.sso import sso_provider_id
 from .oauth_helpers import (
     LOOPBACK_REDIRECT_URI,
     MCP_URL,
@@ -400,7 +400,7 @@ def _oidc_apps(*provider_ids: str) -> dict:
 
 @override_settings(PLUGIN_TESTING_SETUP=True)
 class SsoProviderTest(OAuthFacadeTestMixin, InvenTreeTestCase):
-    """login_bridge.sso_provider_id() / _sso_app() against allauth's real app list."""
+    """sso.sso_provider_id() / sso_app() (used by the login bridge) against allauth's real app list."""
 
     def setUp(self):
         super().setUp()

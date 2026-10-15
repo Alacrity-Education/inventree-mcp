@@ -36,7 +36,9 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   `type(default)`, fail-safe; read from the database while the registry is still loading),
   `plugin_setting(key)` / `plugin_setting_list(key)` with the defaults declared in `core.SETTINGS`.
 - `mcp_server.py` - the `MCPServer` instance; imports `tools/*` for their `@mcp.tool()` side effect.
-- `mcp_transport.py` - Django view bridging Streamable HTTP onto the MCP server.
+- `mcp_transport.py` - Django view bridging Streamable HTTP onto the MCP server; 401 with the OAuth
+  challenge, 401 for users blocked by the membership re-check, background re-check for API-token and
+  Basic requests.
 - `oauth2_bridge.py` - lets `call_view()` present an OAuth2-authenticated request's real token to
   the proxied view, and works around upstream InvenTree OAuth2 scope-enforcement bugs.
 - `tools/` - one module per resource, each a thin async wrapper around `call_view()`;
@@ -50,7 +52,9 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
 - `core.py` - the `InvenTreePlugin` subclass: settings (incl. the OAuth ones), URL wiring (the
   OAuth façade only when `auth.facade_supported()`), well-known entries, scheduled tasks; injects
   DOT settings at load.
-- `models.py`, `migrations/` - plugin models (empty until WP2; `AppMixin` needs them to exist).
+- `models.py`, `migrations/` - plugin models: `MCPUserState` (per-user membership check stamp and
+  MCP block). Generate migrations inside the dev container: `dev/manage.sh makemigrations
+  inventree_mcp` (fixes file ownership); `migrations/` is excluded from ruff.
 - `templates/inventree_mcp/` - server-rendered OAuth pages: `base.html`, `consent.html`,
   `login_bridge.html`, `error.html`.
 - `auth/__init__.py` - `facade_supported()` (DOT >= 3.4 feature detection), `oauth_enabled()`,
@@ -64,24 +68,38 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   used by `mcp_transport.py`).
 - `auth/settings_inject.py` - merges CIMD, lifetimes and refresh-token reuse protection into
   `settings.OAUTH2_PROVIDER` at runtime (`apply()`, `ensure_applied()`); restores InvenTree's
-  values while the façade is off. Applied at plugin load (settings read from the database), by every
-  façade view and challenge, and before every django-q task (`connect_signals()`: `pre_execute`);
-  desired values memoised for a few seconds, dropped on `PluginSetting` saves.
+  values while the façade is off. Applied at plugin load (settings read from the database), before
+  every request (`request_started`) and task (`pre_execute`) via `connect_signals()`, and by every
+  façade view and challenge; desired values memoised for a few seconds, dropped on `PluginSetting`
+  saves.
 - `auth/cors.py` - `trusted_origins()`, `TrustedOriginCORSMixin` for register/token/revoke.
 - `auth/clients.py` - `MCPRegistrationView` (DOT's DCR helpers + rate limit),
   `is_trusted_client()`, `is_loopback_redirect()`, `mcp_applications()`.
 - `auth/authorize.py` - `MCPAuthorizationView` (DOT `AuthorizationView` + policy, consent skip,
   error page), `render_error()`.
-- `auth/login_bridge.py` - `MCPLoginBridgeView`, `sso_provider_id()`: SSO via allauth headless and
-  back to the authorize URL.
-- `auth/token.py` - `MCPTokenView` (membership gate + scope re-narrowing before DOT),
-  `MCPRevokeView`.
-- `auth/policy.py` - `mcp_scopes_available()`, `effective_scopes()`, `may_connect()`, `narrow()`
-  (stub bodies until WP3).
-- `auth/membership.py` - membership re-check API (stubs until WP2) and `revoke_all_mcp_tokens()`.
-- `auth/tasks.py` - `cleanup_stale_clients()` (daily, via `ScheduleMixin`).
+- `auth/login_bridge.py` - `MCPLoginBridgeView`: SSO via allauth headless and back to the authorize
+  URL.
+- `auth/sso.py` - `sso_app()`, `sso_provider_id()`: the allauth app used for MCP sign-in and the
+  membership re-check (`SSO_PROVIDER_ID` or the single `openid_connect` app).
+- `auth/token.py` - `MCPTokenView` (dead refresh tokens sorted out first, then the membership gate,
+  then scope re-narrowing, all before DOT), `MCPRevokeView`.
+- `auth/policy.py` - `mcp_scopes_available()`, `effective_scopes()`, `may_connect()` (blocked,
+  `in_required_groups()` / `MCP_REQUIRED_GROUPS`), `narrow()` (`effective_scopes`/`narrow` are stub
+  bodies until WP3).
+- `auth/membership.py` - membership re-check against the SSO provider: `recheck()`,
+  `refresh_grant_allowed()`, `token_grant_allowed()`, `recheck_due()`, `is_blocked()`,
+  `block_user()`, `unblock_user()`, `revoke_all_mcp_tokens()`. Reuses allauth (the upstream refresh
+  token stays in `SocialToken`, `OpenIDConnectOAuth2Adapter` for endpoints and client auth, jwtkit for
+  the ID token) and core's `InvenTree.sso.ensure_sso_groups` for the group sync; never compare raw
+  claim strings, decide with `policy.may_connect()`. Every outbound call has a 5 s timeout; re-checks
+  are serialised by a row lock on `MCPUserState`.
+- `auth/signals.py` - allauth `user_logged_in`: SSO logins stamp `membership_checked_at` and lift a
+  block, other logins record `last_login_at` (connected from the plugin's `__init__`).
+- `auth/tasks.py` - `cleanup_stale_clients()` (daily), `membership_sweep()` (hourly), both via
+  `ScheduleMixin`; `recheck_user()` (queued by `mcp_transport.py` for API-token/Basic requests).
 - `tests/` - OAuth façade tests (`test_auth_*.py`, `test_settings_inject.py`, shared
-  `oauth_helpers.py`); `test_mcp.py` holds the original suite.
+  `oauth_helpers.py`), membership re-checks (`test_membership.py`, a fake OIDC provider at the
+  `requests` boundary); `test_mcp.py` holds the original suite.
 - `server_card.py` - serves an MCP Server Card (SEP-2127) at `plugin/inventree-mcp/server-card/`
   for discovery, advertised under `/.well-known/` via `core.py`'s `get_well_known_urls()`.
 - `_well_known_compat.py` - `WellKnownMixin` import, falling back to a blank mixin on InvenTree
@@ -97,6 +115,7 @@ dev/test.sh                                 # whole package (test_mcp.py + tests
 dev/test.sh inventree_mcp.tests.test_auth_flow
 dev/test.sh inventree_mcp.test_mcp          # the original suite
 dev/oauth_smoke.py                          # live OAuth flow against http://localhost:8080
+dev/membership_e2e.py                       # live membership re-checks against the dev Authentik
 ```
 
 Inside the InvenTree devcontainer instead:

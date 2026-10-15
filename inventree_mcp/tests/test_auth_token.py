@@ -218,6 +218,58 @@ class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "invalid_grant")
 
+    def test_stale_token_replayed_in_grace_revokes_the_family(self):
+        """R1: RT1 -> RT2 -> RT3, then RT1 again inside the grace window."""
+        tokens = self._tokens()
+        second = self.refresh(self.client_id, tokens["refresh_token"]).json()
+        third = self.refresh(self.client_id, second["refresh_token"]).json()
+        self.assertEqual(self.mcp_call(third["access_token"]).status_code, 200)
+
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+        checksum = hashlib.sha256(third["refresh_token"].encode()).hexdigest()
+        self.assertIsNotNone(RefreshToken.objects.get(token_checksum=checksum).revoked)
+        self.assertEqual(self.mcp_call(third["access_token"]).status_code, 401)
+        self.assertEqual(
+            self.refresh(self.client_id, third["refresh_token"]).status_code, 400
+        )
+
+    def test_dead_tokens_never_reach_the_membership_gate(self):
+        """A revoked token that is not a grace-window rotation triggers no re-check."""
+        revoked = self._tokens()
+        self.assertEqual(
+            Client()
+            .post(
+                url("oauth-revoke"),
+                data={"token": revoked["refresh_token"], "client_id": self.client_id},
+            )
+            .status_code,
+            200,
+        )
+        rotated_away = self._tokens()
+        self.refresh(self.client_id, rotated_away["refresh_token"])
+
+        with (
+            patch(
+                "inventree_mcp.auth.membership.refresh_grant_allowed",
+                wraps=membership.refresh_grant_allowed,
+            ) as gate,
+            patch("inventree_mcp.auth.membership.recheck") as recheck,
+        ):
+            # revoked inside the grace window (no successor)
+            response = self.refresh(self.client_id, revoked["refresh_token"])
+            self.assertEqual(response.status_code, 400, response.content)
+            # rotated, past the grace window (DOT refuses it)
+            self._expire_grace_period()
+            response = self.refresh(self.client_id, rotated_away["refresh_token"])
+            self.assertEqual(response.status_code, 400, response.content)
+            self.assertEqual(response.json()["error"], "invalid_grant")
+
+        gate.assert_not_called()
+        recheck.assert_not_called()
+
     def test_unknown_original_scope_is_refused(self):
         tokens = self._tokens()
         checksum = hashlib.sha256(tokens["access_token"].encode()).hexdigest()

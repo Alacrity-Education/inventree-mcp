@@ -10,9 +10,9 @@ The values are per process, so every kind of process applies them:
 
 - at start-up, from the plugin's ``__init__`` (apply()); the plugin settings
   are then read from the database, the registry holds no instance yet;
-- in web processes, at the top of every façade view and of the 401 challenge
-  (ensure_applied(), also while the façade is off, so switching it off
-  restores DOT's values);
+- in web processes, before every request (``request_started``, memoised) and
+  at the top of every façade view and of the 401 challenge (ensure_applied(),
+  also while the façade is off, so switching it off restores DOT's values);
 - in django-q workers, before every task (connect_signals(): a ``pre_execute``
   receiver), so the façade's scheduled tasks and InvenTree's daily
   ``run_oauth_maintenance`` (DOT's ``clear_expired``, the only place DOT
@@ -185,15 +185,38 @@ def _before_task(sender=None, **kwargs) -> None:
         )
 
 
+def _before_request(sender=None, **kwargs) -> None:
+    """Django ``request_started`` receiver: idle web workers pick up setting changes too.
+
+    Every request of the process (not only façade requests) re-syncs, at most
+    one settings read per DESIRED_VALUES_TTL_SECONDS thanks to the memo, so a
+    worker that serves only /o/ or /api/ also follows an admin's change, and a
+    deactivated plugin's values are restored (the receiver stays connected).
+    """
+    try:
+        ensure_applied()
+    except Exception:  # never break a request over this; logged for debugging
+        logger.debug(
+            "inventree-mcp: DOT settings not synced before request", exc_info=True
+        )
+
+
 def connect_signals() -> None:
     """Connect the receivers that keep every process in sync (idempotent).
 
     - ``post_save`` of PluginSetting / PluginConfig drops the memoised values,
       so a change made in this process applies at the next ensure_applied();
+    - Django's ``request_started`` runs ensure_applied() before every request
+      of a web process (memoised, see _before_request());
     - django-q's ``pre_execute`` runs ensure_applied() in the worker process
       before each task.
     """
+    from django.core.signals import request_started
     from django.db.models.signals import post_save
+
+    request_started.connect(
+        _before_request, dispatch_uid="inventree_mcp.settings_inject.request_started"
+    )
 
     for model in ("plugin.PluginSetting", "plugin.PluginConfig"):
         post_save.connect(

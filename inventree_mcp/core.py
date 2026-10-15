@@ -122,7 +122,36 @@ class InvenTreeMCP(
         },
         "SSO_PROVIDER_ID": {
             "name": "SSO Provider ID",
-            "description": "allauth provider id used for MCP sign-in. Empty selects the single configured OpenID Connect provider.",
+            "description": "allauth provider id used for MCP sign-in and membership re-checks. Empty selects the single configured OpenID Connect provider.",
+            "default": "",
+        },
+        "MEMBERSHIP_ENFORCED": {
+            "name": "Enforce SSO Membership",
+            "description": "Re-check MCP users' group membership at the SSO provider and block users who lost it. Users without an upstream refresh token (password logins, no offline_access) must sign in again after the re-login interval.",
+            "validator": bool,
+            "default": True,
+        },
+        "MEMBERSHIP_RECHECK_INTERVAL_MINUTES": {
+            "name": "Membership Re-check Interval (minutes)",
+            "description": "How old the last membership check may be before a token refresh re-checks at the SSO provider.",
+            "validator": [int, MinValueValidator(1)],
+            "default": 60,
+        },
+        "MEMBERSHIP_GRACE_HOURS": {
+            "name": "Membership Grace (hours)",
+            "description": "While the SSO provider is unreachable, refreshes keep working for this long after the last successful check.",
+            "validator": [int, MinValueValidator(0)],
+            "default": 4,
+        },
+        "RELOGIN_INTERVAL_HOURS": {
+            "name": "Re-login Interval (hours)",
+            "description": "Without an upstream refresh token, refreshes keep working for this long after the last login to InvenTree.",
+            "validator": [int, MinValueValidator(1)],
+            "default": 24,
+        },
+        "MCP_REQUIRED_GROUPS": {
+            "name": "Required Groups",
+            "description": "Comma separated InvenTree group names; when set, a user must be in at least one of them to use MCP.",
             "default": "",
         },
     }
@@ -134,6 +163,10 @@ class InvenTreeMCP(
             "func": "inventree_mcp.auth.tasks.cleanup_stale_clients",
             "schedule": "D",
         },
+        "membership_sweep": {
+            "func": "inventree_mcp.auth.tasks.membership_sweep",
+            "schedule": "H",
+        },
     }
 
     def __init__(self):
@@ -141,9 +174,14 @@ class InvenTreeMCP(
 
         Runs in every process that loads the plugin registry (web, worker,
         management commands). The signal receivers keep the settings in sync
-        afterwards, including in django-q worker processes (see settings_inject).
+        afterwards, including in django-q worker processes (see settings_inject),
+        and stamp logins for the membership re-check (auth/signals.py).
         """
         super().__init__()
+
+        from .auth import signals
+
+        signals.connect_signals()
 
         if facade_supported():
             from .auth import settings_inject

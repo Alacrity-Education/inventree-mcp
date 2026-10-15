@@ -1,15 +1,19 @@
 """Which MCP scopes a user may hold, and whether they may connect at all.
 
-WP1 ships stub bodies (every active user gets every advertised MCP scope).
-WP3 replaces the bodies with the MCP ruleset; the signatures and the call
-sites in authorize.py, token.py and discovery.py stay as they are.
+effective_scopes() and narrow() are WP1 stub bodies (every active user gets
+every advertised MCP scope); WP3 replaces them with the MCP ruleset. The
+signatures and the call sites in authorize.py, token.py and discovery.py stay
+as they are. may_connect() also applies the membership block (WP2) and
+MCP_REQUIRED_GROUPS (in_required_groups()).
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..settings import get_plugin_setting
+from django.db.models import Q
+
+from ..settings import get_plugin_setting, plugin_setting_list
 from . import membership
 
 if TYPE_CHECKING:
@@ -48,14 +52,35 @@ def effective_scopes(user) -> set[str]:
     return set()
 
 
+def in_required_groups(user) -> bool:
+    """Whether *user* is in one of the MCP_REQUIRED_GROUPS (always True when none are set).
+
+    The names are InvenTree group names (as core's SSO group sync maps them),
+    compared case-insensitively.
+    """
+    required = plugin_setting_list("MCP_REQUIRED_GROUPS")
+    if not required:
+        return True
+    match = Q()
+    for name in required:
+        match |= Q(name__iexact=name)
+    return user.groups.filter(match).exists()
+
+
 def may_connect(user) -> tuple[bool, str]:
-    """Whether *user* may connect an MCP client: (True, "") or (False, reason)."""
+    """Whether *user* may connect an MCP client: (True, "") or (False, reason).
+
+    Reasons: "anonymous", "inactive", "blocked" (membership block),
+    "no_mcp_permission" (not in MCP_REQUIRED_GROUPS; WP3 adds "no MCP ruleset").
+    """
     if user is None or not user.is_authenticated:
         return False, "anonymous"
     if not user.is_active:
         return False, "inactive"
     if membership.is_blocked(user):
         return False, "blocked"
+    if not in_required_groups(user):
+        return False, "no_mcp_permission"
     return True, ""
 
 
