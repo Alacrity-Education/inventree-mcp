@@ -165,3 +165,7 @@ cython_debug/
 dev/data/
 dev/.env
 dev/authentik/.bootstrap.json
+
+# Frontend (built output lives in inventree_mcp/static/ and is committed)
+frontend/node_modules
+frontend/dist
