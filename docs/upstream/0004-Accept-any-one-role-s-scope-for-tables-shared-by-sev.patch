@@ -1,4 +1,4 @@
-From 808c179b07a127fa50118f95c3d2eab8767427e7 Mon Sep 17 00:00:00 2001
+From f6be100035b7cde79aa06232445a9f80789afd2e Mon Sep 17 00:00:00 2001
 From: lucaci32u4 <lucaci32u4@gmail.com>
 Date: Thu, 15 Oct 2026 08:50:27 +0300
 Subject: [PATCH 4/4] Accept any one role's scope for tables shared by several
@@ -26,7 +26,7 @@ map_scope(roles=...) has three callers, all affected:
 The object-level checks of the last two are unchanged.
 
 The OpenAPI security requirements of these endpoints change (one
-requirement per role), so bump the API version to 557.
+requirement per role), so bump the API version to 558.
 
 Add unit tests for map_scope, the scope check on a multi-role table
 (PartList), ContentTypePermission and DataImporterPermission.
@@ -39,26 +39,26 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 98 insertions(+), 3 deletions(-)
 
 diff --git a/src/backend/InvenTree/InvenTree/api_version.py b/src/backend/InvenTree/InvenTree/api_version.py
-index fc92f412d..8223bc5f3 100644
+index 2177d7b84..249dc6e66 100644
 --- a/src/backend/InvenTree/InvenTree/api_version.py
 +++ b/src/backend/InvenTree/InvenTree/api_version.py
 @@ -1,11 +1,15 @@
  """InvenTree API version information."""
  
  # InvenTree API version
--INVENTREE_API_VERSION = 556
-+INVENTREE_API_VERSION = 557
+-INVENTREE_API_VERSION = 557
++INVENTREE_API_VERSION = 558
  """Increment this API version number whenever there is a significant change to the API that any clients need to know about."""
  
  INVENTREE_API_TEXT = """
  
-+v557 -> 2026-10-15 : https://github.com/inventree/InvenTree/pull/XXXXX
++v558 -> 2026-10-15 : https://github.com/inventree/InvenTree/pull/XXXXX
 +    - OAuth2 scope requirements of endpoints whose model belongs to several rulesets list one alternative per role (any one role's scope suffices, as for the role check)
 +    - The same applies to the data importer endpoints (writes) and the generic metadata endpoints, which previously required the scopes of all roles
 +
- v556 -> 2026-10-14 : https://github.com/inventree/InvenTree/pull/13017
-     - Adds 'is_internal' field (and filter) to the Company API endpoint
-     - Adds 'INVENTREE_DEFAULT_INTERNAL_COMPANY' global setting
+ v557 -> 2026-10-15 : https://github.com/inventree/InvenTree/pull/12978
+     - Adds tips endpoints
+ 
 diff --git a/src/backend/InvenTree/InvenTree/permissions.py b/src/backend/InvenTree/InvenTree/permissions.py
 index 807117c21..5e46c44c1 100644
 --- a/src/backend/InvenTree/InvenTree/permissions.py

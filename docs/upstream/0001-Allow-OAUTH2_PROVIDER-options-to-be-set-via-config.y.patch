@@ -1,4 +1,4 @@
-From 22e0d2042e2803140df7db47ad8a937b82e3a478 Mon Sep 17 00:00:00 2001
+From f826ba0044f623a2957014eef5a9f64dfa5ebd04 Mon Sep 17 00:00:00 2001
 From: lucaci32u4 <lucaci32u4@gmail.com>
 Date: Thu, 15 Oct 2026 07:19:22 +0300
 Subject: [PATCH 1/4] Allow OAUTH2_PROVIDER options to be set via config.yaml /

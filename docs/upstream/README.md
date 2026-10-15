@@ -1,6 +1,6 @@
 # Upstream patches for InvenTree core
 
-Four small patches against InvenTree core `master` (base commit `9b8fdeb06`), prepared but **not submitted**. Each retires a workaround in the `inventree-mcp` plugin. They are independent and can be proposed as four separate PRs.
+Four small patches against InvenTree core `master` (base commit `2f139f94b`, 2026-10-15), prepared but **not submitted** to inventree/InvenTree. The stacked branch is pushed to the fork `Alacrity-Education/InvenTree` (`upstream-patches`), where core's QC, Frontend, Import/Export and Migration workflows run on it. Each retires a workaround in the `inventree-mcp` plugin. They are independent and can be proposed as four separate PRs.
 
 Source: local branch `upstream-patches` in the worktree `/home/alex.lucaci/Projects/inventree/.worktrees/upstream-patches` (clone `/home/alex.lucaci/Projects/inventree/InvenTree`, branch `master` untouched). Patch files (from `git format-patch master..upstream-patches`) are in this directory:
 
@@ -9,7 +9,7 @@ Source: local branch `upstream-patches` in the worktree `/home/alex.lucaci/Proje
 - `0003-Render-plugin-panels-in-the-group-and-user-drawers-e.patch`
 - `0004-Accept-any-one-role-s-scope-for-tables-shared-by-sev.patch`
 
-Each applies cleanly (`git apply --check` and `git am`) on a fresh checkout of `master` at `9b8fdeb06`. Note: the plan named the files `0001-oauth2-provider-config-override.patch` etc.; format-patch derives names from the commit subjects.
+Each applies cleanly (`git apply --check` and `git am`) on a fresh checkout of `master` at `2f139f94b`. Note: the plan named the files `0001-oauth2-provider-config-override.patch` etc.; format-patch derives names from the commit subjects.
 
 ---
 
@@ -98,7 +98,7 @@ one alternative holding every role's scope (an AND; the loop variable was even n
   - `test_multi_role_table_accepts_any_role_scope`: `PartList`'s required scopes contain `[r:view:part]` and `[r:view:build]`; a token with either scope passes, `r:view:stock` is refused;
   - `test_content_type_permission_accepts_any_role_scope`: one alternative per role for GET and PATCH; `r:view:stock` passes GET, `r:change:part` passes PATCH, `g:read` alone and a view scope on PATCH are refused;
   - `test_data_importer_permission_accepts_any_role_scope`: GET needs `g:read`; every write method lists `r:change:<role>` per role; `r:change:part` passes POST, `r:change:sales_order` passes DELETE, `r:add:part` and `g:read` are refused for writes.
-- API version: `InvenTree/api_version.py` bumped to **v557** with a text entry. The OpenAPI security requirements of all these endpoints change from one requirement holding every role's scope to one requirement per role (`InvenTree/schema.py` turns each alternative into a requirement). Core's `qc_checks.yaml` diffs the exported schema against the published schema of the current API version and fails without a bump. The entry links `https://github.com/inventree/InvenTree/pull/XXXXX`: replace the number when the PR is opened, and renumber if `master` has moved past 556.
+- API version: `InvenTree/api_version.py` bumped to **v558** with a text entry. The OpenAPI security requirements of all these endpoints change from one requirement holding every role's scope to one requirement per role (`InvenTree/schema.py` turns each alternative into a requirement). Core's `qc_checks.yaml` diffs the exported schema against the published schema of the current API version and fails without a bump. The entry links `https://github.com/inventree/InvenTree/pull/XXXXX`: replace the number when the PR is opened, and renumber if `master` has moved past 556.
 
 **Retiring the plugin workaround.** `oauth2_bridge._any_role_alternatives` (called only from `scoped_view_class`) splits every all-role-scope alternative into one alternative per scope, which is exactly what the patched `map_scope` returns. Once the minimum supported InvenTree version includes the patch, drop `_any_role_alternatives` and use `get_required_alternate_scopes(...)` as it is (until then it is a no-op on patched cores: an alternative of one scope is left as it is). Its test `test_policy.TransportNarrowingTest.test_multi_role_tables_accept_any_role_scope` keeps passing either way. The other two bridge workarounds (core bugs 1 and 2 in the `oauth2_bridge.py` docstring: the raw `TokenMatchesOASRequirements()` in `check_oauth2_authentication` and the broken `super().has_permission` fallback) are not covered by these patches.
 
@@ -123,6 +123,6 @@ one alternative holding every role's scope (an AND; the loop variable was even n
 - [ ] Tests: patch 4 `OAuth2ScopeMapTest`; patch 1 `test_oauth2_provider_override`; patch 2 `test_account_login_preserves_next` plus a Playwright test for the `next` flow (login with `/web/?next=/api-doc/` style target); patch 3 a Playwright test with a mock plugin panel in the group drawer (the `inventree-plugin-creator` demo plugin can provide it). Run `invoke dev.test` for the touched backend apps in a proper environment.
 - [ ] `pre-commit run --all-files` (ruff, biome) and the frontend `yarn build`/`lib` build.
 - [ ] Run `invoke dev.translate` / `lingui extract` only if maintainers ask; otherwise leave locales to the translation workflow.
-- [ ] API version bump: patch 4 bumps to v557 (schema security requirements change); fill in the PR number in `api_version.py` and renumber if `master` has moved. Patches 1 to 3 need none. Frontend library version/changelog: patch 3 adds an entry.
+- [ ] API version bump: patch 4 bumps to v558 (schema security requirements change); fill in the PR number in `api_version.py` and renumber if `master` has moved. Patches 1 to 3 need none. Frontend library version/changelog: patch 3 adds an entry.
 - [ ] Patch 4: list the importer and generic metadata endpoints (above) in the PR text as a deliberate relaxation, or narrow the patch to `InvenTreeRoleScopeMixin` if maintainers object.
 - [ ] Squash/reword the commits if requested; remove the `Co-Authored-By` trailers if the project policy requires.
