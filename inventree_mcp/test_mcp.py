@@ -65,6 +65,7 @@ from .proxy import call_view
 from .schema_introspection import paginated_schema, serializer_schema
 from .server_card import SERVER_CARD_SCHEMA, build_server_card
 from .settings import get_plugin_setting
+from .tests.oauth_helpers import grant_mcp
 from .tools import discovery
 from .tools._common import DEFAULT_LIMIT, MAX_LIMIT, build_query_params, clamp_limit
 from .tools.attachments import get_attachment, list_attachments
@@ -2031,6 +2032,8 @@ class MCPTransportTest(InvenTreeTestCase):
 
         registry.reload_plugins(full_reload=True, collect=True)
         registry.set_plugin_state("inventree-mcp", True)
+        # MCP access needs MCP roles (WP3); the interactive roles still decide.
+        grant_mcp(cls.group, "all")
 
     @staticmethod
     def _initialize_body() -> str:
@@ -2210,6 +2213,8 @@ class ToolLoggingTest(InvenTreeTestCase):
 
         registry.reload_plugins(full_reload=True, collect=True)
         registry.set_plugin_state("inventree-mcp", True)
+        # MCP access needs MCP roles (WP3); the interactive roles still decide.
+        grant_mcp(cls.group, "all")
 
     @staticmethod
     def _call_tool_body(name: str, arguments: dict[str, Any] | None = None) -> str:

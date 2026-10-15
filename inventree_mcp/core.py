@@ -154,6 +154,18 @@ class InvenTreeMCP(
             "description": "Comma separated InvenTree group names; when set, a user must be in at least one of them to use MCP.",
             "default": "",
         },
+        "MCP_SUPERUSER_FULL_ACCESS": {
+            "name": "Superusers Bypass MCP Roles",
+            "description": "Superusers get every MCP scope regardless of the MCP roles of their groups. Off: superusers are limited by the MCP roles like everybody else.",
+            "validator": bool,
+            "default": False,
+        },
+        "MCP_ALLOW_BASIC_AUTH": {
+            "name": "Allow Basic Authentication",
+            "description": "Accept username and password (HTTP Basic) on the MCP endpoint. Off: only OAuth and InvenTree API tokens.",
+            "validator": bool,
+            "default": False,
+        },
     }
 
     # Scheduled tasks (from ScheduleMixin)

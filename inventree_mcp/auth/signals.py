@@ -1,4 +1,18 @@
-"""Signal receivers of the auth package: login stamps for the membership re-check (WP2).
+"""Signal receivers of the auth package: login stamps (WP2) and the MCP rulesets (WP3).
+
+MCP rulesets (models.MCPRuleSet):
+
+- every group gets one row per core role: ``post_save`` on ``Group`` (new
+  groups), migration 0002 (existing ones) and ``ensure_rulesets()``, which the
+  API also calls so a role added by a core upgrade appears;
+- a reduction revokes: a flag going from true to false (``pre_save`` snapshot,
+  ``post_save`` comparison), a deleted row that granted something, or a deleted
+  group whose rows granted something revokes the MCP tokens of every member of
+  the group (``membership.revoke_all_mcp_tokens``, never a block). More than
+  REVOKE_SYNC_LIMIT members go to a background task. Additions revoke
+  nothing: the next authorize or refresh picks them up.
+
+Login stamps (WP2):
 
 An SSO login through the MCP sign-in provider proves membership the same way a
 re-check does: allauth already ran core's group sync (``ensure_sso_groups`` on
@@ -17,10 +31,20 @@ from __future__ import annotations
 
 import logging
 
-from django.db import transaction
+from django.db import DatabaseError, transaction
 from django.utils import timezone
 
 logger = logging.getLogger("inventree")
+
+#: Up to this many group members are revoked in the request; more go to a background task.
+REVOKE_SYNC_LIMIT = 20
+
+_FLAGS = ("can_view", "can_add", "can_change", "can_delete")
+#: The ruleset model as a lazy sender: connected once the plugin's app is installed.
+_RULESET_MODEL = "inventree_mcp.MCPRuleSet"
+
+#: Groups whose deletion is in progress (their rows' post_delete must not revoke again).
+_deleting_groups: set[int] = set()
 
 
 def on_user_logged_in(sender, request=None, user=None, sociallogin=None, **kwargs):
@@ -76,10 +100,225 @@ def on_user_logged_in(sender, request=None, user=None, sociallogin=None, **kwarg
         )
 
 
+# -- MCP rulesets ---------------------------------------------------------------
+
+
+def ensure_rulesets(group) -> int:
+    """Create the missing MCPRuleSet rows (all flags false) of *group*; returns how many."""
+    from users.ruleset import RULESET_NAMES
+
+    from ..models import MCPRuleSet
+
+    existing = set(
+        MCPRuleSet.objects.filter(group=group).values_list("name", flat=True)
+    )
+    missing = [str(name) for name in RULESET_NAMES if str(name) not in existing]
+    if missing:
+        MCPRuleSet.objects.bulk_create(
+            [MCPRuleSet(group=group, name=name) for name in missing],
+            ignore_conflicts=True,
+        )
+    return len(missing)
+
+
+def grants_anything(rows) -> bool:
+    """Whether any of *rows* (MCPRuleSet instances or flag dicts) has a true flag."""
+    for row in rows:
+        get = row.get if isinstance(row, dict) else lambda f, r=row: getattr(r, f)
+        if any(get(flag) for flag in _FLAGS):
+            return True
+    return False
+
+
+def live_mcp_token_count(user_ids) -> int:
+    """Live façade tokens of *user_ids* (unrevoked refresh tokens plus access tokens)."""
+    from oauth2_provider.models import get_access_token_model, get_refresh_token_model
+
+    from .clients import mcp_applications
+
+    applications = mcp_applications()
+    refresh = get_refresh_token_model().objects.filter(
+        user_id__in=user_ids, revoked__isnull=True, application__in=applications
+    )
+    access = get_access_token_model().objects.filter(
+        user_id__in=user_ids, application__in=applications
+    )
+    return refresh.count() + access.count()
+
+
+def revoke_users(user_ids, why: str) -> tuple[int, int]:
+    """Revoke the MCP tokens of *user_ids*: (users, tokens).
+
+    Up to REVOKE_SYNC_LIMIT users synchronously; more are handed to
+    ``tasks.revoke_mcp_tokens`` (offload_task runs it inline when no worker
+    is running), and *tokens* is then the number of live tokens at queueing
+    time. Logs counts only.
+    """
+    from django.contrib.auth import get_user_model
+
+    from .membership import revoke_all_mcp_tokens
+
+    user_ids = sorted(set(user_ids))
+    if not user_ids:
+        return 0, 0
+
+    if len(user_ids) > REVOKE_SYNC_LIMIT:
+        from InvenTree.tasks import offload_task
+
+        tokens = live_mcp_token_count(user_ids)
+        offload_task(
+            "inventree_mcp.auth.tasks.revoke_mcp_tokens",
+            user_ids,
+            check_duplicates=False,
+        )
+        logger.info(
+            "inventree-mcp: %s; MCP tokens of %s users queued for revocation (%s live)",
+            why,
+            len(user_ids),
+            tokens,
+        )
+        return len(user_ids), tokens
+
+    tokens = sum(
+        revoke_all_mcp_tokens(user)
+        for user in get_user_model().objects.filter(pk__in=user_ids)
+    )
+    logger.info(
+        "inventree-mcp: %s; revoked %s MCP tokens of %s users",
+        why,
+        tokens,
+        len(user_ids),
+    )
+    return len(user_ids), tokens
+
+
+def revoke_group_members(
+    group, why: str = "MCP tokens revoked for a group"
+) -> tuple[int, int]:
+    """Revoke the MCP tokens of every member of *group*: (users, tokens)."""
+    user_ids = list(group.user_set.values_list("pk", flat=True))
+    return revoke_users(user_ids, f"{why} (group id {group.pk})")
+
+
+def on_group_saved(sender, instance=None, created=False, raw=False, **kwargs):
+    """Group ``post_save``: a new group gets its MCPRuleSet rows (core does the same for RuleSet)."""
+    if raw or not created or instance is None:
+        return
+    from .membership import models_available
+
+    if not models_available():
+        return
+    try:
+        with transaction.atomic():
+            ensure_rulesets(instance)
+    except DatabaseError:  # never break a group save over the plugin's table
+        logger.warning(
+            "inventree-mcp: could not create the MCP rulesets of group id %s "
+            "(run `invoke migrate`)",
+            instance.pk,
+            exc_info=True,
+        )
+
+
+def on_group_deleting(sender, instance=None, **kwargs):
+    """Group ``pre_delete``: revoke the members' MCP tokens when the group granted MCP access.
+
+    Runs before the cascade (the members are still known); the rows'
+    own ``post_delete`` then sees the group marked and does nothing.
+    """
+    if instance is None or instance.pk is None:
+        return
+    from .membership import models_available
+
+    if not models_available():
+        return
+    from ..models import MCPRuleSet
+
+    try:
+        with transaction.atomic():
+            granted = grants_anything(
+                MCPRuleSet.objects.filter(group=instance).values(*_FLAGS)
+            )
+    except DatabaseError:
+        return
+    _deleting_groups.add(instance.pk)
+    if granted:
+        revoke_group_members(instance, "group with MCP permissions deleted")
+
+
+def on_group_deleted(sender, instance=None, **kwargs):
+    """Group ``post_delete``: forget the in-progress marker."""
+    if instance is not None:
+        _deleting_groups.discard(instance.pk)
+
+
+def on_ruleset_saving(sender, instance=None, raw=False, **kwargs):
+    """MCPRuleSet ``pre_save``: remember the stored flags for the reduction check."""
+    if raw or instance is None or instance.pk is None:
+        return
+    instance._mcp_previous_flags = (
+        type(instance).objects.filter(pk=instance.pk).values(*_FLAGS).first()
+    )
+
+
+def on_ruleset_saved(sender, instance=None, created=False, raw=False, **kwargs):
+    """MCPRuleSet ``post_save``: a flag that went from true to false revokes the group's tokens."""
+    previous = getattr(instance, "_mcp_previous_flags", None) if instance else None
+    if raw or created or not previous:
+        return
+    instance._mcp_previous_flags = None
+    if any(previous[flag] and not getattr(instance, flag) for flag in _FLAGS):
+        revoke_group_members(instance.group, "MCP permissions of a group reduced")
+
+
+def on_ruleset_deleted(sender, instance=None, **kwargs):
+    """MCPRuleSet ``post_delete``: a deleted row that granted something revokes too."""
+    if instance is None or instance.group_id in _deleting_groups:
+        return
+    if grants_anything([instance]):
+        from django.contrib.auth.models import Group
+
+        group = Group.objects.filter(pk=instance.group_id).first()
+        if group is not None:
+            revoke_group_members(group, "MCP permissions of a group deleted")
+
+
 def connect_signals() -> None:
-    """Connect the login receiver (idempotent)."""
+    """Connect the login and ruleset receivers (idempotent)."""
     from allauth.account.signals import user_logged_in
+    from django.contrib.auth.models import Group
+    from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
 
     user_logged_in.connect(
         on_user_logged_in, dispatch_uid="inventree_mcp.auth.signals.user_logged_in"
+    )
+    post_save.connect(
+        on_group_saved,
+        sender=Group,
+        dispatch_uid="inventree_mcp.auth.signals.group_saved",
+    )
+    pre_delete.connect(
+        on_group_deleting,
+        sender=Group,
+        dispatch_uid="inventree_mcp.auth.signals.group_deleting",
+    )
+    post_delete.connect(
+        on_group_deleted,
+        sender=Group,
+        dispatch_uid="inventree_mcp.auth.signals.group_deleted",
+    )
+    pre_save.connect(
+        on_ruleset_saving,
+        sender=_RULESET_MODEL,
+        dispatch_uid="inventree_mcp.auth.signals.ruleset_saving",
+    )
+    post_save.connect(
+        on_ruleset_saved,
+        sender=_RULESET_MODEL,
+        dispatch_uid="inventree_mcp.auth.signals.ruleset_saved",
+    )
+    post_delete.connect(
+        on_ruleset_deleted,
+        sender=_RULESET_MODEL,
+        dispatch_uid="inventree_mcp.auth.signals.ruleset_deleted",
     )

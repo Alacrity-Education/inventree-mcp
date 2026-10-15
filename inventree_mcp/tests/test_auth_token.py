@@ -18,6 +18,7 @@ from oauth2_provider.models import (
 
 from ..auth import membership, policy
 from ..auth.token import MCPTokenView
+from ..models import MCPRuleSet
 from .oauth_helpers import OAuthFacadeTestMixin, make_token_pair, url
 
 Application = get_application_model()
@@ -156,6 +157,36 @@ class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "invalid_grant")
         self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+
+    def test_refresh_after_the_group_lost_every_mcp_flag(self):
+        """WP3: a reduction revokes at once; the refresh is invalid_grant, nothing re-issued."""
+        tokens = self._tokens()
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 200)
+
+        for row in MCPRuleSet.objects.filter(group=self.group):
+            for flag in MCPRuleSet.RULE_OPTIONS:
+                setattr(row, flag, False)
+            row.save()
+
+        self.assertEqual(policy.may_connect(self.user), (False, "no_mcp_permission"))
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+        self.assertIsNotNone(
+            RefreshToken.objects.get(token=tokens["refresh_token"]).revoked
+        )
+        self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 401)
+        self.assertFalse(
+            RefreshToken.objects.filter(user=self.user, revoked__isnull=True).exists()
+        )
+
+    def test_code_exchange_grants_the_mcp_roles_only(self):
+        """WP3: the requested scopes are narrowed to the MCP roles at authorize."""
+        MCPRuleSet.objects.filter(group=self.group).exclude(name="part").update(
+            can_view=False, can_add=False, can_change=False, can_delete=False
+        )
+        tokens = self._tokens(scope=" ".join(policy.mcp_scopes_available()))
+        self.assertEqual(tokens["scope"], "g:read r:view:part")
 
     def test_refresh_refused_by_membership(self):
         tokens = self._tokens()

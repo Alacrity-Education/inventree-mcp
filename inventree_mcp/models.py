@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from django.conf import settings
+from django.contrib.auth.models import Group
 from django.db import models
 from django.utils.translation import gettext_lazy as _
+from users.ruleset import RULESET_CHOICES
 
 
 class MCPUserState(models.Model):
@@ -75,3 +77,77 @@ class MCPUserState(models.Model):
         if user.is_staff:
             return True
         return permission == "view" and obj is not None and obj.user_id == user.pk
+
+
+class MCPRuleSet(models.Model):
+    """What members of a group may do through MCP: core's RuleSet shape, one row per role.
+
+    The second permission set. MCP access is the user's interactive roles
+    (core ``RuleSet``) intersected with the MCP roles of the user's groups,
+    which become OAuth2 scopes ``r:<view|add|change|delete>:<role>`` on MCP
+    tokens (auth/policy.py); core enforces roles and scopes on every proxied
+    call. Rows are created for every group (migration 0002, the Group
+    ``post_save`` receiver and ``auth.signals.ensure_rulesets``).
+
+    Query from this model (``MCPRuleSet.objects.filter(group__in=...)``),
+    never through ``Group.mcp_rule_sets`` in a filter: the reverse relation is
+    missing in running processes (plugin apps load after core's relations).
+    """
+
+    RULE_OPTIONS = ("can_view", "can_add", "can_change", "can_delete")
+
+    group = models.ForeignKey(
+        Group,
+        related_name="mcp_rule_sets",
+        on_delete=models.CASCADE,
+        verbose_name=_("Group"),
+        help_text=_("Group"),
+    )
+    name = models.CharField(
+        max_length=50,
+        choices=RULESET_CHOICES,
+        verbose_name=_("Name"),
+        help_text=_("Permission set"),
+    )
+    can_view = models.BooleanField(
+        default=False, verbose_name=_("View"), help_text=_("MCP may view items")
+    )
+    can_add = models.BooleanField(
+        default=False, verbose_name=_("Add"), help_text=_("MCP may add items")
+    )
+    can_change = models.BooleanField(
+        default=False, verbose_name=_("Change"), help_text=_("MCP may edit items")
+    )
+    can_delete = models.BooleanField(
+        default=False, verbose_name=_("Delete"), help_text=_("MCP may delete items")
+    )
+
+    class Meta:
+        """Model options."""
+
+        app_label = "inventree_mcp"
+        unique_together = (("group", "name"),)
+        verbose_name = _("MCP rule set")
+        verbose_name_plural = _("MCP rule sets")
+
+    def __str__(self) -> str:
+        """Role name only (as core's RuleSet)."""
+        return self.name
+
+    @property
+    def label(self) -> str:
+        """The translated role label (as core's RuleSet.label)."""
+        return dict(RULESET_CHOICES).get(self.name, self.name)
+
+    def save(self, *args, **kwargs):
+        """Imply view for any write flag and change for add/delete, as core's RuleSet.save() does."""
+        if self.can_add or self.can_change or self.can_delete:
+            self.can_view = True
+        if self.can_add or self.can_delete:
+            self.can_change = True
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def check_user_permission(cls, user, permission: str, obj=None) -> bool:
+        """Only active staff (InvenTree calls this for plugin models without a RuleSet)."""
+        return bool(user is not None and user.is_active and user.is_staff)

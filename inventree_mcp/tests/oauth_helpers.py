@@ -64,6 +64,29 @@ def consent_form_data(page) -> dict[str, str]:
     return {k: v for k, v in page.context["form"].initial.items() if v is not None}
 
 
+def grant_mcp(group, *roles: str) -> None:
+    """Set *group*'s MCP rulesets, core's assignRole() syntax: "part.view", "stock.change", "all".
+
+    "all" grants every flag of every role; "<role>" alone means "<role>.view".
+    Rows not named are left as they are. Saves through the model (signals run).
+    """
+    from ..auth.signals import ensure_rulesets
+    from ..models import MCPRuleSet
+
+    ensure_rulesets(group)
+    rows = {row.name: row for row in MCPRuleSet.objects.filter(group=group)}
+    for role in roles:
+        if role == "all":
+            for row in rows.values():
+                for flag in MCPRuleSet.RULE_OPTIONS:
+                    setattr(row, flag, True)
+            continue
+        name, _, permission = role.partition(".")
+        setattr(rows[name], f"can_{permission or 'view'}", True)
+    for row in rows.values():
+        row.save()
+
+
 def make_token_pair(
     application, user, *, expired: bool = False, refresh: bool = True, scope="g:read"
 ):
@@ -90,14 +113,23 @@ def make_token_pair(
 
 
 class OAuthFacadeTestMixin:
-    """Activates the plugin with OAUTH_ENABLED on; restores DOT's settings afterwards."""
+    """Activates the plugin with OAUTH_ENABLED on; restores DOT's settings afterwards.
+
+    The test user's group gets every MCP role (``mcp_roles``, "all" by
+    default), so the façade tests see every advertised scope as before the MCP
+    permission set; tests of the permission set narrow it with grant_mcp().
+    """
+
+    mcp_roles: tuple[str, ...] = ("all",)
 
     @classmethod
     def setUpTestData(cls):
-        """Load and activate the plugin, as test_mcp.py does."""
+        """Load and activate the plugin, as test_mcp.py does; grant the MCP roles."""
         super().setUpTestData()
         registry.reload_plugins(full_reload=True, collect=True)
         registry.set_plugin_state("inventree-mcp", True)
+        if getattr(cls, "group", None) is not None:
+            grant_mcp(cls.group, *cls.mcp_roles)
 
     @classmethod
     def tearDownClass(cls):

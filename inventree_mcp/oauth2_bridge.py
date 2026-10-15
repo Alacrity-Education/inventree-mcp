@@ -40,13 +40,24 @@ API too, not just MCP:
 
        AttributeError: 'super' object has no attribute 'has_permission'
 
-scoped_view_class() below works around both: it pre-computes the same
+3. For a table that belongs to several roles (part_part is in both the
+   "part" and the "build" ruleset, stock_stockitem in "stock" and "build"),
+   map_scope() requires *all* of their scopes together ([["r:view:part",
+   "r:view:build"]]), while the role check for the same request
+   (users.permissions.check_user_permission) accepts *any* of the roles. So a
+   token scoped to exactly what the "part" role grants could not list parts,
+   and an MCP role grid ticked "Parts: view" would grant nothing on parts.
+
+scoped_view_class() below works around all three: it pre-computes the same
 required_alternate_scopes value InvenTree's own dynamic logic would produce
-and attaches it as a static attribute (fixes 1), and swaps
-InvenTreeTokenMatchesOASRequirements for a corrected subclass that skips the
-broken super() fallback (fixes 2). Everything else in the view's normal
-permission stack (IsAuthenticated, ModelPermission, RolePermission) is left
-untouched. Remove this workaround if/when the core bugs are fixed.
+and attaches it as a static attribute (fixes 1), with each multi-role
+alternative split into one alternative per role scope, the OR the role check
+applies (fixes 3), and swaps InvenTreeTokenMatchesOASRequirements for a
+corrected subclass that skips the broken super() fallback (fixes 2).
+Everything else in the view's normal permission stack (IsAuthenticated,
+ModelPermission, RolePermission) is left untouched, so the user's
+interactive roles still apply on top of the scopes. Remove this workaround
+if/when the core bugs are fixed.
 """
 
 from __future__ import annotations
@@ -95,6 +106,27 @@ def _fixed_permission_classes(view_cls: type) -> list[type]:
     ]
 
 
+def _any_role_alternatives(required: dict) -> dict:
+    """Split every alternative of role scopes into one alternative per scope (bug 3).
+
+    {"GET": [["r:view:part", "r:view:build"]]} becomes
+    {"GET": [["r:view:part"], ["r:view:build"]]}: any one role's scope
+    suffices, as any one role suffices for core's role check. Alternatives
+    that are not all role scopes ("g:read", "a:staff") stay as they are.
+    """
+    split: dict = {}
+    for method, alternatives in required.items():
+        result: list[list[str]] = []
+        for alternative in alternatives:
+            scopes = list(alternative)
+            if len(scopes) > 1 and all(s.startswith("r:") for s in scopes):
+                result += [[scope] for scope in scopes if [scope] not in result]
+            elif scopes not in result:
+                result.append(scopes)
+        split[method] = result
+    return split
+
+
 def scoped_view_class(view_cls: type) -> type:
     """Return a subclass of view_cls with the OAuth2 scope-check workarounds applied.
 
@@ -103,8 +135,8 @@ def scoped_view_class(view_cls: type) -> type:
     being cleanly denied when the scope doesn't match (bug 2) - see the
     module docstring.
     """
-    required_alternate_scopes = _scope_resolver.get_required_alternate_scopes(
-        None, view_cls()
+    required_alternate_scopes = _any_role_alternatives(
+        _scope_resolver.get_required_alternate_scopes(None, view_cls())
     )
     return type(
         f"_ScopeWorkaround_{view_cls.__name__}",

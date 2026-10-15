@@ -71,7 +71,8 @@ API token for curl: `curl -s -u admin:admin http://localhost:8080/api/user/token
 | `Caddyfile` | proxy: static and media, everything else to gunicorn |
 | `authentik/bootstrap.py` | get-or-create groups, users, scope mapping, provider, application, bindings; subcommands `set-groups`, `groups`, helpers `api_from_env`, `set_user_groups` |
 | `authentik/sso_smoke.py` | scripted SSO login round trip; importable: `sso_login(username)`, `browse(..., stop=...)`, `Browser` |
-| `configure_inventree.py` | global settings, groups `Users` and `MCP Users` (run by `up.sh`) |
+| `configure_inventree.py` | global settings, groups `Users` and `MCP Users` (MCP roles: view on every role; admin is a member) (run by `up.sh`) |
+| `oauth_smoke.py`, `membership_e2e.py`, `permissions_e2e.py` | live checks: OAuth façade, membership re-checks, MCP permission set |
 | `data/` | InvenTree data dir (config, static, media, secret key), git-ignored |
 
 Why an entrypoint wrapper: the image's `init.sh` only prepares directories and `config.yaml`; it never runs

@@ -1,7 +1,8 @@
 """Background tasks of the auth package.
 
 Scheduled through ScheduleMixin in core.py: cleanup_stale_clients (daily),
-membership_sweep (hourly). Queued on demand by mcp_transport.py: recheck_user.
+membership_sweep (hourly). Queued on demand: recheck_user (mcp_transport.py),
+revoke_mcp_tokens (signals.revoke_users, for groups above REVOKE_SYNC_LIMIT members).
 """
 
 from __future__ import annotations
@@ -90,6 +91,24 @@ def recheck_user(user_id: int) -> str:
     if user is None:
         return "missing"
     return membership.recheck(user).value
+
+
+def revoke_mcp_tokens(user_ids: list[int]) -> int:
+    """Revoke the MCP tokens of *user_ids* (an MCP permission reduction); returns the token count."""
+    from django.contrib.auth import get_user_model
+
+    from .membership import revoke_all_mcp_tokens
+
+    count = sum(
+        revoke_all_mcp_tokens(user)
+        for user in get_user_model().objects.filter(pk__in=user_ids)
+    )
+    logger.info(
+        "inventree-mcp: revoked %s MCP tokens of %s users (MCP permissions reduced)",
+        count,
+        len(user_ids),
+    )
+    return count
 
 
 def membership_sweep(user_ids: list[int] | None = None) -> dict[str, int]:

@@ -37,8 +37,13 @@ from users.models import ApiToken
 
 from ..auth import membership, policy, tasks
 from ..auth.membership import Outcome
-from ..models import MCPUserState
-from .oauth_helpers import OAuthFacadeTestMixin, make_token_pair, pkce_pair
+from ..models import MCPRuleSet, MCPUserState
+from .oauth_helpers import (
+    OAuthFacadeTestMixin,
+    grant_mcp,
+    make_token_pair,
+    pkce_pair,
+)
 
 User = get_user_model()
 
@@ -213,6 +218,8 @@ class MembershipTestCase(OAuthFacadeTestMixin, InvenTreeTestCase):
             token_secret="upstream-rt-0",
         )
         self.assertTrue(self.user.groups.filter(name="MCP Users").exists())
+        # The sync removes the test group: the MCP roles come with "MCP Users".
+        grant_mcp(Group.objects.get(name="MCP Users"), "all")
 
         self.idp = FakeIdP()
         idp = self.idp
@@ -490,6 +497,22 @@ class NoMcpPermissionTest(MembershipTestCase):
             self.set_checked(hours_ago=2)
             self.assertEqual(tasks.membership_sweep(), {"no_mcp_permission": 1})
 
+    def test_real_ruleset_without_flags_is_an_authorisation_refusal(self):
+        """WP3: no MCP ruleset at all, unpatched: the re-check revokes and never blocks."""
+        tokens = self._tokens()
+        # update() sends no signal: the re-check itself must notice.
+        MCPRuleSet.objects.filter(group__name="MCP Users").update(
+            can_view=False, can_add=False, can_change=False, can_delete=False
+        )
+        self.set_checked(hours_ago=2)
+
+        self.assertEqual(membership.recheck(self.user), Outcome.NO_MCP_PERMISSION)
+        self.assertFalse(membership.is_blocked(self.user))
+        self.assertIsNotNone(self.upstream_token())
+        response = self.refresh(self.client_id, tokens["refresh_token"])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_grant")
+
 
 class UnreachableTest(MembershipTestCase):
     """Test 4: provider unreachable or unverifiable: grace, then refusal without revocation."""
@@ -691,6 +714,11 @@ class DueAndEnforcementTest(MembershipTestCase):
         self.set_setting("MCP_REQUIRED_GROUPS", "")
         self.user.groups.clear()
         self.assertTrue(policy.in_required_groups(self.user))
+        # No group, so no MCP roles either (WP3): refused for that reason now.
+        self.assertEqual(policy.may_connect(self.user), (False, "no_mcp_permission"))
+        any_group = Group.objects.create(name="Any")
+        grant_mcp(any_group, "part.view")
+        self.user.groups.add(any_group)
         self.assertEqual(policy.may_connect(self.user), (True, ""))
 
     def test_required_groups_apply_with_enforcement_off(self):
@@ -850,7 +878,8 @@ class TransportTest(MembershipTestCase):
         # A re-check is still queued: it lets the credential in again.
         offload.assert_called_once()
 
-        # Basic is a long-lived credential too.
+        # Basic is a long-lived credential too (accepted with MCP_ALLOW_BASIC_AUTH).
+        self.set_setting("MCP_ALLOW_BASIC_AUTH", True)
         self.user.set_password("pw-123")
         self.user.save()
         basic = base64.b64encode(f"{self.user.username}:pw-123".encode()).decode()

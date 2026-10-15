@@ -16,7 +16,11 @@ from urllib.parse import urlencode, urlparse
 
 from django.test import Client, override_settings
 from InvenTree.unit_test import InvenTreeTestCase
+from part.models import Part, PartCategory
+from users.models import ApiToken
 
+from ..auth import policy
+from ..test_mcp import _raw_api_token
 from .oauth_helpers import (
     MCP_URL,
     OAuthFacadeTestMixin,
@@ -180,3 +184,79 @@ class OAuthFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         )
         self.assertEqual(response.status_code, 400, response.content)
         self.assertEqual(response.json()["error"], "invalid_grant")
+
+
+@override_settings(PLUGIN_TESTING_SETUP=True)
+class PermissionSetFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
+    """WP3 test 3: MCP access = interactive roles ∩ MCP roles, through the whole façade.
+
+    Interactive: part view+change, stock view. MCP: part view only.
+    """
+
+    roles: ClassVar[list[str]] = ["part.view", "part.change", "stock.view"]
+    mcp_roles: ClassVar[tuple[str, ...]] = ("part.view",)
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        cls.part = Part.objects.create(
+            name="WP3 flow part",
+            description="x",
+            category=PartCategory.objects.create(name="WP3 flow"),
+        )
+
+    def call_tool(self, access_token: str, name: str) -> dict:
+        response = Client().post(
+            MCP_URL,
+            data=json.dumps({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            }),
+            content_type="application/json",
+            HTTP_ACCEPT="application/json, text/event-stream",
+            HTTP_AUTHORIZATION=f"Bearer {access_token}",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()["result"]
+
+    def test_mcp_roles_narrow_the_token_not_the_interactive_api(self):
+        browser = Client()
+        browser.force_login(self.user)
+        client_id = self.register_public_client()
+
+        # The client asks for everything advertised; the code carries part view.
+        code, verifier = self.obtain_code(
+            browser, client_id, scope=" ".join(policy.mcp_scopes_available())
+        )
+        response = self.exchange_code(client_id, code, verifier)
+        self.assertEqual(response.status_code, 200, response.content)
+        tokens = response.json()
+        self.assertEqual(tokens["scope"], "g:read r:view:part")
+
+        response = self.mcp_call(tokens["access_token"])
+        self.assertEqual(response.status_code, 200, response.content)
+        names = {tool["name"] for tool in response.json()["result"]["tools"]}
+        self.assertIn("list_parts", names)
+        self.assertIn("get_part", names)
+        self.assertNotIn("list_stock_items", names)
+        self.assertNotIn("get_stock_item", names)
+
+        result = self.call_tool(tokens["access_token"], "list_parts")
+        self.assertFalse(result.get("isError"), result)
+        result = self.call_tool(tokens["access_token"], "list_stock_items")
+        self.assertTrue(result["isError"])
+        self.assertIn("permission", result["content"][0]["text"])
+
+        # The interactive API with the same user's API token: roles untouched.
+        api_token = _raw_api_token(ApiToken.objects.create(user=self.user, name="wp3"))
+        response = Client().patch(
+            f"/api/part/{self.part.pk}/",
+            data={"description": "changed interactively"},
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Token {api_token}",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        response = Client().get("/api/stock/", HTTP_AUTHORIZATION=f"Token {api_token}")
+        self.assertEqual(response.status_code, 200)

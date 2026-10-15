@@ -32,16 +32,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from asgiref.sync import async_to_sync
 from django.core.cache import cache
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.urls import path
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from InvenTree.permissions import auth_exempt
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from oauth2_provider.contrib.rest_framework.authentication import OAuth2Authentication
+from oauth2_provider.models import get_access_token_model
 from rest_framework import exceptions
 from rest_framework.authentication import BasicAuthentication
 from rest_framework.views import APIView
@@ -61,6 +64,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger("inventree")
 
 _REQUEST_TIMEOUT_SECONDS = 60.0
+
+#: Lifetime of the synthetic scoped token of an API-token / Basic request. It is
+#: never saved and lives only for the one request; the value only has to
+#: outlast it (DOT's is_expired() is part of the scope check).
+_SCOPED_TOKEN_LIFETIME = timedelta(days=1)
 
 # Hop-by-hop headers (RFC 7230 6.1) that must never be forwarded from the
 # ASGI response onto the Django HttpResponse - WSGI servers (e.g. the stdlib
@@ -240,6 +248,20 @@ def _queue_membership_recheck(user) -> None:
         )
 
 
+def scoped_token_for(user):
+    """An unsaved DOT AccessToken carrying *user*'s MCP scopes (policy.narrow(None, user)).
+
+    Bound as the identity's oauth2_token for API-token and Basic requests, so
+    proxied views enforce the MCP rulesets exactly as for an OAuth token.
+    Never saved: no token value, no application, nothing to revoke or leak.
+    """
+    return get_access_token_model()(
+        user=user,
+        scope=" ".join(policy.narrow(None, user)),
+        expires=timezone.now() + _SCOPED_TOKEN_LIFETIME,
+    )
+
+
 class MCPView(APIView):
     """DRF view handling MCP Streamable HTTP transport requests.
 
@@ -256,6 +278,15 @@ class MCPView(APIView):
         ExtendedOAuth2Authentication,
     ]
     permission_classes: ClassVar[list] = []
+
+    def get_authenticators(self):
+        """The authenticators above; BasicAuthentication only with MCP_ALLOW_BASIC_AUTH."""
+        allow_basic = get_plugin_setting("MCP_ALLOW_BASIC_AUTH", False)
+        return [
+            auth()
+            for auth in self.authentication_classes
+            if allow_basic or auth is not BasicAuthentication
+        ]
 
     def dispatch(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
         # Force Django to cache the raw body now, before initialize_request()
@@ -311,7 +342,16 @@ class MCPView(APIView):
                     )
                     return _long_lived_refusal(why)
 
-        token = set_current_user(user, drf_request.auth if is_oauth2 else None)
+        oauth2_token = None
+        if is_oauth2:
+            oauth2_token = drf_request.auth
+        elif user is not None and user.is_authenticated:
+            # API token / Basic: narrowed like an OAuth token (module docstring).
+            oauth2_token = scoped_token_for(user)
+            if not oauth2_token.scope:
+                return _error_response(403, "No MCP permission")
+
+        token = set_current_user(user, oauth2_token)
         try:
             # async_to_sync (rather than a hand-rolled event loop) is what lets
             # proxy.call_view()'s sync_to_async(thread_sensitive=True) route

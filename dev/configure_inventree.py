@@ -3,7 +3,8 @@
     python src/backend/InvenTree/manage.py shell < dev/configure_inventree.py   (see up.sh)
 
 Sets global settings for plugins and SSO, makes sure the dev admin account works, and creates the groups
-"Users" (view on every role) and "MCP Users" (no roles yet; the MCP ruleset arrives with WP3).
+"Users" (view on every role) and "MCP Users" (no interactive roles; MCP roles: view on every role, once the
+plugin's tables exist). admin is put into "MCP Users" so the password-mode smoke test has MCP roles too.
 """
 
 import json
@@ -72,6 +73,19 @@ rows = RuleSet.objects.filter(group=users_group).update(
 )
 print(f'group Users: {rows} rulesets view-only')
 print(f'group MCP Users: {mcp_group.rule_sets.filter(can_view=True).count()} rulesets with view (expect 0)')
+admin.groups.add(mcp_group)
+
+# The plugin's second permission set (WP3): MCP Users may view everything through MCP (their interactive roles,
+# from "Users", still apply). Skipped while the plugin's app or migration is not there yet (first up.sh run).
+try:
+    from inventree_mcp.auth.signals import ensure_rulesets
+    from inventree_mcp.models import MCPRuleSet
+
+    ensure_rulesets(mcp_group)
+    MCPRuleSet.objects.filter(group=mcp_group).update(can_view=True)
+    print(f'group MCP Users: {MCPRuleSet.objects.filter(group=mcp_group, can_view=True).count()} MCP rulesets with view')
+except Exception as exc:  # noqa: BLE001 - dev convenience only
+    print(f'group MCP Users: MCP rulesets not set ({type(exc).__name__}); re-run up.sh after the plugin migrated')
 print('configure_inventree: done')
 # up.sh restarts the server when this line is present: gunicorn workers that started before ENABLE_PLUGINS_URL was
 # switched on never serve plugin URLs (intermittent 403/404 on /plugin/...) until they are restarted.

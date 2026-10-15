@@ -46,6 +46,9 @@ With **Enable OAuth Sign-in** turned on (see [Connect with OAuth](#connect-with-
 such as Claude connect by signing in through the browser and need no token at all. Otherwise,
 create an InvenTree API token for your MCP client and configure it as below.
 
+Either way, a user reaches MCP only through the **MCP roles** of their groups, which start empty:
+grant them first (see [Two permission sets](#two-permission-sets)).
+
 ### 3. Configure your MCP client
 
 The endpoint is `<your-inventree-server>/plugin/inventree-mcp/mcp/`, using Streamable HTTP
@@ -133,7 +136,7 @@ granted (read-only scopes while **Read Only** is on).
   `https://claude.com` (browser preflights to `/plugin/` are answered by InvenTree's CORS middleware).
 - Plugin settings: **Enable OAuth Sign-in** (`OAUTH_ENABLED`) on; URL integration, schedule
   integration and app integration (`ENABLE_PLUGINS_APP`, needed for the plugin's `MCPUserState`
-  model; run `invoke migrate` after installing or upgrading) enabled for plugins. With
+  and `MCPRuleSet` models; run `invoke migrate` after installing or upgrading) enabled for plugins. With
   `MEMBERSHIP_ENFORCED` on and app integration off, the plugin logs a warning at start-up: re-checks
   and blocks are then disabled. While the migration is missing, reads of the MCP user state fail
   safe (logged once) instead of failing requests.
@@ -162,7 +165,7 @@ on by default):
 |---|---|---|
 | SSO login | every login through the MCP sign-in provider | InvenTree's group sync runs as usual; the plugin records the check and the login. It lifts a block only when the user is active and in `MCP_REQUIRED_GROUPS`; otherwise the block stays. |
 | Token refresh | when the last check is older than `MEMBERSHIP_RECHECK_INTERVAL_MINUTES` (60) | Synchronous re-check before the token is rotated. A refusal is `invalid_grant`, which makes Claude ask the user to sign in again. |
-| MCP request | every request, any credential | Blocked users get `401` with the OAuth challenge. Users who are inactive or outside `MCP_REQUIRED_GROUPS` get `403` "No MCP permission". OAuth access tokens need nothing more (they live an hour and are re-checked at refresh). Requests with an InvenTree API token or Basic auth queue a background re-check when the last one is stale (the request never waits), and follow the refresh grant's windows: they get `401` (challenge `Bearer realm="InvenTree"` only) when the last re-check found the provider unreachable and the last successful check is older than `MEMBERSHIP_GRACE_HOURS`, or when there is no upstream refresh token and the last login is older than `RELOGIN_INTERVAL_HOURS`. InvenTree's own `/api/` is never affected. |
+| MCP request | every request, any credential | Blocked users get `401` with the OAuth challenge. Users who are inactive, outside `MCP_REQUIRED_GROUPS` or without any MCP role get `403` "No MCP permission". OAuth access tokens need nothing more (they live an hour and are re-checked at refresh). Requests with an InvenTree API token or Basic auth queue a background re-check when the last one is stale (the request never waits), and follow the refresh grant's windows: they get `401` (challenge `Bearer realm="InvenTree"` only) when the last re-check found the provider unreachable and the last successful check is older than `MEMBERSHIP_GRACE_HOURS`, or when there is no upstream refresh token and the last login is older than `RELOGIN_INTERVAL_HOURS`. InvenTree's own `/api/` is never affected. |
 | Hourly sweep | users holding a live MCP refresh token or API token | Background re-check of everyone who is due, see below for its time budget. |
 
 The re-check redeems the user's upstream refresh token, which allauth stored at the login
@@ -269,6 +272,76 @@ It is not a full OpenID Connect discovery document (no `jwks_uri`, `subject_type
 `id_token_signing_alg_values_supported`; the plugin issues no ID tokens), so a strict OpenID
 Connect client rejects it. MCP clients only read the OAuth fields.
 
+## Two permission sets
+
+Every InvenTree group has two sets of roles with the same shape (one row per role: *view*, *add*,
+*change*, *delete*):
+
+- its **interactive roles** (core's group roles, used by the web UI and `/api/`), unchanged;
+- its **MCP roles** (the plugin's `MCPRuleSet`), what members may do *through MCP*.
+
+**MCP access = interactive roles ∩ MCP roles.** The MCP roles of a user's groups (their union)
+become OAuth2 scopes on the user's MCP tokens; InvenTree core then checks the user's interactive
+roles *and* the token's scopes on every proxied call, as for any OAuth2 request. The plugin
+re-implements no permission check, and the MCP roles never grant more than the interactive roles.
+
+- New groups get MCP roles with every flag off (so do existing groups when the plugin's migration
+  runs): **after installing or upgrading, nobody can use MCP until an administrator grants MCP
+  roles** ("Copy from roles" copies a group's interactive roles).
+- A user whose groups grant no MCP role gets `403` "No MCP permission" on the endpoint and the *No
+  MCP access* page at sign-in. With `MCP_REQUIRED_GROUPS` set, groups outside it count for nothing.
+- InvenTree API tokens (and Basic, see `MCP_ALLOW_BASIC_AUTH`) on the MCP endpoint get exactly the
+  same narrowing as an OAuth token: the request runs under an unsaved token carrying the user's MCP
+  scopes. The same API token on `/api/` keeps the user's full interactive roles.
+- **Read Only** (`MCP_READ_ONLY`) strips the add / change / delete scopes; MCP write roles take
+  effect only once it is off.
+- Superusers pass every interactive role check; their MCP access is still their groups' MCP roles,
+  unless `MCP_SUPERUSER_FULL_ACCESS` is on.
+- A **reduction** (a flag cleared, a ruleset or group deleted) revokes the MCP tokens of every
+  member of the group at once (more than 20 members: in a background task); clients reconnect and
+  get the narrower scopes. API tokens are never revoked. An **addition** revokes nothing: it applies
+  at the next sign-in, and for API tokens at the next request. Removing a user from a group applies
+  at their next token refresh (at most the access token lifetime).
+- Without app integration (`ENABLE_PLUGINS_APP`) there are no MCP roles, so every MCP request is
+  refused (logged once).
+- A role that covers a table together with other roles (parts are in both *Parts* and *Build
+  Orders*, stock items in *Stock Items* and *Build Orders*) is reachable with any one of those
+  roles' scopes, exactly as the interactive role check accepts any one of the roles. (InvenTree
+  itself would require all of them for an OAuth token; the plugin's proxy relaxes that to match the
+  role check.)
+
+Scope mapping (core's granular scopes, `users/oauth2_scopes.py`):
+
+| MCP role flag | Scope | Notes |
+|---|---|---|
+| any flag of any role | `g:read` | added whenever the user has at least one MCP scope (metadata, `OPTIONS`, role-less tables) |
+| *view* on `<role>` | `r:view:<role>` | |
+| *add* on `<role>` | `r:add:<role>` | only while **Read Only** is off; implies *change* and *view* (as core's roles) |
+| *change* on `<role>` | `r:change:<role>` | only while **Read Only** is off; implies *view* |
+| *delete* on `<role>` | `r:delete:<role>` | only while **Read Only** is off; implies *change* and *view* |
+
+Roles: `admin`, `part_category`, `part`, `bom`, `stock_location`, `stock`, `build`,
+`purchase_order`, `sales_order`, `return_order`, `transfer_order` (core's `RULESET_CHOICES`; a role
+added by a core upgrade appears with every flag off).
+
+**API** (under `/plugin/inventree-mcp/`, InvenTree's session or API-token authentication; used by
+the plugin's admin pages):
+
+| Method and path | Who | What |
+|---|---|---|
+| `GET api/rulesets/?group=<pk>` | staff with the *admin* role's change permission | the group's MCP roles in core's `RuleSetSerializer` shape (`pk`, `name`, `label`, `group`, `can_view`, `can_add`, `can_change`, `can_delete`), sorted by label |
+| `PATCH api/rulesets/<pk>/` | same | the four flags (`name`, `group` read-only) |
+| `POST api/rulesets/copy/` `{"group": pk}` | same | MCP roles := the group's interactive roles |
+| `POST api/rulesets/clear/` `{"group": pk}` | same | every MCP flag off (revokes the members) |
+| `POST api/rulesets/revoke/` `{"group": pk}` | same | revoke the members' MCP tokens: `{"users": n, "tokens": m, "queued": bool}` |
+| `GET api/effective/<user_pk>/` | the user; staff admins for anybody | `roles` (interactive), `mcp_roles`, `effective` (both; what MCP can do), each `{role: {label, view, add, change, delete}}`, plus `scopes`, `may_connect`, `reason` |
+| `GET api/connections/[?user=<pk>]` | the user; staff admins with `?user=` | live MCP connections (façade refresh tokens): `pk`, `client_name`, `client_host`, `client_trusted`, `created`, `expires`, `access_expires`, `scopes` |
+| `DELETE api/connections/<pk>/` | the owner; staff admins | revoke the connection |
+| `GET api/status/[?user=<pk>]` | the user; staff admins with `?user=` | `oauth_enabled`, `mcp_url`, `membership` (`checked_at`, `blocked`, `reason`), `scopes`, `may_connect`, `reason` |
+
+An OAuth token needs the `a:staff` scope for the staff endpoints, so an MCP token (which never
+carries it) cannot change MCP permissions.
+
 ## Configuration
 
 Under **Settings > Plugin Settings**:
@@ -278,6 +351,10 @@ Under **Settings > Plugin Settings**:
 - **Read Only** (`MCP_READ_ONLY`, default `True`): block all write actions via MCP, regardless of
   the calling user's permissions. A plugin-wide kill switch, independent of per-user roles.
 - **Log Tool Calls** (`MCP_LOG_TOOL_CALLS`, default `False`): log every tool call for debugging.
+- **Superusers Bypass MCP Roles** (`MCP_SUPERUSER_FULL_ACCESS`, default `False`): superusers get every
+  MCP scope regardless of their groups' MCP roles ([Two permission sets](#two-permission-sets)).
+- **Allow Basic Authentication** (`MCP_ALLOW_BASIC_AUTH`, default `False`): accept username and
+  password on the MCP endpoint. Off: OAuth and InvenTree API tokens only.
 
 OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
 
@@ -309,10 +386,11 @@ at start-up and picks up changes within a few seconds of its next request or tas
 
 ## Authentication
 
-Access follows the calling user's normal InvenTree role assignments. Supported auth methods:
+Access follows the calling user's normal InvenTree role assignments, intersected with the MCP roles
+of their groups ([Two permission sets](#two-permission-sets)). Supported auth methods:
 
 - An InvenTree API token: `Authorization: Token <token>`.
-- Basic auth (username/password).
+- Basic auth (username/password), only with `MCP_ALLOW_BASIC_AUTH` on.
 - An OAuth2 bearer token: `Authorization: Bearer <token>`, from the OAuth sign-in above or any other
   InvenTree OAuth2 application. A scoped token (e.g. `r:view:part`) narrows access *below* the
   underlying user's roles - useful for issuing an agent a tightly-scoped token without creating a

@@ -20,10 +20,12 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class _Identity:
     user: AbstractUser
-    # The real oauth2_provider AccessToken, if the MCP request itself was
-    # OAuth2-authenticated - None for token/basic/session auth. Propagated so
-    # proxy.call_view() can make the proxied view see the token's *actual*
-    # granted scopes, not just the user's role permissions. See proxy.py.
+    # The oauth2_provider AccessToken whose scopes bound this request: the
+    # real token of an OAuth2-authenticated MCP request, or for API-token /
+    # Basic requests an unsaved one carrying the user's MCP scopes (see
+    # mcp_transport.scoped_token_for). None only when nobody is authenticated.
+    # Propagated so proxy.call_view() makes the proxied view see these scopes,
+    # not just the user's role permissions. See proxy.py.
     oauth2_token: Any | None = None
 
 
