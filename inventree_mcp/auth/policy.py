@@ -43,6 +43,24 @@ FLAG_PERMISSIONS = (
 )
 
 
+def is_staff_admin(user) -> bool:
+    """Active staff holding the admin role's change permission (core's role check).
+
+    The condition of every staff endpoint of the plugin's API (api.IsStaffAdmin)
+    and of the UI entries leading to them (core.py: the groups page, its
+    navigation item and the group panel).
+    """
+    from users.permissions import check_user_role
+
+    return bool(
+        user is not None
+        and user.is_authenticated
+        and user.is_active
+        and user.is_staff
+        and check_user_role(user, "admin", "change")
+    )
+
+
 def mcp_scopes_available() -> list[str]:
     """Every scope the MCP endpoint advertises, in a stable order.
 

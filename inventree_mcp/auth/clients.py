@@ -8,11 +8,8 @@ authorize/token once settings_inject enabled CIMD for the trusted hosts).
 from __future__ import annotations
 
 import logging
-import math
-import time
 from urllib.parse import urlparse
 
-from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.http import HttpRequest, JsonResponse
@@ -34,14 +31,13 @@ from oauth2_provider.views.dynamic_client_registration import (
     _validation_error_description,
 )
 
-from ..settings import get_plugin_setting, plugin_setting_list
-from . import FacadeViewMixin
+from ..settings import plugin_setting_list
+from . import FacadeViewMixin, ratelimit
 from .cors import TrustedOriginCORSMixin, trusted_origins
 
 logger = logging.getLogger("inventree")
 
 DEFAULT_CLIENT_NAME = "MCP client"
-RATE_LIMIT_WINDOW_SECONDS = 60
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
@@ -75,29 +71,6 @@ def is_loopback_redirect(uri: str) -> bool:
     return parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS
 
 
-def _rate_limited(request: HttpRequest) -> int:
-    """Count this registration; return the seconds to wait when over the limit, else 0.
-
-    Fixed one-minute windows aligned to the clock, one counter per client IP
-    in Django's cache. REMOTE_ADDR already reflects InvenTree's proxy settings.
-    """
-    limit = get_plugin_setting("REGISTER_RATE_LIMIT_PER_MINUTE", 30)
-    if limit <= 0:
-        return 0
-
-    key = f"inventree_mcp:dcr:{request.META.get('REMOTE_ADDR', 'unknown')}"
-    remaining = RATE_LIMIT_WINDOW_SECONDS - (time.time() % RATE_LIMIT_WINDOW_SECONDS)
-
-    cache.add(key, 0, timeout=math.ceil(remaining))
-    try:
-        count = cache.incr(key)
-    except ValueError:  # expired between add() and incr()
-        cache.set(key, 1, timeout=math.ceil(remaining))
-        count = 1
-
-    return math.ceil(remaining) if count > limit else 0
-
-
 class _UngatedRegistrationView(DynamicClientRegistrationView):
     def dispatch(self, request, *args, **kwargs):
         # Skip DOT's DCR_ENABLED gate: it guards DOT's own /o/register/, which
@@ -112,11 +85,9 @@ class MCPRegistrationView(
 
     def post(self, request: HttpRequest, *args, **kwargs) -> JsonResponse:
         """Register a client the way DOT does, with façade defaults (no owner, CORS origins)."""
-        retry_after = _rate_limited(request)
-        if retry_after:
-            response = JsonResponse({"error": "too_many_requests"}, status=429)
-            response["Retry-After"] = str(retry_after)
-            return response
+        wait = ratelimit.retry_after(request, "dcr", "REGISTER_RATE_LIMIT_PER_MINUTE")
+        if wait:
+            return ratelimit.too_many_requests(wait)
 
         data, error = _parse_metadata(request.body)
         if error:

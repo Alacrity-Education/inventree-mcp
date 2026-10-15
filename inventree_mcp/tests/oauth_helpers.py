@@ -138,12 +138,15 @@ class OAuthFacadeTestMixin:
         super().tearDownClass()
 
     def setUp(self):
-        """Enable the façade and reset the registration rate-limit counter."""
+        """Enable the façade and reset the rate-limit counters (registration, token)."""
         super().setUp()
         self.plugin = registry.get_plugin("inventree-mcp")
         self.set_setting("OAUTH_ENABLED", True)
         settings_inject.invalidate()  # the previous test's rollback sends no signal
-        cache.delete("inventree_mcp:dcr:127.0.0.1")
+        cache.delete_many([
+            "inventree_mcp:dcr:127.0.0.1",
+            "inventree_mcp:token:127.0.0.1",
+        ])
 
     def set_setting(self, key: str, value: Any) -> None:
         """Set one of the plugin's settings."""

@@ -27,6 +27,18 @@ logger = logging.getLogger("inventree")
 # entries would link to pages that do not exist, so they are only offered when the host supports routes.
 UI_ROUTES_SUPPORTED = hasattr(UserInterfaceMixin, "get_ui_routes")
 
+#: (message, args) already logged by _log_once() in this process.
+_logged_once: set[tuple] = set()
+
+
+def _log_once(level: int, message: str, *args) -> None:
+    """Log *message* once per process: the UI feature API calls the UI methods on every page load."""
+    key = (message, *args)
+    if key in _logged_once:
+        return
+    _logged_once.add(key)
+    logger.log(level, message, *args)
+
 
 class InvenTreeMCP(
     WellKnownMixin,
@@ -126,6 +138,12 @@ class InvenTreeMCP(
             "description": "Maximum client registrations per minute and client IP (0 disables the limit).",
             "validator": [int, MinValueValidator(0)],
             "default": 30,
+        },
+        "TOKEN_RATE_LIMIT_PER_MINUTE": {
+            "name": "Token Rate Limit",
+            "description": "Maximum authorization code exchanges per minute and client IP at the OAuth token endpoint (0 disables the limit). Refresh grants are not limited.",
+            "validator": [int, MinValueValidator(0)],
+            "default": 60,
         },
         "UNUSED_CLIENT_RETENTION_DAYS": {
             "name": "Unused Client Retention (days)",
@@ -285,7 +303,8 @@ class InvenTreeMCP(
         """
         file_name = source.partition(":")[0]
         if not (Path(__file__).parent / "static" / file_name).is_file():
-            logger.warning(
+            _log_once(
+                logging.WARNING,
                 "inventree-mcp: %s is missing, run 'npm ci && npm run build' in frontend/",
                 file_name,
             )
@@ -297,15 +316,17 @@ class InvenTreeMCP(
             return None
 
     @staticmethod
-    def _is_staff(request) -> bool:
-        user = getattr(request, "user", None)
-        return bool(user and user.is_authenticated and user.is_staff)
+    def _is_staff_admin(request) -> bool:
+        """The condition of the plugin's staff API (auth.api.IsStaffAdmin), for its UI entries."""
+        from .auth.policy import is_staff_admin
+
+        return is_staff_admin(getattr(request, "user", None))
 
     def get_ui_routes(self, request, context, **kwargs):
         """Pages: the group permission editor (staff) and the personal connections page."""
         routes = []
         groups = self._ui_source("Groups.js:renderGroupsPage")
-        if groups and self._is_staff(request):
+        if groups and self._is_staff_admin(request):
             routes.append({
                 "key": "mcp-groups-route",
                 "title": "MCP Access",
@@ -326,11 +347,12 @@ class InvenTreeMCP(
         """Navigation entries for the two pages (only where the host serves plugin routes)."""
         items = []
         if not UI_ROUTES_SUPPORTED:
-            logger.info(
-                "inventree-mcp: this InvenTree has no plugin routes, no navigation items"
+            _log_once(
+                logging.INFO,
+                "inventree-mcp: this InvenTree has no plugin routes, no navigation items",
             )
             return items
-        if self._is_staff(request):
+        if self._is_staff_admin(request):
             items.append({
                 "key": "mcp-groups",
                 "title": "MCP Access",
@@ -349,7 +371,7 @@ class InvenTreeMCP(
     def get_ui_panels(self, request, context, **kwargs):
         """The "MCP Roles" panel on a group (entry point for the core group drawer)."""
         context = context or {}
-        if context.get("target_model") != "group" or not self._is_staff(request):
+        if context.get("target_model") != "group" or not self._is_staff_admin(request):
             return []
         source = self._ui_source("Panel.js:renderMCPRolesPanel")
         if not source:

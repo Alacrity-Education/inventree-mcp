@@ -103,10 +103,14 @@ class FakeIdP:
         self.calls: list[tuple[str, str, object]] = []
         self.redeemed: list[str] = []
         self.issued = 0
+        #: Called with (method, url) before every answer (tests inspect state there).
+        self.on_call = None
 
     def __call__(self, session, method, url, **kwargs):
         """Stands in for requests.Session.request (bound: *session* is the Session)."""
         self.calls.append((method, url, kwargs.get("timeout")))
+        if self.on_call is not None:
+            self.on_call(method, url)
         if url == DISCOVERY_URL:
             return _response(
                 200,
@@ -380,6 +384,103 @@ class MemberRecheckTest(MembershipTestCase):
         with patch.object(membership, "recheck_due", return_value=True):
             self.assertEqual(membership.recheck(self.user), Outcome.NOT_DUE)
         self.assertEqual(self.idp.token_calls, 1)
+
+
+class _ProcessDied(BaseException):
+    """Stands in for the worker being killed (not an Exception: nothing catches it)."""
+
+
+class LeaseTest(MembershipTestCase):
+    """WP2 F2: the lease replaces the row lock held across the outbound calls."""
+
+    def test_rotated_token_survives_a_failure_after_the_redeem(self):
+        self.set_checked(hours_ago=2)
+        self.idp.mode = "bad_signature"  # verification raises after the redeem
+
+        self.assertEqual(membership.recheck(self.user), Outcome.UNREACHABLE)
+
+        token = SocialToken.objects.get(pk=self.upstream.pk)
+        self.assertEqual(token.token_secret, "upstream-rt-1")
+        self.assertEqual(self.state().last_recheck_error, "bad_id_token")
+        self.assertIsNone(self.state().recheck_lease_until)
+
+    def test_rotated_token_survives_a_killed_process(self):
+        """The store commits on its own: a death right after it keeps the rotated token."""
+        self.set_checked(hours_ago=2)
+        checked_before = self.state().membership_checked_at
+        store = membership._store_tokens
+
+        def store_then_die(*args, **kwargs):
+            store(*args, **kwargs)
+            raise _ProcessDied
+
+        with (
+            patch.object(membership, "_store_tokens", new=store_then_die),
+            self.assertRaises(_ProcessDied),
+        ):
+            membership.recheck(self.user)
+
+        # Every atomic block recheck() opened has been rolled back by now; the
+        # rotated upstream token was stored outside them.
+        token = SocialToken.objects.get(pk=self.upstream.pk)
+        self.assertEqual(token.token_secret, "upstream-rt-1")
+        self.assertEqual(token.token, "upstream-at-1")
+        state = self.state()
+        self.assertEqual(state.membership_checked_at, checked_before)
+        self.assertIsNone(state.recheck_lease_until)  # released in finally
+
+        # The next re-check redeems the stored (rotated) token, not the spent one.
+        self.assertEqual(membership.recheck(self.user), Outcome.MEMBER)
+        self.assertEqual(self.idp.redeemed, ["upstream-rt-0", "upstream-rt-1"])
+
+    def test_live_lease_means_in_progress_without_a_call(self):
+        self.set_checked(
+            hours_ago=2,
+            recheck_lease_until=timezone.now() + datetime.timedelta(seconds=30),
+        )
+
+        self.assertEqual(membership.recheck(self.user), Outcome.NOT_DUE)
+        self.assertEqual(membership.recheck(self.user, force=True), Outcome.NOT_DUE)
+        self.assertEqual(membership.refresh_grant_allowed(self.user), (True, ""))
+        self.assertEqual(self.idp.calls, [])
+        # The other re-check's lease is left alone.
+        self.assertIsNotNone(self.state().recheck_lease_until)
+
+    def test_expired_lease_is_taken_over(self):
+        """A lease left behind by a killed process does not stop later re-checks."""
+        self.set_checked(
+            hours_ago=2,
+            recheck_lease_until=timezone.now() - datetime.timedelta(seconds=1),
+        )
+
+        self.assertEqual(membership.recheck(self.user), Outcome.MEMBER)
+        self.assertEqual(self.idp.token_calls, 1)
+        self.assertIsNone(self.state().recheck_lease_until)
+
+    def test_no_transaction_is_open_during_the_outbound_calls(self):
+        """No row lock (no atomic block of recheck()) spans a call; a login does not wait."""
+        self.set_checked(hours_ago=2)
+        # The test case's own transactions; recheck() must not add one around a call.
+        depth = len(connection.atomic_blocks)
+        seen = []
+
+        def inspect(method, url):
+            seen.append((url, len(connection.atomic_blocks)))
+            if url == TOKEN_URL:
+                # The lease is committed state, visible outside the re-check.
+                lease = MCPUserState.objects.get(user=self.user).recheck_lease_until
+                self.assertIsNotNone(lease)
+                # A login stamps the same row while the redeem is in flight.
+                self.sso_login()
+
+        self.idp.on_call = inspect
+        self.assertEqual(membership.recheck(self.user), Outcome.MEMBER)
+
+        self.assertIn(TOKEN_URL, [url for url, _depth in seen])
+        self.assertEqual({d for _url, d in seen}, {depth}, seen)
+        state = self.state()
+        self.assertIsNotNone(state.last_login_at)
+        self.assertIsNone(state.recheck_lease_until)
 
 
 class NotMemberTest(MembershipTestCase):

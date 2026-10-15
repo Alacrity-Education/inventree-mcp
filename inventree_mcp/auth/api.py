@@ -46,7 +46,6 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 from users.oauth2_scopes import DEFAULT_STAFF
-from users.permissions import check_user_role
 from users.ruleset import RULESET_CHOICES
 from users.serializers import RuleSetSerializer, get_user_roles
 
@@ -79,15 +78,8 @@ class IsStaffAdmin(permissions.BasePermission):
     message = "Staff with the admin role's change permission required"
 
     def has_permission(self, request, view):
-        """Staff and core's check_user_role(user, "admin", "change")."""
-        user = getattr(request, "user", None)
-        return bool(
-            user is not None
-            and user.is_authenticated
-            and user.is_active
-            and user.is_staff
-            and check_user_role(user, "admin", "change")
-        )
+        """policy.is_staff_admin(): staff and core's check_user_role(user, "admin", "change")."""
+        return policy.is_staff_admin(getattr(request, "user", None))
 
 
 USER_PERMISSIONS: list[type] = [
@@ -177,7 +169,10 @@ class EffectiveSerializer(serializers.Serializer):
             "roles can be reachable without both on the same role (see note)"
         ),
     )
-    scopes = serializers.ListField(child=serializers.CharField())
+    scopes = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="The MCP scopes a connection gets now (empty when may_connect is false)",
+    )
     may_connect = serializers.BooleanField()
     reason = serializers.CharField(allow_blank=True)
     note = serializers.CharField(help_text="How to read 'effective'")
@@ -246,7 +241,10 @@ class StatusSerializer(serializers.Serializer):
     oauth_enabled = serializers.BooleanField()
     mcp_url = serializers.CharField()
     membership = MembershipStateSerializer()
-    scopes = serializers.ListField(child=serializers.CharField())
+    scopes = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="The MCP scopes a connection gets now (empty when may_connect is false)",
+    )
     may_connect = serializers.BooleanField()
     reason = serializers.CharField(allow_blank=True)
 
@@ -285,7 +283,11 @@ class MCPRuleSetList(ListAPI):
         """List, creating missing rows first (a role added by a core upgrade appears)."""
         group = self._group()
         # One SELECT and at most one bulk INSERT, for one group or all of them.
-        ensure_rulesets_for([group] if group is not None else Group.objects.all())
+        ensure_rulesets_for(
+            [group.pk]
+            if group is not None
+            else Group.objects.values_list("pk", flat=True)
+        )
         queryset = self.get_queryset()
         if group is not None:
             queryset = queryset.filter(group=group)
@@ -409,9 +411,9 @@ def effective_document(user) -> dict:
         "MCP_SUPERUSER_FULL_ACCESS", False
     )
     mcp = policy.mcp_roles(user)
-    scopes = policy.narrow(None, user)
+    # One pass for may_connect() and the scopes (empty whenever ok is False).
+    ok, reason, scopes = policy.connect_scopes(user)
     granted = set(scopes)
-    ok, reason = policy.may_connect(user)
     return {
         "user": user.pk,
         "username": user.get_username(),
@@ -532,7 +534,7 @@ class StatusView(GenericAPIView):
         """The status document."""
         user = target_user(request, self)
         state = membership._state(user) if membership.models_available() else None
-        ok, reason = policy.may_connect(user)
+        ok, reason, scopes = policy.connect_scopes(user)
         return Response(
             StatusSerializer({
                 "oauth_enabled": oauth_enabled(),
@@ -542,7 +544,7 @@ class StatusView(GenericAPIView):
                     "blocked": membership.is_blocked(user),
                     "reason": state.revoked_reason if state else "",
                 },
-                "scopes": policy.narrow(None, user),
+                "scopes": scopes,
                 "may_connect": ok,
                 "reason": reason,
             }).data

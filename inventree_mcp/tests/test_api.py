@@ -9,12 +9,13 @@ from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.test import Client
+from django.utils import timezone
 from InvenTree.unit_test import InvenTreeTestCase
 from oauth2_provider.models import RefreshToken
 from users.models import RuleSet
 from users.ruleset import RULESET_NAMES
 
-from ..models import MCPRuleSet
+from ..models import MCPRuleSet, MCPUserState
 from .oauth_helpers import OAuthFacadeTestMixin, grant_mcp, make_token_pair, url
 
 User = get_user_model()
@@ -357,3 +358,20 @@ class ConnectionsAndStatusApiTest(ApiTestCase):
         self.assertEqual(response.status_code, 403)
         response = self.client.get(url("api-status"), {"user": self.plain.pk})
         self.assertEqual(response.status_code, 200)
+
+    def test_blocked_user_has_no_scopes(self):
+        """Status and effective agree with the MCP endpoint (policy.connect_scopes())."""
+        MCPUserState.objects.create(
+            user=self.plain, access_revoked_at=timezone.now(), revoked_reason="x"
+        )
+        status = self.plain_client.get(url("api-status")).json()
+        effective = self.plain_client.get(
+            url("api-effective", user_pk=self.plain.pk)
+        ).json()
+        for doc in (status, effective):
+            self.assertFalse(doc["may_connect"])
+            self.assertEqual(doc["reason"], "blocked")
+            self.assertEqual(doc["scopes"], [])
+        self.assertTrue(status["membership"]["blocked"])
+        self.assertFalse(effective["effective"]["part"]["view"])
+        self.assertTrue(effective["mcp_roles"]["part"]["view"])  # the roles stay

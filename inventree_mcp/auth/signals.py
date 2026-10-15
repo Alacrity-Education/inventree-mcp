@@ -112,16 +112,20 @@ def on_user_logged_in(sender, request=None, user=None, sociallogin=None, **kwarg
 
 def ensure_rulesets(group) -> int:
     """Create the missing MCPRuleSet rows (all flags false) of *group*; returns how many."""
-    return ensure_rulesets_for([group])
+    return ensure_rulesets_for([group.pk])
 
 
-def ensure_rulesets_for(groups) -> int:
-    """ensure_rulesets() for several groups: one SELECT, at most one bulk INSERT."""
+def ensure_rulesets_for(group_ids) -> int:
+    """ensure_rulesets() for several groups, by pk: one SELECT, at most one bulk INSERT.
+
+    *group_ids* is any iterable of group pks (e.g. a ``values_list("pk",
+    flat=True)`` queryset, so no Group rows are loaded).
+    """
     from users.ruleset import RULESET_NAMES
 
     from ..models import MCPRuleSet
 
-    group_ids = [group.pk for group in groups]
+    group_ids = list(group_ids)
     if not group_ids:
         return 0
     existing = set(

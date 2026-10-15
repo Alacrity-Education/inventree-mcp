@@ -65,9 +65,16 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   view's real `output_options`.
 - `core.py` - the `InvenTreePlugin` subclass: settings (incl. the OAuth ones), URL wiring (the
   OAuth façade only when `auth.facade_supported()`), well-known entries, scheduled tasks; injects
-  DOT settings at load.
-- `models.py`, `migrations/` - plugin models: `MCPUserState` (per-user membership check stamp and
-  MCP block), `MCPRuleSet` (WP3: the MCP roles, core's `RuleSet` shape, one row per group and role;
+  DOT settings at load. UI (`UserInterfaceMixin`): `get_ui_routes()` (pages `groups` and
+  `connections`), `get_ui_navigation_items()` (only when `UI_ROUTES_SUPPORTED`, i.e. the host has
+  plugin routes, InvenTree 1.6+), `get_ui_panels()` (the "MCP Roles" panel for
+  `target_model == "group"`). The groups page, its nav item and the panel are offered only to
+  `_is_staff_admin()` (`policy.is_staff_admin()`, the condition of the plugin's staff API);
+  `_ui_source()` returns None when a bundle is missing from `static/`. Both the missing-build
+  WARNING and the "no plugin routes" INFO go through `_log_once()` (once per process: the web UI
+  asks for UI features on every page load).
+- `models.py`, `migrations/` - plugin models: `MCPUserState` (per-user membership check stamp,
+  MCP block and the re-check lease `recheck_lease_until`, `0003`), `MCPRuleSet` (WP3: the MCP roles, core's `RuleSet` shape, one row per group and role;
   `0002` also creates the rows of existing groups). Never filter core models through the plugin's
   reverse relations (`Group.objects.filter(mcp_rule_sets__…)`, `User.objects.filter(mcp_state__…)`):
   they raise `FieldError` in running processes; query `MCPRuleSet.objects.filter(group__in=…)` /
@@ -75,6 +82,12 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   inventree_mcp` (fixes file ownership); `migrations/` is excluded from ruff.
 - `templates/inventree_mcp/` - server-rendered OAuth pages: `base.html`, `consent.html`,
   `login_bridge.html`, `error.html`.
+- `static/` - **generated** by the frontend build (`frontend/`), git-ignored
+  (`inventree_mcp/.gitignore`); never edit it by hand. Shipped in the wheel.
+- `frontend/` - React + Mantine sources of the plugin pages and the group panel (see "Frontend"
+  below and `frontend/README.md`): `src/Groups.tsx`, `src/Connections.tsx`, `src/Panel.tsx`
+  (entry points), shared code in `src/lib/` (`api.ts`, `RoleGrid.tsx`, `McpRolesEditor.tsx`,
+  hooks, vitest files), `scripts/check-bundles.mjs`.
 - `auth/__init__.py` - `facade_supported()` (DOT >= 3.4 feature detection), `oauth_enabled()`,
   `FacadeViewMixin` (`settings_inject.ensure_applied()`, then 404 while `OAUTH_ENABLED` is off),
   the one-time warning when InvenTree 1.5.x needs the proxy rewrites.
@@ -97,7 +110,11 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   façade view and challenge; desired values memoised for a few seconds, dropped on `PluginSetting`
   saves.
 - `auth/cors.py` - `trusted_origins()`, `TrustedOriginCORSMixin` for register/token/revoke.
-- `auth/clients.py` - `MCPRegistrationView` (DOT's DCR helpers + rate limit),
+- `auth/ratelimit.py` - the one fixed-window limiter per client IP (`retry_after()`,
+  `too_many_requests()`: 429 with `Retry-After`), used by registration
+  (`REGISTER_RATE_LIMIT_PER_MINUTE`) and the token endpoint's authorization_code grant
+  (`TOKEN_RATE_LIMIT_PER_MINUTE`). Do not add a second limiter.
+- `auth/clients.py` - `MCPRegistrationView` (DOT's DCR helpers + `ratelimit`),
   `is_trusted_client()`, `is_loopback_redirect()`, `mcp_applications()`.
 - `auth/authorize.py` - `MCPAuthorizationView` (DOT `AuthorizationView` + policy, consent skip,
   error page), `render_error()`.
@@ -105,14 +122,17 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   URL.
 - `auth/sso.py` - `sso_app()`, `sso_provider_id()`: the allauth app used for MCP sign-in and the
   membership re-check (`SSO_PROVIDER_ID` or the single `openid_connect` app).
-- `auth/token.py` - `MCPTokenView` (dead refresh tokens sorted out first, then the membership gate,
-  then scope re-narrowing, all before DOT), `MCPRevokeView`.
+- `auth/token.py` - `MCPTokenView` (authorization_code grants rate limited per IP; dead refresh
+  tokens sorted out first, then the membership gate, then scope re-narrowing, all before DOT;
+  refresh grants are not rate limited), `MCPRevokeView`.
 - `auth/policy.py` - `mcp_scopes_available()`, `effective_scopes()` (union of the groups' MCP
   rulesets as core's granular scopes, cut to the advertised ones so `MCP_READ_ONLY` strips writes,
   plus `g:read`; empty outside `MCP_REQUIRED_GROUPS`; everything for superusers with
   `MCP_SUPERUSER_FULL_ACCESS`), `may_connect()` (inactive, blocked, `in_required_groups()`, then
   `no_mcp_permission` when no scope is left), `connect_scopes()` (may_connect plus the scopes in one
-  pass, for the transport), `narrow()`, `mcp_roles()`.
+  pass, for the transport and the status / effective API), `narrow()`, `mcp_roles()`,
+  `is_staff_admin()` (staff + the admin role's change permission; `api.IsStaffAdmin` and the UI
+  gating in `core.py`).
 - `auth/membership.py` - membership re-check against the SSO provider: `recheck()`,
   `refresh_grant_allowed()`, `token_grant_allowed()`, `recheck_due()`, `is_blocked()`,
   `block_user()`, `unblock_user()`, `revoke_all_mcp_tokens()`, `mcp_token_querysets()` (the live
@@ -124,11 +144,17 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   tokens (`Outcome.NO_MCP_PERMISSION`). The grace and re-login predicates (`within_grace()`,
   `within_relogin()`) are shared by `refresh_grant_allowed()` and `long_lived_credential_allowed()`.
   Every outbound call has a 5 s timeout, a provider is left alone for 60 s after a timeout /
-  connection error / 5xx; re-checks are serialised by a row lock on `MCPUserState`.
+  connection error / 5xx. Re-checks are serialised by a lease, not by a lock held across the
+  network: a short `select_for_update` transaction takes `MCPUserState.recheck_lease_until`
+  (60 s) and commits; discovery, redeem, `_store_tokens()` (the rotated upstream token is durable
+  at once), verification and userinfo run in autocommit; a second short transaction does the group
+  sync, the classification, the stamp and the block / revocation; the lease is released in
+  `finally`. A re-check finding a live lease returns `NOT_DUE` without calling out. Never move an
+  outbound call back inside a transaction.
 - `auth/signals.py` - allauth `user_logged_in`: SSO logins stamp `membership_checked_at` and lift a
   block only when the user is active and in `MCP_REQUIRED_GROUPS`, other logins record
-  `last_login_at`. MCP rulesets: `ensure_rulesets()` / `ensure_rulesets_for()` (Group `post_save` and the API; one
-  SELECT and one bulk INSERT for any number of groups), revocation of
+  `last_login_at`. MCP rulesets: `ensure_rulesets()` / `ensure_rulesets_for(group_ids)` (Group
+  `post_save` and the API; takes pks; one SELECT and one bulk INSERT for any number of groups), revocation of
   the group's members on a reduction (flag true -> false, row or group deleted) through
   `membership.revoke_all_mcp_tokens()` only (never a block) through `tasks.revoke_mcp_tokens`
   (inline up to 20 members, a background task above). All connected from the plugin's `__init__`.
@@ -137,8 +163,13 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
 - `tests/` - OAuth façade tests (`test_auth_*.py`, `test_settings_inject.py`, shared
   `oauth_helpers.py` with `grant_mcp()`; the façade mixin grants the test group every MCP role
   unless a class sets `mcp_roles`), membership re-checks (`test_membership.py`, a fake OIDC provider
-  at the `requests` boundary), the MCP permission set (`test_policy.py`, `test_api.py`);
+  at the `requests` boundary), the MCP permission set (`test_policy.py`, `test_api.py`), the UI
+  features (`test_ui.py`: routes, navigation and panel per user kind incl. staff without the admin
+  role, the once-per-process logging, the UI feature API; needs the built bundles);
   `test_mcp.py` holds the original suite.
+- `dev/ui_smoke.py` - live browser check of the plugin pages (playwright) against the dev stack,
+  on a scratch group; needs a host with plugin routes (InvenTree 1.6+ / `latest`), exits 3 on
+  1.5.x.
 - `server_card.py` - serves an MCP Server Card (SEP-2127) at `plugin/inventree-mcp/server-card/`
   for discovery, advertised under `/.well-known/` via `core.py`'s `get_well_known_urls()`.
 - `_well_known_compat.py` - `WellKnownMixin` import, falling back to a blank mixin on InvenTree
@@ -156,6 +187,7 @@ dev/test.sh inventree_mcp.test_mcp          # the original suite
 dev/oauth_smoke.py                          # live OAuth flow against http://localhost:8080
 dev/membership_e2e.py                       # live membership re-checks against the dev Authentik
 dev/permissions_e2e.py                      # live MCP permission set (parts-only MCP role) as e2e-member
+dev/ui_smoke.py                             # live plugin pages in a headless browser (1.6+ host)
 ```
 
 Inside the InvenTree devcontainer instead:
@@ -173,8 +205,33 @@ pip install -e dev/InvenTreeMCP --no-deps
 invoke dev.test -r inventree_mcp.test_mcp.MCPToolPermissionTest
 ```
 
-CI (`.github/workflows/ci.yaml`) runs `ruff check` + a build check, then a matrix job against the
-real `inventree/inventree:stable` and `:latest` Docker images with Postgres.
+CI (`.github/workflows/ci.yaml`) runs ruff, the frontend job (`npm ci`, lint, vitest, build,
+`check:bundles`) and `python -m build` with a wheel check (templates and bundles inside), then a
+matrix job against the real `inventree/inventree:stable` and `:latest` Docker images with
+Postgres.
+
+## Frontend
+
+The plugin pages ("MCP Access" for staff admins, "MCP" for everybody) and the "MCP Roles" group
+panel are React + Mantine in `frontend/`, built with Vite against `@inventreedb/ui`:
+
+```
+cd frontend
+npm ci && npm run build      # writes ../inventree_mcp/static/ (Groups.js, Connections.js, Panel.js + chunks)
+npm run lint && npm test     # biome, vitest
+npm run check:bundles        # renders every built bundle with stub host globals
+```
+
+- `inventree_mcp/static/` is generated and git-ignored. Never edit it by hand; rebuild. Build it
+  before `python -m build` (the wheel must contain it) and before `dev/test.sh` (`test_ui.py`
+  checks the bundles exist). `dev/up.sh` rebuilds it when stale.
+- React, ReactDOM, Mantine and Lingui are externals provided by the host (`vite.config.ts`).
+- The backend decides visibility (`core.py`); the bundles only render. Pages and nav items need
+  plugin routes (InvenTree 1.6+); on 1.5.x only the panel API exists and `UI_ROUTES_SUPPORTED` is
+  False.
+- Lesson: the Python `.gitignore` template's `lib/` rule silently ignored `frontend/src/lib/`
+  (shared code never committed, fresh clones could not build). The rule is anchored (`/lib/`)
+  now; after adding a directory, check `git status --ignored` / `git check-ignore -v <path>`.
 
 ## Lint/format
 
@@ -183,7 +240,7 @@ ruff check --preview inventree_mcp
 ruff format --preview inventree_mcp
 ```
 
-`--preview` matches `.pre-commit-config.yaml`, which pins ruff `v0.16.0` (CI installs the latest
-ruff). Run the pinned version with `uvx ruff@0.16.0 check --preview inventree_mcp` and
+`--preview` matches `.pre-commit-config.yaml`, which pins ruff `v0.16.0`; CI pins the same
+version (`RUFF_VERSION: "0.16.0"` in `ci.yaml`). Run the pinned version with `uvx ruff@0.16.0 check --preview inventree_mcp` and
 `uvx ruff@0.16.0 format --preview inventree_mcp`. `tests/` is excluded by the repo config; check it
 with `--isolated`.

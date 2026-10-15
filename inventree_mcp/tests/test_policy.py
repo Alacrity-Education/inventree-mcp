@@ -363,6 +363,45 @@ class TransportNarrowingTest(PermissionSetTestCase):
                 body["next"].startswith("http://mcp.example/"), body["next"]
             )
 
+    @override_settings(ALLOWED_HOSTS=["mcp.example"])
+    def test_write_call_carries_the_request_meta(self):
+        """Finding 17: the write branch of _call_view_sync (MCP_READ_ONLY off) uses request_meta too."""
+        from part.api import PartDetail
+
+        grant_mcp(self.group, "part.view", "part.change")
+        self.set_setting("MCP_READ_ONLY", False)
+        part = Part.objects.get(name="WP3 part")
+        access, _refresh = make_token_pair(
+            self.create_cimd_application(),
+            self.user,
+            scope="g:read r:view:part r:change:part",
+        )
+        meta = {
+            "HTTP_HOST": "mcp.example",
+            "wsgi.url_scheme": "https",
+            "REMOTE_ADDR": "192.0.2.7",
+            "HTTP_ACCEPT_LANGUAGE": "de",
+        }
+        token = context.set_current_user(self.user, access, meta)
+        self.addCleanup(context.reset_current_user, token)
+
+        with patch.object(proxy, "_factory", wraps=proxy._factory) as factory:
+            body = proxy._call_view_sync(
+                PartDetail,
+                "PATCH",
+                f"/api/part/{part.pk}/",
+                data={"description": "patched over MCP"},
+                pk=part.pk,
+            )
+
+        self.assertEqual(body["description"], "patched over MCP")
+        part.refresh_from_db()
+        self.assertEqual(part.description, "patched over MCP")
+        factory.patch.assert_called_once()
+        kwargs = factory.patch.call_args.kwargs
+        self.assertEqual(kwargs["format"], "json")
+        self.assertEqual({key: kwargs[key] for key in meta}, meta)
+
     def test_request_meta_reaches_the_proxied_request(self):
         from django.test import RequestFactory
 

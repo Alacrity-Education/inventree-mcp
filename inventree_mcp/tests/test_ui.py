@@ -20,7 +20,8 @@ STATIC = Path(__file__).resolve().parent.parent / "static"
 
 
 class UiTestCase(InvenTreeAPITestCase):
-    roles = ()
+    # The plugin's staff API needs staff plus the admin role's change permission.
+    roles = ("admin.change",)
     superuser = False
     is_staff = True
 
@@ -31,6 +32,10 @@ class UiTestCase(InvenTreeAPITestCase):
         registry.reload_plugins(full_reload=True, collect=True)
         registry.set_plugin_state("inventree-mcp", True)
         cls.plain = User.objects.create_user(username="ui-plain", password="pw")
+        # Staff without the admin role: every plugin staff endpoint answers 403.
+        cls.staff_only = User.objects.create_user(
+            username="ui-staff", password="pw", is_staff=True
+        )
 
     def setUp(self):
         super().setUp()
@@ -68,6 +73,22 @@ class UiFeatureMethodsTest(UiTestCase):
         routes = self.plugin.get_ui_routes(self.request_as(self.plain), {})
         self.assertEqual([r["options"]["path"] for r in routes], ["connections"])
 
+    @mock.patch("inventree_mcp.core.UI_ROUTES_SUPPORTED", True)
+    def test_staff_without_admin_role_sees_no_staff_entries(self):
+        """Finding 8: the UI entries follow IsStaffAdmin, not is_staff."""
+        request = self.request_as(self.staff_only)
+        self.assertEqual(
+            [r["options"]["path"] for r in self.plugin.get_ui_routes(request, {})],
+            ["connections"],
+        )
+        self.assertEqual(
+            [i["title"] for i in self.plugin.get_ui_navigation_items(request, {})],
+            ["MCP"],
+        )
+        self.assertEqual(
+            self.plugin.get_ui_panels(request, {"target_model": "group"}), []
+        )
+
     def test_routes_anonymous(self):
         from django.contrib.auth.models import AnonymousUser
 
@@ -80,6 +101,18 @@ class UiFeatureMethodsTest(UiTestCase):
             self.assertEqual(
                 self.plugin.get_ui_navigation_items(self.request_as(self.user), {}), []
             )
+
+    def test_no_route_support_is_logged_once_per_process(self):
+        """Finding 6: the web UI asks for navigation items on every page load."""
+        with (
+            mock.patch("inventree_mcp.core.UI_ROUTES_SUPPORTED", False),
+            mock.patch("inventree_mcp.core._logged_once", set()),
+            self.assertLogs("inventree", level="INFO") as logs,
+        ):
+            for _page_load in range(3):
+                self.plugin.get_ui_navigation_items(self.request_as(self.user), {})
+        lines = [line for line in logs.output if "no plugin routes" in line]
+        self.assertEqual(len(lines), 1, logs.output)
 
     @mock.patch("inventree_mcp.core.UI_ROUTES_SUPPORTED", True)
     def test_navigation(self):
@@ -111,18 +144,26 @@ class UiFeatureMethodsTest(UiTestCase):
     def test_missing_build_does_not_raise(self):
         with (
             mock.patch("pathlib.Path.is_file", return_value=False),
+            mock.patch("inventree_mcp.core._logged_once", set()),
             self.assertLogs("inventree", level="WARNING") as logs,
         ):
-            self.assertEqual(
-                self.plugin.get_ui_routes(self.request_as(self.user), {}), []
-            )
-            self.assertEqual(
-                self.plugin.get_ui_panels(
-                    self.request_as(self.user), {"target_model": "group"}
-                ),
-                [],
-            )
-        self.assertTrue(any("is missing" in line for line in logs.output))
+            for _page_load in range(2):
+                self.assertEqual(
+                    self.plugin.get_ui_routes(self.request_as(self.user), {}), []
+                )
+                self.assertEqual(
+                    self.plugin.get_ui_panels(
+                        self.request_as(self.user), {"target_model": "group"}
+                    ),
+                    [],
+                )
+        # One warning per missing bundle and process (finding 6).
+        missing = sorted(line for line in logs.output if "is missing" in line)
+        self.assertEqual(len(missing), 3, logs.output)
+        for name, line in zip(
+            ("Connections.js", "Groups.js", "Panel.js"), missing, strict=True
+        ):
+            self.assertIn(name, line)
         # navigation does not depend on the build
         with mock.patch("inventree_mcp.core.UI_ROUTES_SUPPORTED", True):
             self.assertEqual(
@@ -159,6 +200,14 @@ class UiFeatureApiTest(UiTestCase):
         panels = self.mine(self.features("panel", target_model="group", target_id=1))
         self.assertEqual([p["title"] for p in panels], ["MCP Roles"])
         self.assertEqual(self.mine(self.features("panel", target_model="part")), [])
+
+    def test_staff_without_admin_role_session(self):
+        self.client.logout()
+        self.client.force_login(self.staff_only)
+        routes = self.mine(self.features("route"))
+        if UI_ROUTES_SUPPORTED:
+            self.assertEqual([r["options"]["path"] for r in routes], ["connections"])
+        self.assertEqual(self.mine(self.features("panel", target_model="group")), [])
 
     def test_non_staff_session(self):
         self.client.logout()

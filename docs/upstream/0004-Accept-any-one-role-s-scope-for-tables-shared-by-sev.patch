@@ -1,4 +1,4 @@
-From cc50ad2bb9b2372aba904b668a4500cd51af94b5 Mon Sep 17 00:00:00 2001
+From 808c179b07a127fa50118f95c3d2eab8767427e7 Mon Sep 17 00:00:00 2001
 From: lucaci32u4 <lucaci32u4@gmail.com>
 Date: Thu, 15 Oct 2026 08:50:27 +0300
 Subject: [PATCH 4/4] Accept any one role's scope for tables shared by several
@@ -13,15 +13,52 @@ token issued with exactly the scopes a role grants could not use that
 role's tables.
 
 Return one alternative per role instead, which TokenMatchesOASRequirements
-treats as OR. Add unit tests for map_scope and for the scope check on a
-multi-role table (PartList).
+treats as OR.
+
+map_scope(roles=...) has three callers, all affected:
+- InvenTreeRoleScopeMixin (every endpoint of a multi-role table);
+- DataImporterPermission (the data importer endpoints: writes needed the
+  r:change scope of all eleven roles, now any one of them; reads keep
+  g:read);
+- ContentTypePermission (GenericMetadataView, the generic metadata
+  endpoints: every method needed the scope of all eleven roles, now any
+  one of them).
+The object-level checks of the last two are unchanged.
+
+The OpenAPI security requirements of these endpoints change (one
+requirement per role), so bump the API version to 557.
+
+Add unit tests for map_scope, the scope check on a multi-role table
+(PartList), ContentTypePermission and DataImporterPermission.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
+ .../InvenTree/InvenTree/api_version.py        |  6 +-
  .../InvenTree/InvenTree/permissions.py        |  5 +-
- src/backend/InvenTree/InvenTree/tests.py      | 51 +++++++++++++++++++
- 2 files changed, 54 insertions(+), 2 deletions(-)
+ src/backend/InvenTree/InvenTree/tests.py      | 90 +++++++++++++++++++
+ 3 files changed, 98 insertions(+), 3 deletions(-)
 
+diff --git a/src/backend/InvenTree/InvenTree/api_version.py b/src/backend/InvenTree/InvenTree/api_version.py
+index fc92f412d..8223bc5f3 100644
+--- a/src/backend/InvenTree/InvenTree/api_version.py
++++ b/src/backend/InvenTree/InvenTree/api_version.py
+@@ -1,11 +1,15 @@
+ """InvenTree API version information."""
+ 
+ # InvenTree API version
+-INVENTREE_API_VERSION = 556
++INVENTREE_API_VERSION = 557
+ """Increment this API version number whenever there is a significant change to the API that any clients need to know about."""
+ 
+ INVENTREE_API_TEXT = """
+ 
++v557 -> 2026-10-15 : https://github.com/inventree/InvenTree/pull/XXXXX
++    - OAuth2 scope requirements of endpoints whose model belongs to several rulesets list one alternative per role (any one role's scope suffices, as for the role check)
++    - The same applies to the data importer endpoints (writes) and the generic metadata endpoints, which previously required the scopes of all roles
++
+ v556 -> 2026-10-14 : https://github.com/inventree/InvenTree/pull/13017
+     - Adds 'is_internal' field (and filter) to the Company API endpoint
+     - Adds 'INVENTREE_DEFAULT_INTERNAL_COMPANY' global setting
 diff --git a/src/backend/InvenTree/InvenTree/permissions.py b/src/backend/InvenTree/InvenTree/permissions.py
 index 807117c21..5e46c44c1 100644
 --- a/src/backend/InvenTree/InvenTree/permissions.py
@@ -46,10 +83,10 @@ index 807117c21..5e46c44c1 100644
  
      def get_scope(method, action):
 diff --git a/src/backend/InvenTree/InvenTree/tests.py b/src/backend/InvenTree/InvenTree/tests.py
-index 7c5454f93..76296809d 100644
+index 7c5454f93..660f9a466 100644
 --- a/src/backend/InvenTree/InvenTree/tests.py
 +++ b/src/backend/InvenTree/InvenTree/tests.py
-@@ -2078,3 +2078,54 @@ class InvenTreeAppConfigTests(TestCase):
+@@ -2078,3 +2078,93 @@ class InvenTreeAppConfigTests(TestCase):
  
              self.assertEqual(raised.exception.code, 1)
              self.assertFalse(apps.PRE_1_0_0_CHECK_DONE)
@@ -57,6 +94,24 @@ index 7c5454f93..76296809d 100644
 +
 +class OAuth2ScopeMapTest(TestCase):
 +    """Scopes required for tables that belong to several rulesets."""
++
++    @staticmethod
++    def token_passes(scope, method, required):
++        """Whether DOT's TokenMatchesOASRequirements passes a token with *scope*."""
++        from oauth2_provider.contrib.rest_framework import TokenMatchesOASRequirements
++        from oauth2_provider.models import AccessToken
++
++        class Request:
++            def __init__(self):
++                self.method = method
++                self.auth = AccessToken(
++                    scope=scope, expires=timezone.now() + timedelta(hours=1)
++                )
++
++        class View:
++            required_alternate_scopes = required
++
++        return TokenMatchesOASRequirements().has_permission(Request(), View())
 +
 +    def test_map_scope_any_role(self):
 +        """map_scope(roles=...) gives one alternative per role."""
@@ -74,9 +129,6 @@ index 7c5454f93..76296809d 100644
 +
 +    def test_multi_role_table_accepts_any_role_scope(self):
 +        """A token with the scope of one of the table's roles passes the scope check."""
-+        from oauth2_provider.contrib.rest_framework import TokenMatchesOASRequirements
-+        from oauth2_provider.models import AccessToken
-+
 +        from InvenTree.permissions import InvenTreeRoleScopeMixin, precalculated_roles
 +        from part.api import PartList
 +
@@ -89,21 +141,45 @@ index 7c5454f93..76296809d 100644
 +        self.assertIn(['r:view:part'], required['GET'])
 +        self.assertIn(['r:view:build'], required['GET'])
 +
-+        class Request:
-+            method = 'GET'
++        self.assertTrue(self.token_passes('r:view:part', 'GET', required))
++        self.assertTrue(self.token_passes('r:view:build', 'GET', required))
++        self.assertFalse(self.token_passes('r:view:stock', 'GET', required))
 +
-+            def __init__(self, scope):
-+                self.auth = AccessToken(
-+                    scope=scope, expires=timezone.now() + timedelta(hours=1)
-+                )
++    def test_content_type_permission_accepts_any_role_scope(self):
++        """ContentTypePermission (GenericMetadataView): any one role's scope passes.
 +
-+        class View:
-+            required_alternate_scopes = required
++        Before, a token needed the scope of all roles. The object-level check
++        (has_object_permission) still applies to the user.
++        """
++        from InvenTree.permissions import ContentTypePermission
++        from users.oauth2_scopes import _roles
 +
-+        check = TokenMatchesOASRequirements()
-+        self.assertTrue(check.has_permission(Request('r:view:part'), View()))
-+        self.assertTrue(check.has_permission(Request('r:view:build'), View()))
-+        self.assertFalse(check.has_permission(Request('r:view:stock'), View()))
++        required = ContentTypePermission().get_required_alternate_scopes(None, None)
++        self.assertEqual(required['GET'], [[f'r:view:{role}'] for role in _roles])
++        self.assertEqual(required['PATCH'], [[f'r:change:{role}'] for role in _roles])
++
++        self.assertTrue(self.token_passes('r:view:stock', 'GET', required))
++        self.assertTrue(self.token_passes('r:change:part', 'PATCH', required))
++        self.assertFalse(self.token_passes('g:read', 'GET', required))
++        self.assertFalse(self.token_passes('r:view:part', 'PATCH', required))
++
++    def test_data_importer_permission_accepts_any_role_scope(self):
++        """DataImporterPermission: reads need g:read, writes any one role's change scope."""
++        from InvenTree.permissions import DataImporterPermission
++        from users.oauth2_scopes import _roles
++
++        required = DataImporterPermission().get_required_alternate_scopes(None, None)
++        self.assertEqual(required['GET'], [['g:read']])
++        for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
++            self.assertEqual(
++                required[method], [[f'r:change:{role}'] for role in _roles]
++            )
++
++        self.assertTrue(self.token_passes('g:read', 'GET', required))
++        self.assertTrue(self.token_passes('r:change:part', 'POST', required))
++        self.assertTrue(self.token_passes('r:change:sales_order', 'DELETE', required))
++        self.assertFalse(self.token_passes('r:add:part', 'POST', required))
++        self.assertFalse(self.token_passes('g:read', 'PATCH', required))
 -- 
 2.56.0
 

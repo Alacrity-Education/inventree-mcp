@@ -30,6 +30,11 @@ strings here:
   blocked and the upstream token is kept, Outcome.NO_MCP_PERMISSION;
 - otherwise Outcome.MEMBER.
 
+One re-check per user calls out at a time: a lease on MCPUserState
+(``recheck_lease_until``) is taken and committed under a short row lock, the
+outbound calls run without a transaction, and the outcome is applied in a
+second short transaction (recheck()).
+
 ``MEMBERSHIP_ENFORCED`` off means no re-checks and no new blocks; existing
 blocks are honoured regardless (is_blocked()).
 
@@ -64,6 +69,10 @@ NO_TOKEN_WARNING_SECONDS = 3600
 PROVIDER_BACKOFF_SECONDS = 60
 #: The transport's per-user "re-check queued" marker after an ordinary queueing.
 RECHECK_QUEUED_SECONDS = 60
+#: Lifetime of a re-check's lease (MCPUserState.recheck_lease_until). A re-check
+#: makes at most four outbound calls with HTTP_TIMEOUT_SECONDS each; a lease left
+#: behind by a killed process expires after this.
+RECHECK_LEASE_SECONDS = 60
 
 #: Reason codes stored in MCPUserState.revoked_reason by a failed re-check.
 REVOKED_UPSTREAM = "invalid_grant"
@@ -347,57 +356,108 @@ def refresh_grant_allowed(user) -> tuple[bool, str]:
 def recheck(user, *, force: bool = False) -> Outcome:
     """Re-check *user*'s group membership at the SSO provider (see the module docstring).
 
-    Serialised per user by a row lock on MCPUserState, so the upstream refresh
-    token is never redeemed twice at once; a re-check that waited for the lock
-    returns NOT_DUE when the other one just succeeded.
+    Three steps, so that no row lock is held across the network (WP2 F2):
+
+    1. a short transaction locks the MCPUserState row, re-reads it and takes
+       the re-check lease (``recheck_lease_until``, RECHECK_LEASE_SECONDS),
+       then commits. A re-check that finds a live lease returns NOT_DUE ("in
+       progress") without calling out, so the upstream refresh token is never
+       redeemed twice at once;
+    2. outside any transaction (autocommit): discovery, redeem, storing the
+       rotated upstream tokens (durable at once, so neither a later failure
+       nor a killed process loses them), ID-token verification and userinfo;
+    3. a second short transaction under the row lock: core's group sync, the
+       classification, the stamp and the block or revocation.
+
+    The lease is released in ``finally``; one left by a killed process expires
+    on its own. A login (signals.py) only ever waits for steps 1 and 3.
     """
     if not enforced():
         return Outcome.DISABLED
     if not force and not recheck_due(user):
         return Outcome.NOT_DUE
 
+    lease = _take_lease(user, force=force)
+    if isinstance(lease, Outcome):
+        return lease
+    try:
+        return _recheck_under_lease(user)
+    finally:
+        _release_lease(user, lease)
+
+
+def _take_lease(user, *, force: bool):
+    """Step 1 of recheck(): the lease's expiry, or the Outcome when there is nothing to do."""
     with transaction.atomic():
         state = _locked_state(user)
         if state.access_revoked_at is not None:
             return Outcome.NOT_MEMBER  # blocked until the next SSO login
         if not force and not _is_due(state):
+            return Outcome.NOT_DUE  # another re-check has just succeeded
+        now = timezone.now()
+        if state.recheck_lease_until is not None and state.recheck_lease_until > now:
+            logger.debug(
+                "inventree-mcp: membership re-check for user id %s in progress", user.pk
+            )
             return Outcome.NOT_DUE
+        state.recheck_lease_until = now + timedelta(seconds=RECHECK_LEASE_SECONDS)
+        state.save(update_fields=["recheck_lease_until"])
+        return state.recheck_lease_until
 
-        context = {"issuer_host": "unknown"}
+
+def _release_lease(user, lease) -> None:
+    """Drop *lease*, unless another re-check took the row over after it expired."""
+    from ..models import MCPUserState
+
+    try:
+        MCPUserState.objects.filter(user_id=user.pk, recheck_lease_until=lease).update(
+            recheck_lease_until=None
+        )
+    except DatabaseError:  # e.g. the caller's transaction is broken: it expires
+        logger.warning(
+            "inventree-mcp: could not release the re-check lease of user id %s",
+            user.pk,
+            exc_info=True,
+        )
+
+
+def _recheck_under_lease(user) -> Outcome:
+    """Steps 2 and 3 of recheck(), with the lease held."""
+    from django.contrib.auth import get_user_model
+
+    context = {"issuer_host": "unknown"}
+    try:
+        account, groups = _check_upstream(user, context)
+    except _NoUpstreamToken as exc:
+        _record_error(user, exc.code)
+        _warn_no_upstream_token(user, exc.code)
+        # Nothing to re-check with until the next login: keep the
+        # transport from queueing this user again within the interval (F5).
+        cache.set(
+            recheck_queued_key(user.pk),
+            True,
+            plugin_setting("MEMBERSHIP_RECHECK_INTERVAL_MINUTES") * 60,
+        )
+        return Outcome.NO_UPSTREAM_TOKEN
+    except _RevokedUpstream:
+        logger.info(
+            "inventree-mcp: identity provider %s revoked the upstream grant of user id %s",
+            context["issuer_host"],
+            user.pk,
+        )
+        block_user(user, REVOKED_UPSTREAM)
+        return Outcome.NOT_MEMBER
+    except Exception as exc:  # noqa: BLE001 - _Unreachable, or anything unexpected
+        return _inconclusive(user, exc, context)
+
+    with transaction.atomic():
+        state = _locked_state(user)
         try:
-            verdict, reason = _check_upstream(user, context)
-        except _NoUpstreamToken as exc:
-            _record_error(state, exc.code)
-            _warn_no_upstream_token(user, exc.code)
-            # Nothing to re-check with until the next login: keep the
-            # transport from queueing this user again within the interval (F5).
-            cache.set(
-                recheck_queued_key(user.pk),
-                True,
-                plugin_setting("MEMBERSHIP_RECHECK_INTERVAL_MINUTES") * 60,
-            )
-            return Outcome.NO_UPSTREAM_TOKEN
-        except _RevokedUpstream:
-            logger.info(
-                "inventree-mcp: identity provider %s revoked the upstream grant of user id %s",
-                context["issuer_host"],
-                user.pk,
-            )
-            block_user(user, REVOKED_UPSTREAM)
-            return Outcome.NOT_MEMBER
-        except Exception as exc:  # _Unreachable, or anything unexpected: inconclusive
-            code = exc.code if isinstance(exc, _Unreachable) else "error"
-            if code == "error":
-                logger.debug("inventree-mcp: re-check failure", exc_info=True)
-            _record_error(state, code)
-            logger.warning(
-                "inventree-mcp: membership re-check for user id %s inconclusive (%s%s), issuer %s",
-                user.pk,
-                code,
-                "" if isinstance(exc, _Unreachable) else f": {type(exc).__name__}",
-                context["issuer_host"],
-            )
-            return Outcome.UNREACHABLE
+            with transaction.atomic():
+                _sync_groups(account, groups)
+                verdict, reason = _classify(get_user_model().objects.get(pk=user.pk))
+        except Exception as exc:  # noqa: BLE001 - the sync failed: inconclusive
+            return _inconclusive(user, exc, context)
 
         if verdict is _Verdict.IDENTITY_REFUSED:
             block_user(user, reason)
@@ -421,17 +481,35 @@ def recheck(user, *, force: bool = False) -> Outcome:
             )
             return Outcome.NO_MCP_PERMISSION
 
-        logger.info(
-            "inventree-mcp: membership re-check for user id %s: member (issuer %s)",
-            user.pk,
-            context["issuer_host"],
-        )
-        return Outcome.MEMBER
+    logger.info(
+        "inventree-mcp: membership re-check for user id %s: member (issuer %s)",
+        user.pk,
+        context["issuer_host"],
+    )
+    return Outcome.MEMBER
 
 
-def _record_error(state, code: str) -> None:
-    state.last_recheck_error = code[:255]
-    state.save(update_fields=["last_recheck_error"])
+def _inconclusive(user, exc: Exception, context: dict) -> Outcome:
+    """Record and log a re-check that could neither confirm nor deny membership."""
+    code = exc.code if isinstance(exc, _Unreachable) else "error"
+    if code == "error":
+        logger.debug("inventree-mcp: re-check failure", exc_info=exc)
+    _record_error(user, code)
+    logger.warning(
+        "inventree-mcp: membership re-check for user id %s inconclusive (%s%s), issuer %s",
+        user.pk,
+        code,
+        "" if isinstance(exc, _Unreachable) else f": {type(exc).__name__}",
+        context["issuer_host"],
+    )
+    return Outcome.UNREACHABLE
+
+
+def _record_error(user, code: str) -> None:
+    """Store *code* as the user's last_recheck_error (the row exists from the lease)."""
+    from ..models import MCPUserState
+
+    MCPUserState.objects.filter(user_id=user.pk).update(last_recheck_error=code[:255])
 
 
 def _warn_no_upstream_token(user, code: str) -> None:
@@ -469,8 +547,8 @@ def _starts_backoff(code: str) -> bool:
     return code in _BACKOFF_CODES or code.endswith("http_5xx")
 
 
-def _check_upstream(user, context: dict) -> tuple[_Verdict, str]:
-    """Redeem, store, verify, sync groups and classify. Returns (verdict, block reason).
+def _check_upstream(user, context: dict) -> tuple:
+    """Step 2 of recheck(): redeem, store, verify. Returns (SocialAccount, groups claim).
 
     Raises _NoUpstreamToken, _Unreachable or _RevokedUpstream. Sets
     ``context["issuer_host"]`` for the caller's log lines.
@@ -499,37 +577,34 @@ def _check_upstream(user, context: dict) -> tuple[_Verdict, str]:
     if code := cache.get(backoff_key):
         raise _Unreachable(code)
     try:
-        return _redeem_and_classify(user, app, provider_id, account, token)
+        return account, _redeem_and_verify(app, provider_id, account, token)
     except _Unreachable as exc:
         if _starts_backoff(exc.code):
             cache.set(backoff_key, exc.code, PROVIDER_BACKOFF_SECONDS)
         raise
 
 
-def _redeem_and_classify(user, app, provider_id, account, token):
-    """The outbound part of _check_upstream(): discovery, redeem, verify, sync, classify."""
+def _redeem_and_verify(app, provider_id, account, token) -> list[str]:
+    """The outbound calls: discovery, redeem, store, verify, userinfo. Returns the groups claim.
+
+    Runs outside any transaction of recheck(), so _store_tokens() commits on
+    its own (autocommit) before anything else can fail.
+    """
     from allauth.socialaccount.adapter import get_adapter
-    from django.contrib.auth import get_user_model
 
     with get_adapter().get_requests_session() as session:
         config = _discovery(session, app)
         adapter = _adapter_class()(provider_id, config)
         data = _redeem(session, app, adapter, token.token_secret)
         # The old upstream refresh token is spent now: store the rotated one
-        # first, outside the savepoint below, so no later failure loses it.
+        # first, so no later failure (or a killed process) loses it.
         _store_tokens(adapter, token, data)
 
-        with transaction.atomic():
-            claims = _verify_id_token(config, app, data)
-            subject_field = app.settings.get("uid_field", "sub")
-            if claims is not None and str(claims.get(subject_field)) != account.uid:
-                raise _Unreachable("subject_mismatch")
-            groups = _groups_claim(
-                session, adapter, data, claims, subject_field, account
-            )
-            _sync_groups(account, groups)
-
-            return _classify(get_user_model().objects.get(pk=user.pk))
+        claims = _verify_id_token(config, app, data)
+        subject_field = app.settings.get("uid_field", "sub")
+        if claims is not None and str(claims.get(subject_field)) != account.uid:
+            raise _Unreachable("subject_mismatch")
+        return _groups_claim(session, adapter, data, claims, subject_field, account)
 
 
 def _classify(fresh) -> tuple[_Verdict, str]:

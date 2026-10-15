@@ -7,6 +7,7 @@ import hashlib
 from typing import ClassVar
 from unittest.mock import patch
 
+from django.core.cache import cache
 from django.test import Client, RequestFactory, override_settings
 from django.utils import timezone
 from InvenTree.unit_test import InvenTreeTestCase
@@ -201,6 +202,46 @@ class TokenEndpointTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertEqual(response.json()["error"], "invalid_grant")
         # Refused before DOT ran: nothing was rotated.
         self.assertEqual(self.mcp_call(tokens["access_token"]).status_code, 200)
+
+    def test_code_exchange_rate_limit(self):
+        """Code grants are limited per client IP (429 + Retry-After); refresh grants are not."""
+        self.set_setting("TOKEN_RATE_LIMIT_PER_MINUTE", 2)
+        tokens = self._tokens()
+        code, verifier = self.obtain_code(self.browser, self.client_id)
+        cache.delete("inventree_mcp:token:127.0.0.1")  # counted at the real time
+
+        # Fixed clock: all requests fall into one window, 20 s before its end.
+        with patch("inventree_mcp.auth.ratelimit.time.time", return_value=6040.0):
+            self.assertEqual(
+                self.exchange_code(self.client_id, "guess-1", "x" * 50).status_code,
+                400,
+            )
+            self.assertEqual(
+                self.exchange_code(self.client_id, "guess-2", "x" * 50).status_code,
+                400,
+            )
+            response = self.exchange_code(self.client_id, code, verifier)
+            self.assertEqual(response.status_code, 429)
+            self.assertEqual(response.json(), {"error": "too_many_requests"})
+            self.assertEqual(response["Retry-After"], "20")
+
+            # Another client IP has its own counter.
+            response = self.exchange_code(
+                self.client_id, code, verifier, REMOTE_ADDR="192.0.2.9"
+            )
+            self.assertEqual(response.status_code, 200, response.content)
+
+            # Refresh grants are never limited.
+            for _attempt in range(3):
+                response = self.refresh(self.client_id, tokens["refresh_token"])
+                self.assertEqual(response.status_code, 200, response.content)
+                tokens = response.json()
+
+            # 0 disables the limit.
+            self.set_setting("TOKEN_RATE_LIMIT_PER_MINUTE", 0)
+            response = self.exchange_code(self.client_id, "guess-3", "x" * 50)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.json()["error"], "invalid_grant")
 
     def test_unsupported_grant_type(self):
         response = Client().post(

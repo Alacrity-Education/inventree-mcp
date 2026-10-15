@@ -128,8 +128,8 @@ def membership_sweep(user_ids: list[int] | None = None) -> dict[str, int]:
     remaining candidates are queued as a continuation of this task
     (*user_ids*), which re-checks only those (still due, not blocked) users.
     At least one user is re-checked per run, so a continuation always makes
-    progress. (The lease-based restructuring that also shortens the row lock
-    is WP5.)
+    progress. A user whose re-check is in progress elsewhere (lease held)
+    counts as not_due.
     """
     from django.contrib.auth import get_user_model
     from django.db.models import Q

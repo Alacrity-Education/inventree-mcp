@@ -10,6 +10,9 @@ delegating, whether the grant may proceed:
   policy.narrow() (WP3: a reduced MCP ruleset takes effect at the next refresh).
 
 A refusal is ``400 invalid_grant``, the error Claude treats as "sign in again".
+authorization_code grants are rate limited per client IP
+(TOKEN_RATE_LIMIT_PER_MINUTE, ratelimit.py: 429 with Retry-After); refresh
+grants are not.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from oauth2_provider.settings import oauth2_settings
 from oauth2_provider.views import RevokeTokenView, TokenView
 from oauthlib.oauth2.rfc6749.utils import scope_to_list
 
-from . import FacadeViewMixin, membership, policy
+from . import FacadeViewMixin, membership, policy, ratelimit
 from .clients import mcp_applications
 from .cors import TrustedOriginCORSMixin
 
@@ -75,6 +78,13 @@ class MCPTokenView(FacadeViewMixin, TrustedOriginCORSMixin, TokenView):
         grant_type = request.POST.get("grant_type")
 
         if grant_type == "authorization_code":
+            # Code guessing: per client IP, like registration. Refresh grants
+            # are not limited (a refresh token is a long random secret).
+            wait = ratelimit.retry_after(
+                request, "token", "TOKEN_RATE_LIMIT_PER_MINUTE"
+            )
+            if wait:
+                return ratelimit.too_many_requests(wait)
             refusal = self._check_code_grant(request)
         elif grant_type == "refresh_token":
             refusal = self._check_refresh_grant(request)

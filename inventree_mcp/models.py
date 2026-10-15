@@ -14,7 +14,9 @@ class MCPUserState(models.Model):
 
     One row per user, created on first use (login stamp, re-check, block).
     ``access_revoked_at`` set means the user is blocked from MCP until the next
-    SSO login (auth/membership.py, auth/signals.py).
+    SSO login (auth/membership.py, auth/signals.py). ``recheck_lease_until`` is
+    the re-check lease (membership.recheck()): one re-check per user calls the
+    provider at a time, without holding a row lock across the network.
     """
 
     user = models.OneToOneField(
@@ -52,6 +54,15 @@ class MCPUserState(models.Model):
         blank=True,
         verbose_name=_("Last login at"),
         help_text=_("Last interactive login to InvenTree"),
+    )
+    recheck_lease_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("Re-check lease until"),
+        help_text=_(
+            "Set while a membership re-check calls the identity provider; "
+            "other re-checks of the user are skipped until it ends or expires"
+        ),
     )
 
     class Meta:
