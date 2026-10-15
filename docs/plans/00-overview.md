@@ -97,6 +97,7 @@ Well-known advertisement (`WellKnownMixin.get_well_known_urls`): `mcp-server-car
 | `AUTH_CODE_LIFETIME_SECONDS` | int / 600 | injected into DOT [1] |
 | `ALLOW_LOCALHOST_LOOPBACK` | bool / True | injected into DOT [1] |
 | `REGISTER_RATE_LIMIT_PER_MINUTE` | int / 30 | DCR rate limit per client IP, 0 disables [1] |
+| `TOKEN_RATE_LIMIT_PER_MINUTE` | int / 60 | authorization-code exchanges per minute and client IP at the token endpoint, 0 disables; refresh grants unlimited [5] |
 | `UNUSED_CLIENT_RETENTION_DAYS` | int / 90 | daily cleanup of DCR clients with no live token [1] |
 | `OAUTH_FORCE_SSO` | bool / True | login bridge sends the browser straight to the SSO provider [1] |
 | `SSO_PROVIDER_ID` | str / `` | allauth provider id used by the bridge and the re-check; empty = the single configured `openid_connect` app [1] |

@@ -41,7 +41,7 @@ them there.
 
 | Source | Export | Used for |
 |---|---|---|
-| `src/Groups.tsx` | `renderGroupsPage` | route `groups` and nav item "MCP Access" (staff) |
+| `src/Groups.tsx` | `renderGroupsPage` | route `groups` and nav item "MCP Access" (staff with the admin role's change permission) |
 | `src/Connections.tsx` | `renderConnectionsPage` | route `connections` and nav item "MCP" |
 | `src/Panel.tsx` | `renderMCPRolesPanel` | group panel ("MCP Roles"), `context.id` = group pk |
 
