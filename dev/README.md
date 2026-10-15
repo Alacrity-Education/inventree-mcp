@@ -30,6 +30,25 @@ Plugin code is bind-mounted and installed with `pip install -e`: Python edits sh
 (`pip install` over the network plus `invoke update`), so it takes about a minute.
 `dev/test.sh` always runs the current files, no restart needed.
 
+## Other InvenTree versions (`latest` = master)
+
+CI's integration matrix runs the suite in `inventree/inventree:stable` and `:latest`. `dev/test-image.sh` does the
+same on this machine, in a throwaway container with its own Postgres, next to the stack above (which stays on the
+pinned release):
+
+```bash
+dev/test-image.sh up latest            # or any tag; pulls the image, runs invoke update, installs the checkout editable
+dev/test-image.sh test                 # the whole suite (--keepdb; edits are picked up without a restart)
+dev/test-image.sh test inventree_mcp.tests.test_policy inventree_mcp.test_mcp.PluginSettingsTest -v 2
+dev/test-image.sh shell                # bash in the container (/home/inventree/src/backend)
+dev/test-image.sh down
+```
+
+InvenTree 1.6+ (core PR #13007) purges and re-imports the plugin's modules on every registry collect, which the test
+runner does for every test class. `inventree_mcp/tests/__init__.py` disables that purge for the test run (otherwise
+every `unittest.mock.patch` target misses and the model classes duplicate), and `test_mcp.py` patches the module
+objects it imported rather than dotted paths. Keep both rules when writing tests.
+
 ## Frontend (plugin pages)
 
 The pages ("MCP Access" for staff, "MCP" for everybody) are React bundles built from `frontend/` into

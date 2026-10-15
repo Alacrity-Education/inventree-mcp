@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.db import connection
 from django.test import Client, override_settings
 from InvenTree.unit_test import InvenTreeTestCase
 from oauth2_provider.contrib.rest_framework import TokenMatchesOASRequirements
@@ -23,7 +24,7 @@ from .. import context, proxy, tool_visibility
 from ..auth import policy, signals
 from ..mcp_server import mcp
 from ..mcp_transport import scoped_token_for
-from ..models import MCPRuleSet
+from ..models import MCPRuleSet, MCPUserState
 from ..oauth2_bridge import scoped_view_class
 from ..test_mcp import _raw_api_token
 from .oauth_helpers import (
@@ -599,3 +600,56 @@ class ReductionRevokesTest(PermissionSetTestCase):
         self.assertEqual(self.mcp_call(self.member_access.token).status_code, 200)
         self.set_mcp(self.group, part="")
         self.assertEqual(self.mcp_call(self.member_access.token).status_code, 401)
+
+
+class DeletionCleanupTest(PermissionSetTestCase):
+    """Deleting a group or a user removes the plugin's rows even when core's cascade does not reach them.
+
+    After a plugin registry reload on InvenTree 1.6+ (core PR #13007 purges and
+    re-imports the plugin's modules) core models keep stale relation caches and
+    no longer know the plugin's foreign keys: on_delete=CASCADE is never
+    collected and the database constraint fails the transaction. The pre_delete
+    receivers delete the rows themselves. The tests hide the relation the same
+    way (the reverse relation cache without the plugin's model).
+    """
+
+    def hide_relation(self, model, plugin_model):
+        # By label, not identity: InvenTree re-executes the plugin's models
+        # module on every registry reload, so this module's class is not the
+        # one the relation tree holds.
+        label = plugin_model._meta.label
+        opts = model._meta
+        opts._expire_cache()
+        complete = opts._relation_tree
+        opts.__dict__["_relation_tree"] = [
+            field for field in complete if field.model._meta.label != label
+        ]
+        self.addCleanup(opts._expire_cache)
+        self.assertNotIn(
+            label,
+            [
+                field.related_model._meta.label
+                for field in opts.get_fields(include_hidden=True)
+                if field.auto_created and not field.concrete
+            ],
+        )
+
+    def test_group_rows_go_without_the_cascade(self):
+        self.hide_relation(Group, MCPRuleSet)
+        pk = self.group.pk
+        self.assertTrue(MCPRuleSet.objects.filter(group_id=pk).exists())
+
+        self.group.delete()
+
+        self.assertFalse(MCPRuleSet.objects.filter(group_id=pk).exists())
+        connection.check_constraints()  # the deferred foreign key would fail here otherwise
+
+    def test_user_state_goes_without_the_cascade(self):
+        MCPUserState.objects.create(user=self.user)
+        self.hide_relation(User, MCPUserState)
+        pk = self.user.pk
+
+        self.user.delete()
+
+        self.assertFalse(MCPUserState.objects.filter(user_id=pk).exists())
+        connection.check_constraints()

@@ -59,6 +59,7 @@ from stock.models import (
 from users.models import ApiToken
 
 from . import PLUGIN_VERSION, context, tool_visibility, view_resolution
+from . import settings as plugin_settings
 from .filter_introspection import _default_ordering_fields
 from .mcp_server import mcp
 from .proxy import call_view
@@ -1387,9 +1388,8 @@ class ViewResolutionTest(unittest.TestCase):
         self.assertIsNone(view_resolution.resolve_view("not.a.real.module", "Whatever"))
 
     def test_caches_a_failure_without_re_importing(self):
-        with patch(
-            "inventree_mcp.view_resolution.import_module",
-            side_effect=ImportError("boom"),
+        with patch.object(
+            view_resolution, "import_module", side_effect=ImportError("boom")
         ) as mock_import:
             self.assertIsNone(view_resolution.resolve_view("some.fake.module", "X"))
             self.assertIsNone(view_resolution.resolve_view("some.fake.module", "X"))
@@ -1443,9 +1443,8 @@ class ResolveViewAnyTest(unittest.TestCase):
         )
 
     def test_caches_a_total_failure_without_re_importing(self):
-        with patch(
-            "inventree_mcp.view_resolution.import_module",
-            side_effect=ImportError("boom"),
+        with patch.object(
+            view_resolution, "import_module", side_effect=ImportError("boom")
         ) as mock_import:
             self.assertIsNone(
                 view_resolution.resolve_view_any("some.fake.module", ["X", "Y"])
@@ -2293,10 +2292,15 @@ class PluginSettingsTest(InvenTreeTestCase):
     """Verify get_plugin_setting() fails safe - both REQUIRE_AUTH and MCP_READ_ONLY
     depend on this for their fail-*closed* (i.e. restrictive) behaviour, so "can't
     resolve the setting" must never quietly mean "unrestricted".
+
+    The mocks target the module object imported above (patch.object), not the
+    dotted path: after a plugin registry reload on InvenTree 1.6+ (core PR
+    #13007) the dotted path names a re-imported copy of the module, while
+    get_plugin_setting() keeps using the one it was defined in.
     """
 
     def test_returns_default_when_plugin_unresolvable(self):
-        with patch("inventree_mcp.settings._get_plugin_instance", return_value=None):
+        with patch.object(plugin_settings, "_get_plugin_instance", return_value=None):
             self.assertTrue(get_plugin_setting("REQUIRE_AUTH"))
             self.assertTrue(get_plugin_setting("MCP_READ_ONLY"))
             # The default parameter itself must be respected, not hardcoded True.
@@ -2307,14 +2311,13 @@ class PluginSettingsTest(InvenTreeTestCase):
             def get_setting(self, key):
                 raise RuntimeError("simulated failure")
 
-        with patch(
-            "inventree_mcp.settings._get_plugin_instance",
-            return_value=_BrokenPlugin(),
+        with patch.object(
+            plugin_settings, "_get_plugin_instance", return_value=_BrokenPlugin()
         ):
             self.assertTrue(get_plugin_setting("REQUIRE_AUTH"))
 
     def test_returns_real_value_when_plugin_resolvable(self):
-        with patch("inventree_mcp.settings._get_plugin_instance") as mock_get:
+        with patch.object(plugin_settings, "_get_plugin_instance") as mock_get:
             mock_get.return_value.get_setting.return_value = False
             self.assertFalse(get_plugin_setting("MCP_READ_ONLY"))
 

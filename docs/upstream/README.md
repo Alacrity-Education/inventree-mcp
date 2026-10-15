@@ -1,6 +1,6 @@
 # Upstream patches for InvenTree core
 
-Four small patches against InvenTree core `master` (base commit `2f139f94b`, 2026-10-15), prepared but **not submitted** to inventree/InvenTree. The stacked branch is pushed to the fork `Alacrity-Education/InvenTree` (`upstream-patches`), where core's QC, Frontend, Import/Export and Migration workflows run on it. Each retires a workaround in the `inventree-mcp` plugin. They are independent and can be proposed as four separate PRs.
+Five small patches against InvenTree core `master` (base commit `2f139f94b`, 2026-10-15), prepared but **not submitted** to inventree/InvenTree. The stacked branch is pushed to the fork `Alacrity-Education/InvenTree` (`upstream-patches`), where core's QC, Frontend, Import/Export and Migration workflows run on it. Patches 1 to 4 each retire a workaround in the `inventree-mcp` plugin; patch 5 fixes a core regression the plugin's CI found on `latest`. They are independent and can be proposed as five separate PRs (per-patch branches `upstream/<name>` in the worktree, PR texts in `pr/`).
 
 Source: local branch `upstream-patches` in the worktree `/home/alex.lucaci/Projects/inventree/.worktrees/upstream-patches` (clone `/home/alex.lucaci/Projects/inventree/InvenTree`, branch `master` untouched). Patch files (from `git format-patch master..upstream-patches`) are in this directory:
 
@@ -8,6 +8,7 @@ Source: local branch `upstream-patches` in the worktree `/home/alex.lucaci/Proje
 - `0002-Preserve-next-through-account_login-and-honour-it-in.patch`
 - `0003-Render-plugin-panels-in-the-group-and-user-drawers-e.patch`
 - `0004-Accept-any-one-role-s-scope-for-tables-shared-by-sev.patch`
+- `0005-Expire-model-meta-caches-after-a-plugin-registry-rel.patch`
 
 Each applies cleanly (`git apply --check` and `git am`) on a fresh checkout of `master` at `2f139f94b`. Note: the plan named the files `0001-oauth2-provider-config-override.patch` etc.; format-patch derives names from the commit subjects.
 
@@ -110,6 +111,22 @@ one alternative holding every role's scope (an AND; the loop variable was even n
 
 ---
 
+## 5. Expire model meta caches after a plugin registry reload
+
+**Motivation.** Found by the plugin's CI on `inventree/inventree:latest` (master after PR #13007, 2026-10-13): two tests deleting a `Group` failed with `IntegrityError ... inventree_mcp_mcpruleset ... violates foreign key constraint` at the end of the transaction. After a registry reload, `Group._meta.get_fields()` no longer lists the plugin's foreign key (`mcp_rule_sets`), so Django's deletion collector never cascades into the plugin's table and the deferred database constraint fails the commit. `apps.clear_cache()` brings the relation back.
+
+**Cause.** `reload_plugins()` re-populates the apps registry (`registry._reload_apps`) while `apps.ready` is False, so the `Apps.clear_cache()` calls inside `populate()` skip the per-model cache expiry. Before #13007 this did not matter: `AppMixin._reregister_contrib_apps()` reloaded the plugin's models module *after* the registry was ready, and the `register_model()` calls expired the caches. Since #13007 the plugin package is purged from `sys.modules` on every collect, so the models module is imported inside `populate()` instead, `app_config.models` is already filled and `_reregister_contrib_apps()` reloads nothing: core models keep relation trees built before the reload.
+
+**What it changes.**
+- `plugin/registry.py` `_reload_apps()`: `apps.clear_cache()` after the registry is populated again (both the `populate` and the `set_installed_apps` paths).
+- Test `plugin/test_plugin.py::RegistryTests::test_reload_expires_model_meta_caches`: the relation tree cached on `Group` before a `reload_plugins(full_reload=True, force_reload=True, collect=True)` is not the one in place afterwards.
+
+**Plugin side.** `auth/signals.py` no longer relies on the cascade at all: the Group and User `pre_delete` receivers delete the plugin's rows themselves (`tests/test_policy.py::DeletionCleanupTest` hides the relation the way the stale cache does). The plugin's test package also disables the purge for the test run (`tests/__init__.py`), because every `unittest.mock.patch` target misses once the test modules and the code under test hold different module objects; that is a test-ergonomics concern worth raising with the PR (core's own regression test for #13007 relies on the purge, so a plain `PLUGIN_TESTING` gate is not the answer).
+
+**Verification performed.** The regression test and `plugin.test_plugin` were run in the `inventree/inventree:latest` image (`dev/test-image.sh`), with the fix (pass) and without (the new test fails). Also NOT run: the rest of core's suite; the fork's QC workflow runs it on the stacked branch.
+
+---
+
 ## Environment notes (all patches)
 
 - The frontend uses `yarn.lock`; `yarn`/`corepack` are not installed here and `npm ci` is impossible (no `package-lock.json`). `npm install` fails with an ERESOLVE peer conflict (`@codecov/vite-plugin` vs `vite@7`), so `--legacy-peer-deps` was used; resolved versions may differ slightly from `yarn.lock`. `yarn.lock` and `package-lock.json` were not committed.
@@ -123,6 +140,6 @@ one alternative holding every role's scope (an AND; the loop variable was even n
 - [ ] Tests: patch 4 `OAuth2ScopeMapTest`; patch 1 `test_oauth2_provider_override`; patch 2 `test_account_login_preserves_next` plus a Playwright test for the `next` flow (login with `/web/?next=/api-doc/` style target); patch 3 a Playwright test with a mock plugin panel in the group drawer (the `inventree-plugin-creator` demo plugin can provide it). Run `invoke dev.test` for the touched backend apps in a proper environment.
 - [ ] `pre-commit run --all-files` (ruff, biome) and the frontend `yarn build`/`lib` build.
 - [ ] Run `invoke dev.translate` / `lingui extract` only if maintainers ask; otherwise leave locales to the translation workflow.
-- [ ] API version bump: patch 4 bumps to v558 (schema security requirements change); fill in the PR number in `api_version.py` and renumber if `master` has moved. Patches 1 to 3 need none. Frontend library version/changelog: patch 3 adds an entry.
+- [ ] API version bump: patch 4 bumps to v558 (schema security requirements change); fill in the PR number in `api_version.py` and renumber if `master` has moved. Patches 1 to 3 and 5 need none. Frontend library version/changelog: patch 3 adds an entry.
 - [ ] Patch 4: list the importer and generic metadata endpoints (above) in the PR text as a deliberate relaxation, or narrow the patch to `InvenTreeRoleScopeMixin` if maintainers object.
 - [ ] Squash/reword the commits if requested; remove the `Co-Authored-By` trailers if the project policy requires.

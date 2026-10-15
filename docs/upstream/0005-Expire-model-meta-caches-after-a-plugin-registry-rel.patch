@@ -1,0 +1,76 @@
+From e5b47c36368d98e9fe7b72c87a908706c30223f3 Mon Sep 17 00:00:00 2001
+From: lucaci32u4 <lucaci32u4@gmail.com>
+Date: Thu, 15 Oct 2026 18:09:15 +0300
+Subject: [PATCH] Expire model meta caches after a plugin registry reload
+
+reload_plugins() re-populates the Django apps registry (registry._reload_apps)
+while apps.ready is False, so the Apps.clear_cache() calls populate() makes
+skip the per-model cache expiry. Relation trees and field caches built before
+the reload then never learn about models registered during it.
+
+Since #13007 the plugin package is purged from sys.modules on every collect,
+so a plugin's models module is imported inside populate() rather than by
+AppMixin._reregister_contrib_apps() afterwards (which reloaded it with the
+registry ready, expiring the caches as a side effect). After a reload, core
+models no longer know the plugin's foreign keys: reverse accessors are
+missing and on_delete cascades are not collected, so deleting a Group or a
+User referenced by a plugin table fails on the database constraint.
+
+Call apps.clear_cache() once the registry is populated again.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/backend/InvenTree/plugin/registry.py    |  6 ++++++
+ src/backend/InvenTree/plugin/test_plugin.py | 19 +++++++++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/src/backend/InvenTree/plugin/registry.py b/src/backend/InvenTree/plugin/registry.py
+index 8f8a45018..41da965b0 100644
+--- a/src/backend/InvenTree/plugin/registry.py
++++ b/src/backend/InvenTree/plugin/registry.py
+@@ -1072,6 +1072,12 @@ class PluginsRegistry:
+         else:
+             self._try_reload(apps.set_installed_apps, loadable_apps)
+ 
++        # Both paths re-populate the registry while apps.ready is False, so the
++        # Apps.clear_cache() they run skips the per-model cache expiry: relation
++        # trees and field caches built before the reload would still miss the
++        # models registered during it (reverse accessors, on_delete cascades).
++        apps.clear_cache()
++
+     def _clean_installed_apps(self):
+         for plugin in self.installed_apps:
+             if plugin in settings.INSTALLED_APPS:
+diff --git a/src/backend/InvenTree/plugin/test_plugin.py b/src/backend/InvenTree/plugin/test_plugin.py
+index f96f0ec26..0a6e5322e 100644
+--- a/src/backend/InvenTree/plugin/test_plugin.py
++++ b/src/backend/InvenTree/plugin/test_plugin.py
+@@ -687,6 +687,25 @@ class RegistryTests(TestQueryMixin, PluginRegistryMixin, TestCase):
+             registry.registry_hash = 'abc'
+             self.assertTrue(registry.check_reload())
+ 
++    def test_reload_expires_model_meta_caches(self):
++        """A reload re-populates the apps registry, so cached model meta must be rebuilt.
++
++        Apps.populate() runs Apps.clear_cache() while apps.ready is False, which
++        skips the per-model cache expiry. Relation trees and field caches built
++        before the reload would then never learn about models registered during
++        it (plugin models after a package update): reverse accessors are
++        missing and on_delete cascades are not collected, so deleting the core
++        object fails on the database constraint.
++        """
++        from django.contrib.auth.models import Group
++
++        before = Group._meta._relation_tree  # computed and cached now
++
++        registry.reload_plugins(full_reload=True, force_reload=True, collect=True)
++
++        # Rebuilt (a new list), not the one cached before the reload
++        self.assertIsNot(Group._meta._relation_tree, before)
++
+     def test_check_reload_mismatch(self):
+         """Test that a persistent registry hash mismatch is reported, rather than looping.
+ 
+-- 
+2.56.0
+

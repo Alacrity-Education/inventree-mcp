@@ -187,6 +187,7 @@ dev/up.sh                                   # once: InvenTree + Authentik + demo
 dev/test.sh                                 # whole package (test_mcp.py + tests/)
 dev/test.sh inventree_mcp.tests.test_auth_flow
 dev/test.sh inventree_mcp.test_mcp          # the original suite
+dev/test-image.sh up latest && dev/test-image.sh test   # the suite in another InvenTree image (CI's `latest` = master)
 dev/oauth_smoke.py                          # live OAuth flow against http://localhost:8080
 dev/membership_e2e.py                       # live membership re-checks against the dev Authentik
 dev/permissions_e2e.py                      # live MCP permission set (parts-only MCP role) as e2e-member
@@ -212,6 +213,16 @@ CI (`.github/workflows/ci.yaml`) runs ruff, the frontend job (`npm ci`, lint, vi
 `check:bundles`) and `python -m build` with a wheel check (templates and bundles inside), then a
 matrix job against the real `inventree/inventree:stable` and `:latest` Docker images with
 Postgres.
+
+Mocks and InvenTree 1.6+: core (PR #13007) purges and re-imports the plugin's modules on every
+registry collect, and the test runner collects for every test class. `tests/__init__.py` disables
+that purge for the test run; without it every `unittest.mock.patch` target misses (the test
+modules keep the old module objects, the code under test lazily imports the fresh ones). Core's
+`AppMixin` still re-executes `models.py` on every reload on all versions, so a test module's model
+class is never the registry's: compare models by `_meta.label`, not identity, and never rely on
+`on_delete=CASCADE` from a core model into a plugin table (`auth/signals.py` deletes the plugin's
+rows itself on `pre_delete`). In `test_mcp.py`, patch the module objects it imported
+(`patch.object(view_resolution, ...)`), not dotted paths.
 
 ## Frontend
 

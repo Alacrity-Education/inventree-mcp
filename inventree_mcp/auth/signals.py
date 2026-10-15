@@ -23,8 +23,16 @@ user is active and in MCP_REQUIRED_GROUPS); otherwise the block stays.
 Other logins (password) only record ``last_login_at``, which the degraded
 "no upstream refresh token" mode reads.
 
+Deletions (``pre_delete`` on ``Group`` and on the user model): the plugin's
+rows are deleted here, not left to ``on_delete=CASCADE``. After a plugin
+registry reload on InvenTree 1.6+ (core PR #13007 purges and re-imports the
+plugin's modules) core models keep stale relation caches and no longer know
+the plugin's foreign keys, so the cascade is never collected and the
+database constraint fails the whole transaction.
+
 connect_signals() is called from the plugin's ``__init__`` and is idempotent
-(``dispatch_uid``); this module is never reloaded by InvenTree's registry.
+(``dispatch_uid``: the receivers connected first stay connected when
+InvenTree's registry re-imports this module).
 """
 
 from __future__ import annotations
@@ -247,12 +255,28 @@ def on_group_deleting(sender, instance=None, **kwargs):
     _deleting_groups.add(instance.pk)
     if granted:
         revoke_group_members(instance, "group with MCP permissions deleted")
+    # Not left to the cascade (see the module docstring); the rows' post_delete
+    # sees the marker above and revokes nothing more.
+    MCPRuleSet.objects.filter(group_id=instance.pk).delete()
 
 
 def on_group_deleted(sender, instance=None, **kwargs):
     """Group ``post_delete``: forget the in-progress marker."""
     if instance is not None:
         _deleting_groups.discard(instance.pk)
+
+
+def on_user_deleting(sender, instance=None, **kwargs):
+    """User ``pre_delete``: drop the user's MCPUserState row (not left to the cascade, see the module docstring)."""
+    if instance is None or instance.pk is None:
+        return
+    from .membership import models_available
+
+    if not models_available():
+        return
+    from ..models import MCPUserState
+
+    MCPUserState.objects.filter(user_id=instance.pk).delete()
 
 
 def on_ruleset_saving(sender, instance=None, raw=False, **kwargs):
@@ -289,6 +313,7 @@ def on_ruleset_deleted(sender, instance=None, **kwargs):
 def connect_signals() -> None:
     """Connect the login and ruleset receivers (idempotent)."""
     from allauth.account.signals import user_logged_in
+    from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group
     from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
 
@@ -309,6 +334,11 @@ def connect_signals() -> None:
         on_group_deleted,
         sender=Group,
         dispatch_uid="inventree_mcp.auth.signals.group_deleted",
+    )
+    pre_delete.connect(
+        on_user_deleting,
+        sender=get_user_model(),
+        dispatch_uid="inventree_mcp.auth.signals.user_deleting",
     )
     pre_save.connect(
         on_ruleset_saving,

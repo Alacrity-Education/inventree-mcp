@@ -113,7 +113,12 @@ class DiscoveryDocumentTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertEqual(writable[: len(read_only)], read_only)
 
 
-@override_settings(PLUGIN_TESTING_SETUP=True)
+@override_settings(
+    PLUGIN_TESTING_SETUP=True,
+    # Core's site-URL middleware answers 500 when the visited host differs from SITE_URL
+    SITE_URL="http://testserver",
+    CSRF_TRUSTED_ORIGINS=["http://testserver"],
+)
 class WellKnownRedirectTest(OAuthFacadeTestMixin, InvenTreeTestCase):
     """Core's /.well-known/<name>[/<anything>] redirects (InvenTree with WellKnownMixin only)."""
 
@@ -141,9 +146,6 @@ class WellKnownRedirectTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         self.assertIn(response.status_code, (301, 302))
         self.assertTrue(response["Location"].endswith(ASM_PATH))
 
-    @override_settings(
-        SITE_URL="http://testserver", CSRF_TRUSTED_ORIGINS=["http://testserver"]
-    )
     def test_index_lists_the_oauth_documents(self):
         data = Client().get(reverse("well-known:index")).json()["well_known_urls"]
         self.assertTrue(data["oauth-protected-resource"].endswith(PRM_PATH))

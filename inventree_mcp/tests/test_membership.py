@@ -39,6 +39,7 @@ from users.models import ApiToken
 from ..auth import membership, policy, tasks
 from ..auth.membership import Outcome
 from ..models import MCPRuleSet, MCPUserState
+from ..test_mcp import _raw_api_token
 from .oauth_helpers import (
     OAuthFacadeTestMixin,
     grant_mcp,
@@ -979,10 +980,13 @@ class TransportTest(MembershipTestCase):
 
     def setUp(self):
         super().setUp()
+        # The usable credential is only available right after creation (hmac
+        # digest storage on InvenTree master, see test_mcp._raw_api_token).
         self.api_token = ApiToken.objects.create(user=self.user, name="mcp test")
+        self.raw_api_token = _raw_api_token(self.api_token)
 
     def call_with_api_token(self):
-        return self.mcp_call(HTTP_AUTHORIZATION=f"Token {self.api_token.key}")
+        return self.mcp_call(HTTP_AUTHORIZATION=f"Token {self.raw_api_token}")
 
     def test_stale_check_queues_exactly_one_background_recheck(self):
         self.set_checked(hours_ago=2)
@@ -1033,7 +1037,7 @@ class TransportTest(MembershipTestCase):
 
         # The rest of InvenTree is unaffected.
         response = Client().get(
-            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.api_token.key}"
+            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.raw_api_token}"
         )
         self.assertEqual(response.status_code, 200, response.content)
 
@@ -1063,7 +1067,7 @@ class TransportTest(MembershipTestCase):
 
         # The interactive API is never affected.
         response = Client().get(
-            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.api_token.key}"
+            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.raw_api_token}"
         )
         self.assertEqual(response.status_code, 200, response.content)
 
@@ -1087,7 +1091,7 @@ class TransportTest(MembershipTestCase):
         self.assert_suspended(response, "sign in to InvenTree again")
 
         response = Client().get(
-            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.api_token.key}"
+            "/api/user/me/", HTTP_AUTHORIZATION=f"Token {self.raw_api_token}"
         )
         self.assertEqual(response.status_code, 200, response.content)
 
@@ -1258,6 +1262,7 @@ class MissingTableTest(MembershipTestCase):
     def setUp(self):
         super().setUp()
         self.api_token = ApiToken.objects.create(user=self.user, name="mcp test")
+        self.raw_api_token = _raw_api_token(self.api_token)
         membership._db_error_logged = False
         self.addCleanup(setattr, membership, "_db_error_logged", False)
 
@@ -1275,7 +1280,7 @@ class MissingTableTest(MembershipTestCase):
             self.assertEqual(
                 membership.long_lived_credential_allowed(self.user), (True, "")
             )
-            response = self.mcp_call(HTTP_AUTHORIZATION=f"Token {self.api_token.key}")
+            response = self.mcp_call(HTTP_AUTHORIZATION=f"Token {self.raw_api_token}")
             self.assertEqual(response.status_code, 200, response.content)
 
         warnings = [
