@@ -1,0 +1,86 @@
+# Local Caddy behind the external TLS proxy (plain HTTP on port 80, published as 8999). Adapted from InvenTree's
+# contrib/container/Caddyfile and the plugin's dev/Caddyfile.
+(cors-headers) {
+	header Allow GET,HEAD,OPTIONS
+	header Access-Control-Allow-Origin *
+	header Access-Control-Allow-Methods GET,HEAD,OPTIONS
+	header Access-Control-Allow-Headers Authorization,Content-Type,User-Agent,traceparent
+
+	@cors_preflight{args[0]} method OPTIONS
+
+	handle @cors_preflight{args[0]} {
+		respond "" 204
+	}
+}
+
+{
+	admin off
+	auto_https off
+	servers {
+		# X-Forwarded-For from the external proxy is kept only when it comes from a trusted address, so the plugin's
+		# per-client rate limits see the real client (set TRUSTED_PROXIES in .env to the proxy's address)
+		trusted_proxies static {$TRUSTED_PROXIES}
+	}
+}
+
+# internal health check for the compose healthcheck
+:9090 {
+	handle /api/system/health/* {
+		reverse_proxy inventree-server:8000
+	}
+	handle {
+		respond 404
+	}
+}
+
+:80 {
+	# OAuth callbacks carry authorization codes in the query string and in redirect Location headers
+	log {
+		output stdout
+		format filter {
+			request>uri query {
+				delete code
+				delete state
+			}
+			resp_headers>Location query {
+				delete code
+				delete state
+			}
+		}
+	}
+
+	encode gzip
+
+	# RFC 8414 / RFC 9728 path-insertion discovery URLs of the plugin's issuer and MCP endpoint. Core 1.6 answers them
+	# itself through its /.well-known/ index; the rewrites keep working on every version.
+	rewrite /.well-known/oauth-authorization-server/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/oauth-authorization-server
+	rewrite /.well-known/openid-configuration/plugin/inventree-mcp /plugin/inventree-mcp/.well-known/openid-configuration
+	rewrite /.well-known/oauth-protected-resource/plugin/inventree-mcp/mcp* /plugin/inventree-mcp/.well-known/oauth-protected-resource
+
+	request_body {
+		max_size 100MB
+	}
+
+	handle_path /static/* {
+		import cors-headers static
+		root * /var/www/static
+		file_server
+	}
+
+	handle_path /media/* {
+		import cors-headers media
+		root * /var/www/media
+		file_server
+		header Content-Disposition attachment
+		forward_auth inventree-server:8000 {
+			uri /auth/
+		}
+	}
+
+	reverse_proxy inventree-server:8000 {
+		# everything reaching this port came through https://{$PUBLIC_HOST}
+		header_up X-Forwarded-Proto https
+		header_up X-Forwarded-Host {$PUBLIC_HOST}
+		header_up Host {$PUBLIC_HOST}
+	}
+}

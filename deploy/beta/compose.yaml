@@ -1,0 +1,97 @@
+# Beta deployment of InvenTree + inventree-mcp on this machine. See README.md.
+# The external reverse proxy terminates TLS for https://${PUBLIC_HOST} and forwards to port 8999 here, where the
+# local Caddy does the OAuth discovery rewrites, serves static/media and forces the public origin headers.
+# Secrets come from ./.env (written by up.sh, git-ignored).
+name: inventree-mcp-beta
+
+x-inventree: &inventree
+  build:
+    context: ./image
+    args:
+      BASE_IMAGE: ${INVENTREE_IMAGE:-ghcr.io/alacrity-education/inventree:1.6.0-alacrity.1}
+      PLUGIN_WHEEL: ${PLUGIN_WHEEL:-https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.0/inventree_mcp-0.4.0-py3-none-any.whl}
+  image: inventree-mcp-beta:local
+  env_file:
+    - inventree.env
+  environment:
+    INVENTREE_SITE_URL: https://${PUBLIC_HOST:?run up.sh, it writes .env}
+    INVENTREE_ALLOWED_HOSTS: ${PUBLIC_HOST},localhost,127.0.0.1,inventree-server
+    INVENTREE_DB_NAME: ${DB_NAME:-inventree}
+    INVENTREE_DB_USER: ${DB_USER:-inventree}
+    INVENTREE_DB_PASSWORD: ${PG_PASS:?run up.sh, it writes .env}
+    INVENTREE_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?run up.sh, it writes .env}
+    # gunicorn's access log without query strings (SSO callbacks carry authorization codes)
+    GUNICORN_CMD_ARGS: "--access-logformat '%(h)s %(t)s \"%(m)s %(U)s %(H)s\" %(s)s %(b)s'"
+  volumes:
+    - ./data:/home/inventree/data
+  restart: unless-stopped
+
+services:
+  db:
+    # the restored data directory (pgdata/, Postgres 16 from the instance copy); POSTGRES_* only matter for an empty one
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${DB_USER:-inventree}
+      POSTGRES_PASSWORD: ${PG_PASS:?run up.sh, it writes .env}
+      POSTGRES_DB: ${DB_NAME:-inventree}
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-inventree}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  cache:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  inventree-server:
+    <<: *inventree
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "invoke server-health --address http://localhost:8000"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 180s
+
+  inventree-worker:
+    <<: *inventree
+    command: invoke worker
+    depends_on:
+      inventree-server:
+        condition: service_healthy
+
+  proxy:
+    image: caddy:alpine
+    ports:
+      - "8999:80"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-private_ranges}
+    depends_on:
+      inventree-server:
+        condition: service_healthy
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/static:/var/www/static:ro
+      - ./data/media:/var/www/media:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "--header=Host: localhost", "http://127.0.0.1:9090/api/system/health/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
