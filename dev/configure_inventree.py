@@ -13,6 +13,9 @@ from django.contrib.auth.models import Group
 
 from common.models import InvenTreeSetting
 
+# Authentik group -> InvenTree group (a plain literal: authentik/sso_smoke.py reads it with ast to derive its expectations)
+SSO_GROUP_MAP = {'inventree-users': 'Users', 'inventree-mcp': 'MCP Users'}
+
 SETTINGS = {
     'ENABLE_PLUGINS_URL': True,
     'ENABLE_PLUGINS_APP': True,
@@ -23,7 +26,7 @@ SETTINGS = {
     'LOGIN_ENABLE_SSO_GROUP_SYNC': True,
     'LOGIN_SIGNUP_SSO_AUTO': True,
     'SSO_GROUP_KEY': 'groups',
-    'SSO_GROUP_MAP': json.dumps({'inventree-users': 'Users', 'inventree-mcp': 'MCP Users'}),
+    'SSO_GROUP_MAP': json.dumps(SSO_GROUP_MAP),
     'SSO_REMOVE_GROUPS': True,
     # the demo data names a default group for new sign-ups ('all access'); a guest must end up in no group
     'SIGNUP_GROUP': '',

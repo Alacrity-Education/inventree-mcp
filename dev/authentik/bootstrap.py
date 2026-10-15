@@ -15,6 +15,13 @@ Prints {issuer, client_id, client_secret} as JSON on stdout and writes it to dev
 (git-ignored). The client secret is generated once and reused on re-runs.
   AUTHENTIK_URL=http://127.0.0.1:19000 AUTHENTIK_PUBLIC_URL=http://authentik.localtest.me:19000 \
   AUTHENTIK_BOOTSTRAP_TOKEN=... python3 bootstrap.py
+
+AUTHENTIK_BOOTSTRAP_TOKEN is read from dev/.env when it is not in the environment. Subcommands (for the e2e scripts):
+  python3 bootstrap.py groups USER                  print the Authentik group names of USER
+  python3 bootstrap.py set-groups USER [GROUP ...]  replace USER's groups (no GROUP = remove from all groups)
+  python3 bootstrap.py dev-password | public-url    print the shared constants (used by up.sh)
+Re-running the plain bootstrap restores the intended memberships of the four test users: it is the reset step after
+a scenario that changed them with set-groups.
 """
 from __future__ import annotations
 
@@ -44,6 +51,27 @@ USERS = {  # username -> groups
 }
 GROUPS_EXPRESSION = 'return {"groups": [group.name for group in request.user.groups.all()]}'
 TIMEOUT = 15
+ENV_FILE = HERE.parent / ".env"
+LOCAL_URL = "http://127.0.0.1:19000"
+# The container listens on 19000 and the host publishes 127.0.0.1:19000 (see compose.yaml); the same URL works in
+# the browser on the host and, through the network alias, inside the containers.
+DEFAULT_PUBLIC_URL = "http://authentik.localtest.me:19000"
+
+
+def public_url() -> str:
+    return os.environ.get("AUTHENTIK_PUBLIC_URL", DEFAULT_PUBLIC_URL)
+
+
+def load_env(path: Path = ENV_FILE) -> dict:
+    """KEY=VALUE lines of dev/.env (empty when the file does not exist)."""
+    values = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip()
+    return values
 
 
 class Api:
@@ -101,6 +129,39 @@ def wait_api(api: Api, seconds: int = 240) -> None:
             last = e
         time.sleep(3)
     raise RuntimeError(f"Authentik API/default flows not available: {last}")
+
+
+def api_from_env(base: str | None = None) -> Api:
+    """Api for the dev Authentik; the token comes from AUTHENTIK_BOOTSTRAP_TOKEN or dev/.env."""
+    token = os.environ.get("AUTHENTIK_BOOTSTRAP_TOKEN") or load_env().get("AUTHENTIK_BOOTSTRAP_TOKEN")
+    if not token:
+        raise RuntimeError("AUTHENTIK_BOOTSTRAP_TOKEN is not set and not in dev/.env (run dev/up.sh)")
+    return Api(base or os.environ.get("AUTHENTIK_URL", LOCAL_URL), token)
+
+
+def user_pk(api: Api, username: str) -> int:
+    user = api.find("/core/users/", username=username)
+    if not user:
+        raise RuntimeError(f"Authentik user {username!r} does not exist")
+    return user["pk"]
+
+
+def group_pk(api: Api, name: str) -> str:
+    group = api.find("/core/groups/", name=name)
+    if not group:
+        raise RuntimeError(f"Authentik group {name!r} does not exist")
+    return group["pk"]
+
+
+def user_groups(api: Api, username: str) -> list[str]:
+    user = api.call("GET", f"/core/users/{user_pk(api, username)}/")
+    return sorted(g["name"] for g in user.get("groups_obj", []))
+
+
+def set_user_groups(api: Api, username: str, group_names: list[str]) -> None:
+    """Replace the groups of one user (an empty list removes the user from every group)."""
+    pks = [group_pk(api, name) for name in group_names]
+    api.call("PATCH", f"/core/users/{user_pk(api, username)}/", {"groups": pks})
 
 
 def bootstrap(base: str, public: str, token: str, client_secret: str) -> dict:
@@ -173,18 +234,38 @@ def bootstrap(base: str, public: str, token: str, client_secret: str) -> dict:
             "client_secret": client_secret}
 
 
+def main(argv: list[str]) -> int:
+    command = argv[0] if argv else "bootstrap"
+    if command == "dev-password":
+        print(DEV_PASSWORD)
+    elif command == "public-url":
+        print(public_url())
+    elif command == "groups" and len(argv) == 2:
+        print("\n".join(user_groups(api_from_env(), argv[1])))
+    elif command == "set-groups" and len(argv) >= 2:
+        api = api_from_env()
+        set_user_groups(api, argv[1], argv[2:])
+        print(f"{argv[1]}: {', '.join(user_groups(api, argv[1])) or '(no groups)'}")
+    elif command == "bootstrap" and len(argv) <= 1:
+        url = os.environ.get("AUTHENTIK_URL", LOCAL_URL)
+        token = api_from_env(url).token
+        secret = None
+        if OUTPUT.exists():
+            secret = json.loads(OUTPUT.read_text()).get("client_secret")
+        wait_ready(url)
+        result = bootstrap(url, public_url(), token, secret or secrets.token_urlsafe(32))
+        OUTPUT.write_text(json.dumps(result, indent=2) + "\n")
+        OUTPUT.chmod(0o600)
+        json.dump(result, sys.stdout, indent=2)
+        print()
+    else:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return 0
+
+
 if __name__ == "__main__":
-    url = os.environ.get("AUTHENTIK_URL", "http://127.0.0.1:19000")
-    public_url = os.environ.get("AUTHENTIK_PUBLIC_URL", "http://authentik.localtest.me:19000")
-    token = os.environ.get("AUTHENTIK_BOOTSTRAP_TOKEN")
-    if not token:
-        sys.exit("AUTHENTIK_BOOTSTRAP_TOKEN is not set (dev/up.sh exports it from dev/.env)")
-    secret = None
-    if OUTPUT.exists():
-        secret = json.loads(OUTPUT.read_text()).get("client_secret")
-    wait_ready(url)
-    result = bootstrap(url, public_url, token, secret or secrets.token_urlsafe(32))
-    OUTPUT.write_text(json.dumps(result, indent=2) + "\n")
-    OUTPUT.chmod(0o600)
-    json.dump(result, sys.stdout, indent=2)
-    print()
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except RuntimeError as e:
+        sys.exit(f"bootstrap.py: {e}")

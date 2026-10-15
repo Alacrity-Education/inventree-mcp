@@ -28,8 +28,15 @@
 }
 
 :80 {
+	# the OAuth callback carries the upstream authorization code in its query string; keep it out of the log
 	log {
 		output stdout
+		format filter {
+			request>uri query {
+				delete code
+				delete state
+			}
+		}
 	}
 
 	encode gzip

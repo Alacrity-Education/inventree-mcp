@@ -164,5 +164,4 @@ cython_debug/
 # Dev environment (dev/)
 dev/data/
 dev/.env
-dev/.ready
 dev/authentik/.bootstrap.json

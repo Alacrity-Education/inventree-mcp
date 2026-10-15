@@ -12,25 +12,27 @@ if [[ ! -f .env ]]; then
     fi
     log "generating dev/.env"
     rnd() { python3 -c "import secrets; print(secrets.token_urlsafe($1))"; }
-    umask 077
-    {
-        echo "PG_PASS=$(rnd 24)"
-        echo "AUTHENTIK_SECRET_KEY=$(rnd 48)"
-        echo "AUTHENTIK_BOOTSTRAP_PASSWORD=$(rnd 18)"
-        echo "AUTHENTIK_BOOTSTRAP_TOKEN=$(rnd 32)"
-        echo "AUTHENTIK_PORT=19000"
-    } > .env
-    umask 022
+    (
+        umask 077
+        {
+            echo "PG_PASS=$(rnd 24)"
+            echo "AUTHENTIK_SECRET_KEY=$(rnd 48)"
+            echo "AUTHENTIK_BOOTSTRAP_PASSWORD=$(rnd 18)"
+            echo "AUTHENTIK_BOOTSTRAP_TOKEN=$(rnd 32)"
+        } > .env
+    )
 fi
 set -a; source .env; set +a
-PORT="${AUTHENTIK_PORT:-19000}"
-PUBLIC_URL="http://authentik.localtest.me:${PORT}"
+# one source for the shared constants: authentik/bootstrap.py (Authentik is published on 127.0.0.1:19000 only)
+PUBLIC_URL="$(python3 authentik/bootstrap.py public-url)"
+DEV_PASSWORD="$(python3 authentik/bootstrap.py dev-password)"
 
 mkdir -p data
 cp config/plugins.txt data/plugins.txt
 
 HOSTS_OK=1
-if ! getent hosts authentik.localtest.me | grep -qE '(^|[[:space:]])(127\.0\.0\.1|::1)([[:space:]]|$)'; then
+# the published port is bound on 127.0.0.1 (IPv4), so an IPv4 loopback answer is required (getent ahosts lists them all)
+if ! getent ahosts authentik.localtest.me | grep -qE '^127\.0\.0\.1[[:space:]]'; then
     HOSTS_OK=0
 fi
 hosts_warning() {
@@ -48,15 +50,16 @@ MSG
 hosts_warning
 
 # --- 2. database, cache, mail and Authentik ------------------------------------------------------------------------
-log "starting db, cache, mailpit and Authentik (first run pulls ~1 GB of images)"
+log "starting db, cache, mailpit and Authentik (first run pulls ~2 GB of images)"
 dc up -d --wait --wait-timeout 900 db cache mailpit authentik-db authentik-server authentik-worker
 
 # --- 3. bootstrap Authentik, render config.yaml -----------------------------------------------------------------------
 log "bootstrapping Authentik"
-AUTHENTIK_URL="http://127.0.0.1:${PORT}" AUTHENTIK_PUBLIC_URL="$PUBLIC_URL" \
+AUTHENTIK_URL="http://127.0.0.1:19000" AUTHENTIK_PUBLIC_URL="$PUBLIC_URL" \
     python3 authentik/bootstrap.py > /dev/null
 [[ -s authentik/.bootstrap.json ]] || die "authentik/.bootstrap.json was not written"
 
+need_restart=0
 server_was_running="$(dc ps -q --status running inventree-server)"
 python3 - <<'PY'
 import json, pathlib
@@ -71,14 +74,18 @@ pathlib.Path("data/.config-changed").write_text("1" if old != t else "0")
 PY
 config_changed="$(cat data/.config-changed)"; rm -f data/.config-changed
 
+# gunicorn preloads the app, so config.yaml and the global settings that switch plugin URLs on are only picked up by a
+# restart; that re-runs the entrypoint (pip install, invoke update), so it is done at most once per up.sh run.
+restart_inventree() {
+    log "restarting InvenTree ($1)"
+    dc restart inventree-server inventree-worker
+    dc up -d --wait --wait-timeout 600 inventree-server inventree-worker proxy
+}
+
 # --- 4. InvenTree -----------------------------------------------------------------------------------------------------
 log "starting InvenTree server, worker and proxy (first run runs migrations, takes a few minutes)"
 dc up -d --wait --wait-timeout 1200 inventree-server inventree-worker proxy
-if [[ -n "$server_was_running" && "$config_changed" == 1 ]]; then
-    log "config.yaml changed, restarting InvenTree"
-    dc restart inventree-server inventree-worker
-    dc up -d --wait --wait-timeout 600 inventree-server inventree-worker proxy
-fi
+[[ -n "$server_was_running" && "$config_changed" == 1 ]] && need_restart=1
 
 # --- 5. demo data (once), configuration (every time) -----------------------------------------------------
 if [[ ! -f data/.demo-loaded ]]; then
@@ -108,10 +115,14 @@ log "configuring InvenTree (settings, groups)"
 dcx inventree-server python src/backend/InvenTree/manage.py shell < configure_inventree.py 2>&1 | tee data/configure.log \
     | grep -E '^(setting|admin|group|configure|SETTINGS)' || true
 grep -q '^configure_inventree: done' data/configure.log || die "configure_inventree.py failed (see output above)"
-if grep -q '^SETTINGS_CHANGED' data/configure.log; then
-    log "settings changed, restarting InvenTree so every gunicorn worker serves the plugin URLs"
-    dc restart inventree-server inventree-worker
-    dc up -d --wait --wait-timeout 600 inventree-server inventree-worker proxy
+grep -q '^SETTINGS_CHANGED' data/configure.log && need_restart=1
+if [[ "$need_restart" == 1 ]]; then
+    restart_inventree "config.yaml or settings changed, so every gunicorn worker serves the plugin URLs and the SSO config"
+fi
+
+# the OIDC issuer must resolve inside the container too (network alias on authentik-server)
+if ! dcx inventree-server python -c "import urllib.request as u; u.urlopen('${PUBLIC_URL}/application/o/inventree/.well-known/openid-configuration', timeout=10)" >/dev/null 2>&1; then
+    echo "WARNING: the InvenTree container cannot reach ${PUBLIC_URL}; SSO login will fail (see dev/README.md, Authentik reachability)" >&2
 fi
 
 # --- 6. summary -----------------------------------------------------------------------------------------------------
@@ -124,7 +135,7 @@ InvenTree MCP dev stack is up.
   Authentik admin           ${PUBLIC_URL}   akadmin / ${AUTHENTIK_BOOTSTRAP_PASSWORD}
   Mailpit                   http://127.0.0.1:8025
 
-  SSO test accounts (password: dev-password-123)
+  SSO test accounts (password: ${DEV_PASSWORD})
     e2e-member       groups inventree-users + inventree-mcp  -> InvenTree groups Users + MCP Users
     e2e-interactive  groups inventree-users                  -> Users
     e2e-guest        groups inventree-guests                 -> logs in, no InvenTree group

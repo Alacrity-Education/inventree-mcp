@@ -11,24 +11,33 @@ password stages, follows back into InvenTree and finally calls GET /api/user/me/
   e2e-nonmember  -> refused by Authentik
 
 Usage: python3 dev/authentik/sso_smoke.py [username ...]   (default: all four scenarios). Exit code 1 on failure.
+
+Importable by other scripts (put dev/authentik on sys.path): Browser, browse(..., stop=...), sso_login(username) and
+SsoRefused. browse(stop=callable) returns ("stopped", url, status, "") as soon as the next redirect target matches,
+so an OAuth client flow can stop at its own redirect_uri instead of fetching it.
 """
 from __future__ import annotations
 
 import http.cookiejar
 import json
 import os
+import ast
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Callable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bootstrap import DEV_PASSWORD, USERS, public_url  # noqa: E402  (the shared constants)
 
 HERE = Path(__file__).resolve().parent
 DEV = HERE.parent
 INVENTREE = os.environ.get("INVENTREE_URL", "http://localhost:8080")
-AUTHENTIK = os.environ.get("AUTHENTIK_PUBLIC_URL", "http://authentik.localtest.me:19000")
-PASSWORD = "dev-password-123"
+AUTHENTIK = public_url()
+PASSWORD = DEV_PASSWORD
 PROVIDER = "authentik"
 TIMEOUT = 30
 FAILED = False
@@ -112,15 +121,19 @@ def run_flow(browser: Browser, flow_url: str, username: str, password: str) -> t
     raise RuntimeError("Authentik flow did not finish")
 
 
-def browse(browser: Browser, url: str, username: str, password: str):
-    """Follows redirects across InvenTree and Authentik (running Authentik flows) until a non-redirect response or the
-    final callback target. Returns (kind, url, status, text)."""
+def browse(browser: Browser, url: str, username: str, password: str, stop: Callable[[str], bool] | None = None):
+    """Follows redirects across InvenTree and Authentik (running Authentik flows) until a non-redirect response.
+    Returns (kind, url, status, text); kind is "page", "authentik-denied" or, when stop(url) is true for the next
+    redirect target, "stopped" (the target is not fetched; status is that of the redirecting response)."""
+    status = 0
     for _ in range(30):
+        if stop is not None and stop(url):
+            return "stopped", url, status, ""
         if url.startswith(AUTHENTIK) and "/if/flow/" in url:
             outcome, target = run_flow(browser, url, username, password)
             if outcome == "denied":
                 return "authentik-denied", url, 403, target
-            url = target
+            url, status = target, 302
             continue
         status, headers, text = browser.request("GET", url)
         if status in (301, 302, 303, 307):
@@ -154,8 +167,27 @@ def start_login(browser: Browser) -> str:
     return absolute(INVENTREE, headers["Location"])
 
 
+class SsoRefused(RuntimeError):
+    """Authentik refused the user, or the round trip did not end on InvenTree's logged-in page."""
+
+
+def sso_login(username: str, password: str = PASSWORD, browser: Browser | None = None) -> Browser:
+    """Full SSO login through allauth headless and Authentik. Returns the Browser holding the InvenTree session
+    cookie; raises SsoRefused when Authentik refuses the user or the final page is not /web/logged-in with 200."""
+    browser = browser or Browser()
+    authorize = start_login(browser)
+    if not authorize.startswith(AUTHENTIK):
+        raise SsoRefused(f"{username}: InvenTree did not redirect into Authentik: {authorize[:100]}")
+    kind, url, status, text = browse(browser, authorize, username, password)
+    if kind == "authentik-denied":
+        raise SsoRefused(f"{username}: refused by Authentik ({status}: {text[:200]})")
+    if kind != "page" or status != 200 or urllib.parse.urlparse(url).path != "/web/logged-in":
+        raise SsoRefused(f"{username}: round trip ended on {kind} {status} {url[:100]}: {text[:300]}")
+    return browser
+
+
 def inventree_state(username: str) -> dict:
-    """Groups and stored upstream refresh token of the InvenTree user (read through the Django shell)."""
+    """Groups and stored upstream refresh token of the InvenTree user (read through dev/shell.sh)."""
     code = (
         "import json\n"
         "from django.contrib.auth import get_user_model\n"
@@ -164,39 +196,44 @@ def inventree_state(username: str) -> dict:
         "print('STATE ' + json.dumps(None if u is None else {\n"
         "  'groups': sorted(u.groups.values_list('name', flat=True)),\n"
         "  'refresh_token': any(bool(t.token_secret) for t in SocialToken.objects.filter(account__user=u))}))\n")
-    out = subprocess.run(
-        ["docker", "compose", "-f", str(DEV / "compose.yaml"), "--project-directory", str(DEV), "exec", "-T",
-         "inventree-server", "python", "src/backend/InvenTree/manage.py", "shell"],
-        input=code, capture_output=True, text=True, check=True,
-        env={**os.environ, "PG_PASS": "unset", "AUTHENTIK_SECRET_KEY": "unset"}).stdout
+    out = subprocess.run([str(DEV / "shell.sh"), "-c", code], capture_output=True, text=True, check=True).stdout
     line = next(line for line in out.splitlines() if line.startswith("STATE "))
     return json.loads(line[6:])
 
 
+def expected_groups(username: str) -> list[str]:
+    """InvenTree groups a user ends up in: bootstrap.USERS (Authentik groups) through SSO_GROUP_MAP of
+    configure_inventree.py (read as a literal, that file needs Django and cannot be imported here)."""
+    tree = ast.parse((DEV / "configure_inventree.py").read_text())
+    mapping = next(ast.literal_eval(node.value) for node in tree.body
+                   if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "SSO_GROUP_MAP" for t in node.targets))
+    return sorted(mapping[g] for g in USERS[username] if g in mapping)
+
+
 def scenario(username: str) -> None:
-    browser = Browser()
     try:
-        authorize = start_login(browser)
+        browser = sso_login(username)
+    except SsoRefused as e:
+        if username == "e2e-nonmember":
+            check("e2e-nonmember: refused by Authentik", "refused by Authentik" in str(e), str(e)[:120])
+            state = inventree_state(username)
+            check("e2e-nonmember: no InvenTree user created", state is None, str(state))
+        else:
+            check(f"{username}: SSO round trip ends on /web/logged-in with 200", False, str(e))
+        return
     except RuntimeError as e:
         check(f"{username}: allauth login start", False, str(e))
         return
-    check(f"{username}: InvenTree redirects into Authentik", authorize.startswith(AUTHENTIK), authorize[:80])
-    kind, url, status, text = browse(browser, authorize, username, PASSWORD)
     if username == "e2e-nonmember":
-        check("e2e-nonmember: refused by Authentik", kind == "authentik-denied", f"{kind} {status}")
-        state = inventree_state(username)
-        check("e2e-nonmember: no InvenTree user created", state is None, str(state))
+        check("e2e-nonmember: refused by Authentik", False, "login succeeded")
         return
-    if not check(f"{username}: round trip ends back on InvenTree", kind == "page" and url.startswith(INVENTREE),
-                 f"{kind} {status} {url[:100]}"):
-        print(text[:500])
-        return
+    check(f"{username}: SSO round trip ends on /web/logged-in with 200", True)
     status, _, text = browser.request("GET", f"{INVENTREE}/api/user/me/", headers={"Accept": "application/json"})
     me = json.loads(text) if status == 200 else {}
     check(f"{username}: GET /api/user/me/ with the session cookie", status == 200 and me.get("username") == username,
           f"{status} username={me.get('username')}")
     state = inventree_state(username)
-    expected = {"e2e-member": ["MCP Users", "Users"], "e2e-interactive": ["Users"], "e2e-guest": []}[username]
+    expected = expected_groups(username)
     check(f"{username}: InvenTree groups == {expected}", state is not None and state["groups"] == expected,
           str(state and state["groups"]))
     if username == "e2e-member":
@@ -205,6 +242,6 @@ def scenario(username: str) -> None:
 
 
 if __name__ == "__main__":
-    for name in sys.argv[1:] or ["e2e-member", "e2e-interactive", "e2e-guest", "e2e-nonmember"]:
+    for name in sys.argv[1:] or list(USERS):
         scenario(name)
     sys.exit(1 if FAILED else 0)

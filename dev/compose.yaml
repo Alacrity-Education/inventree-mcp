@@ -1,6 +1,6 @@
 # Disposable development and test stack for the InvenTree MCP plugin. See dev/README.md.
 # Secrets for the dev Authentik come from ./.env, which up.sh generates (git-ignored, never commit it).
-# Published ports (loopback unless noted): 8080 proxy, 8000 gunicorn, 8025 Mailpit, 19000 Authentik (all interfaces).
+# Published ports, all on 127.0.0.1 only: 8080 proxy, 8000 gunicorn, 8025 Mailpit, 19000 Authentik.
 # Nothing is published on 5432, 80 or 443.
 name: inventree-mcp-dev
 
@@ -10,15 +10,25 @@ x-inventree: &inventree
     - inventree.env
   # root so that `pip install -e` into the image's site-packages works (same as upstream CI)
   user: root
-  # The browser on the host and the containers must reach Authentik under the same URL
-  extra_hosts:
-    - "authentik.localtest.me:host-gateway"
   volumes:
     - ./data:/home/inventree/data
     - ..:/home/inventree/plugins/inventree-mcp
     - ../../demo-dataset:/home/inventree/demo:ro
     - ./entrypoint.sh:/dev-entrypoint.sh:ro
   entrypoint: ["/bin/bash", "/dev-entrypoint.sh"]
+
+x-authentik-env: &authentik-env
+    AUTHENTIK_POSTGRESQL__HOST: authentik-db
+    AUTHENTIK_POSTGRESQL__NAME: authentik
+    AUTHENTIK_POSTGRESQL__USER: authentik
+    AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+    AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?run dev/up.sh, it writes dev/.env}
+    AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+    AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+    AUTHENTIK_BOOTSTRAP_EMAIL: admin@example.test
+    AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+    AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
 
 services:
   db:
@@ -109,21 +119,29 @@ services:
   authentik-server:
     image: ${AUTHENTIK_IMAGE:-ghcr.io/goauthentik/server}:${AUTHENTIK_TAG:-2026.8.3}
     command: server
-    environment: &authentik-env
-      AUTHENTIK_POSTGRESQL__HOST: authentik-db
-      AUTHENTIK_POSTGRESQL__NAME: authentik
-      AUTHENTIK_POSTGRESQL__USER: authentik
-      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
-      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?run dev/up.sh, it writes dev/.env}
-      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
-      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
-      AUTHENTIK_BOOTSTRAP_EMAIL: admin@example.test
-      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
-      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
-      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+    # The browser on the host and the InvenTree containers must reach Authentik under one URL, because the OIDC issuer
+    # is derived from it: http://authentik.localtest.me:19000. On the host *.localtest.me resolves to 127.0.0.1 and
+    # the port is published on loopback only; inside the compose network the alias below points at this container.
+    # That needs Authentik to listen on 19000 inside the container (default 9000), hence AUTHENTIK_LISTEN__HTTP.
+    # FALLBACK if this container never becomes healthy: the image's healthcheck (`ak healthcheck`) then still probes
+    # the default port 9000 and does not honour the listen setting. Add to this service
+    #     healthcheck:
+    #       test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:19000/-/health/live/ || exit 1"]
+    #       interval: 30s
+    #       timeout: 10s
+    #       retries: 5
+    #       start_period: 60s
+    # If Authentik does not accept 19000 at all, revert to the old layout: publish 127.0.0.1:19000:9000 and add
+    # extra_hosts "authentik.localtest.me:host-gateway" to x-inventree again.
+    environment:
+      <<: *authentik-env
+      AUTHENTIK_LISTEN__HTTP: 0.0.0.0:19000
     ports:
-      # all interfaces on purpose: containers reach it through host-gateway
-      - "0.0.0.0:${AUTHENTIK_PORT:-19000}:9000"
+      - "127.0.0.1:19000:19000"
+    networks:
+      default:
+        aliases:
+          - authentik.localtest.me
     shm_size: 512mb
     depends_on:
       authentik-db:
