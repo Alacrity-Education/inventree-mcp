@@ -219,9 +219,10 @@ registry collect, and the test runner collects for every test class. `tests/__in
 that purge for the test run; without it every `unittest.mock.patch` target misses (the test
 modules keep the old module objects, the code under test lazily imports the fresh ones). Core's
 `AppMixin` still re-executes `models.py` on every reload on all versions, so a test module's model
-class is never the registry's: compare models by `_meta.label`, not identity, and never rely on
+class is never the registry's: compare models by `_meta.label`, not identity, never rely on
 `on_delete=CASCADE` from a core model into a plugin table (`auth/signals.py` deletes the plugin's
-rows itself on `pre_delete`). In `test_mcp.py`, patch the module objects it imported
+rows itself on `pre_delete`), and have every receiver connected to a plugin model check
+`instance._meta.label` (Django matches senders by `id()`, and a dead class's id gets reused). In `test_mcp.py`, patch the module objects it imported
 (`patch.object(view_resolution, ...)`), not dotted paths.
 
 ## Frontend

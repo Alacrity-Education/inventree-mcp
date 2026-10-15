@@ -653,3 +653,22 @@ class DeletionCleanupTest(PermissionSetTestCase):
 
         self.assertFalse(MCPUserState.objects.filter(user_id=pk).exists())
         connection.check_constraints()
+
+
+class RulesetReceiverGuardTest(PermissionSetTestCase):
+    """The ruleset receivers ignore rows of other models.
+
+    Django matches signal senders by id(). InvenTree re-executes the plugin's
+    models module on every registry reload, so a dead MCPRuleSet class's id
+    can be reused by another model's class, and the receivers connected for
+    the dead class then fire for that model's rows (seen on InvenTree master:
+    a MCPUserState save ran the pre_save receiver's ruleset query).
+    """
+
+    def test_receivers_ignore_other_models(self):
+        state = MCPUserState.objects.create(user=self.user)
+        with self.assertNumQueries(0):
+            signals.on_ruleset_saving(MCPUserState, instance=state)
+            signals.on_ruleset_saved(MCPUserState, instance=state)
+            signals.on_ruleset_deleted(MCPUserState, instance=state)
+        self.assertFalse(hasattr(state, "_mcp_previous_flags"))

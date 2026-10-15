@@ -279,9 +279,14 @@ def on_user_deleting(sender, instance=None, **kwargs):
     MCPUserState.objects.filter(user_id=instance.pk).delete()
 
 
+def _is_ruleset(instance) -> bool:
+    """Whether *instance* is an MCPRuleSet row (the receivers below check, see connect_signals)."""
+    return instance is not None and instance._meta.label == _RULESET_MODEL
+
+
 def on_ruleset_saving(sender, instance=None, raw=False, **kwargs):
     """MCPRuleSet ``pre_save``: remember the stored flags for the reduction check."""
-    if raw or instance is None or instance.pk is None:
+    if raw or not _is_ruleset(instance) or instance.pk is None:
         return
     instance._mcp_previous_flags = (
         type(instance).objects.filter(pk=instance.pk).values(*_flags()).first()
@@ -290,8 +295,10 @@ def on_ruleset_saving(sender, instance=None, raw=False, **kwargs):
 
 def on_ruleset_saved(sender, instance=None, created=False, raw=False, **kwargs):
     """MCPRuleSet ``post_save``: a flag that went from true to false revokes the group's tokens."""
-    previous = getattr(instance, "_mcp_previous_flags", None) if instance else None
-    if raw or created or not previous:
+    if raw or created or not _is_ruleset(instance):
+        return
+    previous = getattr(instance, "_mcp_previous_flags", None)
+    if not previous:
         return
     instance._mcp_previous_flags = None
     if any(previous[flag] and not getattr(instance, flag) for flag in _flags()):
@@ -300,7 +307,7 @@ def on_ruleset_saved(sender, instance=None, created=False, raw=False, **kwargs):
 
 def on_ruleset_deleted(sender, instance=None, **kwargs):
     """MCPRuleSet ``post_delete``: a deleted row that granted something revokes too."""
-    if instance is None or instance.group_id in _deleting_groups:
+    if not _is_ruleset(instance) or instance.group_id in _deleting_groups:
         return
     if grants_anything([instance]):
         from django.contrib.auth.models import Group
@@ -311,7 +318,16 @@ def on_ruleset_deleted(sender, instance=None, **kwargs):
 
 
 def connect_signals() -> None:
-    """Connect the login and ruleset receivers (idempotent)."""
+    """Connect the login and ruleset receivers (idempotent).
+
+    The ruleset receivers are connected to the model by name: every call (the
+    plugin's ``__init__``, so every registry reload) binds the class currently
+    registered, because InvenTree re-executes the plugin's models module on
+    each reload. Earlier classes die, and Django matches senders by ``id()``,
+    so a later class (of any model) can reuse a dead class's id and the stale
+    entry then fires for its rows: the receivers check the instance's model
+    themselves (``_is_ruleset``).
+    """
     from allauth.account.signals import user_logged_in
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group
