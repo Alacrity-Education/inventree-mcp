@@ -38,11 +38,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
+from asgiref.sync import sync_to_async
 from mcp.types import ListToolsResult, PaginatedRequestParams
 
 from . import proxy
 from .context import has_bound_identity
 from .mcp_server import mcp
+from .settings import get_plugin_setting
 from .tools.discovery import RESOURCE_LOADERS
 
 if TYPE_CHECKING:
@@ -188,6 +190,10 @@ def apply() -> None:
         ctx: ServerRequestContext, params: PaginatedRequestParams | None
     ) -> ListToolsResult:
         tools = await unfiltered_list_tools()
+        # Off by default: every tool is listed and a call the user may not
+        # make fails with a permission error (call_view() enforces either way).
+        if not await sync_to_async(get_plugin_setting)("MCP_FILTER_TOOL_LIST", False):
+            return ListToolsResult(tools=list(tools))
         names = await visible_tool_names(tool.name for tool in tools)
         return ListToolsResult(tools=[tool for tool in tools if tool.name in names])
 

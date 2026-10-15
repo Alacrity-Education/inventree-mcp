@@ -87,6 +87,12 @@ class InvenTreeMCP(
             "validator": bool,
             "default": False,
         },
+        "MCP_FILTER_TOOL_LIST": {
+            "name": "Hide Unavailable Tools",
+            "description": "List only the tools the calling user may use (tools/list). Off: every tool is listed, and a call the user may not make fails with a permission error.",
+            "validator": bool,
+            "default": False,
+        },
         "OAUTH_ENABLED": {
             "name": "Enable OAuth Sign-in",
             "description": "Serve OAuth discovery and the OAuth endpoints under /plugin/inventree-mcp/, so MCP clients such as Claude can connect by signing in through the browser. Changes DOT token lifetimes for the whole instance (see the lifetime settings). InvenTree 1.5.x also needs the reverse-proxy rewrites from the plugin README for /.well-known/ discovery.",

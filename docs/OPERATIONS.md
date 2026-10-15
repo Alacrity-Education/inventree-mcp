@@ -85,6 +85,7 @@ workers), no restart needed.
 |---|---|---|---|
 | `REQUIRE_AUTH` | `True` | `True` | off only for local testing |
 | `MCP_READ_ONLY` | `True` | `True` | strips the add / change / delete scopes; MCP write roles take effect only when off |
+| `MCP_FILTER_TOOL_LIST` | `False` | `False` | on: `tools/list` shows only the tools the caller may use; off: every tool is listed and a refused call fails with a permission error (enforcement is per call either way) |
 | `MCP_LOG_TOOL_CALLS` | `False` | `False` | logs tool name, arguments and the calling **username**; for debugging only (see §7) |
 | `MCP_SUPERUSER_FULL_ACCESS` | `False` | `False` | superusers are limited by their groups' MCP roles like everybody else |
 | `MCP_ALLOW_BASIC_AUTH` | `False` | `False` | username and password on `/mcp/`; prefer API tokens for scripts |

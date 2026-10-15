@@ -222,6 +222,8 @@ class TransportNarrowingTest(PermissionSetTestCase):
         self.api_token = api_token_for(self.user)
         # No background membership re-check is queued for the API token here.
         self.set_setting("MEMBERSHIP_ENFORCED", False)
+        # these tests read the narrowing off the advertised tool list
+        self.set_setting("MCP_FILTER_TOOL_LIST", True)
 
     def tools(self, **headers) -> set[str]:
         response = self.mcp_call(**headers)

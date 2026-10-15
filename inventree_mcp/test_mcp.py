@@ -18,7 +18,7 @@ from typing import Any, ClassVar
 from unittest.mock import patch
 
 import jsonschema
-from asgiref.sync import sync_to_async
+from asgiref.sync import async_to_sync, sync_to_async
 from build.models import Build, BuildItem
 from build.serializers import BuildSerializer
 from common.models import Attachment, Parameter, ParameterTemplate, ProjectCode
@@ -2173,8 +2173,10 @@ class MCPTransportTest(InvenTreeTestCase):
         (see AGENTS.md's Output schemas section).
 
         cls.user has zero roles here (MCPTransportTest.roles is never set -
-        see UserMixin's default), so only the ungated tools should appear.
+        see UserMixin's default), so only the ungated tools should appear
+        once MCP_FILTER_TOOL_LIST is on (off by default, see the next test).
         """
+        registry.get_plugin("inventree-mcp").set_setting("MCP_FILTER_TOOL_LIST", True)
         response = self._list_tools(HTTP_AUTHORIZATION=f"Token {self.api_token}")
 
         self.assertEqual(response.status_code, 200)
@@ -2185,6 +2187,23 @@ class MCPTransportTest(InvenTreeTestCase):
         self.assertIn("list_project_codes", names)
         self.assertNotIn("list_parts", names)
         self.assertNotIn("list_purchase_orders", names)
+
+    def test_tools_list_over_http_shows_every_tool_by_default(self):
+        """MCP_FILTER_TOOL_LIST off (the default): a zero-role caller still sees
+        every registered tool; the call itself is refused with a permission
+        error (MCPToolPermissionTest covers that).
+        """
+        registry.get_plugin("inventree-mcp").set_setting("MCP_FILTER_TOOL_LIST", False)
+        response = self._list_tools(HTTP_AUTHORIZATION=f"Token {self.api_token}")
+
+        self.assertEqual(response.status_code, 200)
+        names = {
+            tool["name"] for tool in json.loads(response.content)["result"]["tools"]
+        }
+        registered = {tool.name for tool in async_to_sync(mcp.list_tools)()}
+        self.assertEqual(names, registered)
+        self.assertIn("list_parts", names)
+        self.assertIn("list_purchase_orders", names)
 
 
 @override_settings(PLUGIN_TESTING_SETUP=True)

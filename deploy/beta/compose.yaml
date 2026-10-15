@@ -9,7 +9,7 @@ x-inventree: &inventree
     context: ./image
     args:
       BASE_IMAGE: ${INVENTREE_IMAGE:-ghcr.io/alacrity-education/inventree:1.6.0-alacrity.1}
-      PLUGIN_WHEEL: ${PLUGIN_WHEEL:-https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.1/inventree_mcp-0.4.1-py3-none-any.whl}
+      PLUGIN_WHEEL: ${PLUGIN_WHEEL:-https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.2/inventree_mcp-0.4.2-py3-none-any.whl}
   image: inventree-mcp-beta:local
   env_file:
     - inventree.env

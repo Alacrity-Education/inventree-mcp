@@ -40,7 +40,7 @@ This fork is not on PyPI. Install the wheel attached to the latest release on
 `pip install` it into the InvenTree environment:
 
 ```bash
-pip install https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.1/inventree_mcp-0.4.1-py3-none-any.whl
+pip install https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.2/inventree_mcp-0.4.2-py3-none-any.whl
 ```
 
 Then enable the plugin under **Admin > Plugins**, switch on URL, app, schedule and interface integration for plugins
@@ -267,6 +267,9 @@ Under **Settings > Plugin Settings**:
 - **Read Only** (`MCP_READ_ONLY`, default `True`): block all write actions via MCP, regardless of
   the calling user's permissions. A plugin-wide kill switch, independent of per-user roles.
 - **Log Tool Calls** (`MCP_LOG_TOOL_CALLS`, default `False`): log every tool call for debugging.
+- **Hide Unavailable Tools** (`MCP_FILTER_TOOL_LIST`, default `False`): list only the tools the calling user may
+  use. Off, every tool is listed and a call the user may not make fails with a permission error; the
+  permission check happens on every call either way.
 - **Superusers Bypass MCP Roles** (`MCP_SUPERUSER_FULL_ACCESS`, default `False`): superusers get every
   MCP scope regardless of their groups' MCP roles ([Two permission sets](#two-permission-sets)).
 - **Allow Basic Authentication** (`MCP_ALLOW_BASIC_AUTH`, default `False`): accept username and

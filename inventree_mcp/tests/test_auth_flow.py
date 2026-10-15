@@ -222,6 +222,7 @@ class PermissionSetFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         return response.json()["result"]
 
     def test_mcp_roles_narrow_the_token_not_the_interactive_api(self):
+        self.set_setting("MCP_FILTER_TOOL_LIST", True)  # the test reads the narrowing off the tool list
         browser = Client()
         browser.force_login(self.user)
         client_id = self.register_public_client()
