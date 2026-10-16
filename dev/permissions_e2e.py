@@ -5,8 +5,8 @@
      (clear, then PATCH the part row); the effective document of e2e-member
   A  e2e-member connects through the façade (login bridge -> Authentik -> consent -> token):
      the token carries g:read r:view:part; tools/list lists the part tools and no stock tool;
-     a stock tool call fails with the permission error; list_parts {"limit": 1} succeeds with a
-     row and a "next" link on the proxy's host, and get_part on that row succeeds
+     a stock tool call (get_stock) fails with the permission error; list_parts {"limit": 1}
+     succeeds with a count and a row, and get_part on that row succeeds
   B  e2e-member's InvenTree API token: /api/stock/ still answers 200 (interactive roles untouched),
      on /mcp it sees exactly the OAuth tool list, and list_parts / get_part succeed as in A
   C  the plugin API in the server process: rulesets (all groups), effective, connections (?user=),
@@ -16,7 +16,7 @@
 
 Usage: python3 dev/permissions_e2e.py [--base-url http://localhost:8080]
 
-Restores the MCP rulesets of "MCP Users" and deletes the API token at the end. Reuses dev/oauth_smoke.py's
+Switches MCP_FILTER_TOOL_LIST on for the run. Restores that setting, the MCP rulesets of "MCP Users" and deletes the API token at the end. Reuses dev/oauth_smoke.py's
 and dev/membership_e2e.py's helpers. Tokens are never printed.
 """
 
@@ -31,10 +31,12 @@ DEV = Path(__file__).resolve().parent
 sys.path.insert(0, str(DEV))
 sys.path.insert(0, str(DEV / "authentik"))
 from membership_e2e import (
+    PRELUDE,
     USER,
     connect,
     create_api_token,
     delete_api_tokens,
+    shell,
     state,
 )
 from oauth_smoke import JSON, expect, mcp_tools_list, password_login, refresh, step
@@ -42,7 +44,13 @@ from sso_smoke import Browser
 
 GROUP = "MCP Users"
 FLAGS = ("can_view", "can_add", "can_change", "can_delete")
-STOCK_TOOLS = {"list_stock_items", "get_stock_item", "list_locations", "get_location"}
+STOCK_TOOLS = {
+    "get_stock",
+    "get_stock_item",
+    "search_stock_locations",
+    "list_stock_locations",
+    "get_stock_location",
+}
 
 
 class Admin:
@@ -159,31 +167,26 @@ def tool_body(result: dict) -> dict:
 def real_tool_calls(
     agent: Browser, base_url: str, authorization: str, label: str, who: str
 ) -> None:
-    """list_parts {"limit": 1} and get_part on its row must succeed (paginated + detail call)."""
+    """list_parts {"limit": 1} and get_part on its row must succeed (list + detail call)."""
     result = call_tool(agent, base_url, authorization, "list_parts", {"limit": 1})
     message = (result.get("content") or [{}])[0].get("text", "")
     body = tool_body(result)
     rows = body.get("results") or []
-    following = body.get("next") or ""
     step(
         label,
         f"{who} tools/call list_parts {{'limit': 1}} -> isError={bool(result.get('isError'))}, "
-        f"count={body.get('count')}, rows={len(rows)}, next={following.split('?')[0]!r}",
+        f"count={body.get('count')}, rows={len(rows)}",
     )
     expect(
         not result.get("isError") and len(rows) >= 1,
         f"list_parts failed: {message[:200]!r}",
     )
-    expect(
-        following.startswith(f"{base_url}/"),
-        f"'next' is not on {base_url}: {following!r}",
-    )
     pk = rows[0]["pk"]
-    result = call_tool(agent, base_url, authorization, "get_part", {"part_id": pk})
+    result = call_tool(agent, base_url, authorization, "get_part", {"id": pk})
     body = tool_body(result)
     step(
         label,
-        f"{who} tools/call get_part {{'part_id': {pk}}} -> isError={bool(result.get('isError'))}, "
+        f"{who} tools/call get_part {{'id': {pk}}} -> isError={bool(result.get('isError'))}, "
         f"pk={body.get('pk')}",
     )
     expect(
@@ -206,6 +209,18 @@ def stock_with_api_token(
         return status, None
 
 
+def set_tool_filter(value: bool) -> bool:
+    """MCP_FILTER_TOOL_LIST (off by default since 0.4.2; the tool list checks need it on); returns the old value."""
+    return shell(
+        PRELUDE
+        + f"""
+previous = plugin.get_setting('MCP_FILTER_TOOL_LIST')
+plugin.set_setting('MCP_FILTER_TOOL_LIST', {value})
+print('E2E ' + json.dumps(previous))
+"""
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default="http://localhost:8080")
@@ -220,9 +235,12 @@ def main() -> None:
         "0",
         f"{GROUP!r} MCP roles before: {sorted(r['name'] for r in rows if r['can_view'])}",
     )
+    filter_before = set_tool_filter(True)
+    step("0", f"MCP_FILTER_TOOL_LIST on (was {filter_before})")
     try:
         run(admin, base_url, group)
     finally:
+        set_tool_filter(filter_before)
         for pk, flags in snapshot.items():
             admin.api("PATCH", f"rulesets/{pk}/", flags)
         delete_api_tokens()
@@ -278,16 +296,16 @@ def run(admin: Admin, base_url: str, group: int) -> None:
         "tools/list does not reflect MCP view on parts only",
     )
     bearer = f"Bearer {tokens['access_token']}"
-    result = call_tool(agent, base_url, bearer, "list_stock_items")
+    result = call_tool(agent, base_url, bearer, "get_stock")
     message = (result.get("content") or [{}])[0].get("text", "")
     step(
         "A",
-        f"tools/call list_stock_items -> isError={result.get('isError')} {message!r}",
+        f"tools/call get_stock -> isError={result.get('isError')} {message!r}",
     )
     expect(
         result.get("isError") and "permission" in message, "stock tool call not refused"
     )
-    # A paginated list (absolute "next" link built from the MCP request's host) and a detail call.
+    # A list call and a detail call.
     real_tool_calls(agent, base_url, bearer, "A", "OAuth token:")
 
     # B: the interactive API is untouched; the API token on /mcp is narrowed the same way.

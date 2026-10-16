@@ -15,17 +15,15 @@ Every tool is a thin wrapper around InvenTree's own REST API view classes (see
 requests go through exactly the same permission checks, filtering, and serialization as the regular
 REST API. Tool code never queries the Django ORM directly.
 
-Currently read-only, covering parts, stock items/locations, part categories, purchase/sales/return/
-build orders (with line items and allocations), companies, contacts, addresses, manufacturer/
-supplier parts, BOM items, attachments, parameters, stock tracking history, test results, and
-project codes. Once write tools land, the `MCP_READ_ONLY` setting (see Configuration) will block
-them by default regardless of the calling user's permissions.
-
-Each tool's `outputSchema` and filter/ordering options are derived live from InvenTree's own
-serializers and views (not hand-maintained), so they can't drift as InvenTree evolves. Call
-`describe_filters(resource)` to see what's available for a given resource. The set of tools an MCP
-client sees is also filtered to what the calling user can actually use - though every call is still
-permission-checked in full regardless of what was advertised.
+It offers 26 tools for parts, part categories, stock items and stock locations: search, list and get, plus
+create, update and delete tools and image attachment for parts. The tool set, the tool names, their inputs and their
+descriptions are the ones of [syntaxerr66/inventree-mcp](https://github.com/syntaxerr66/inventree-mcp), a Go MCP
+server for InvenTree; this plugin re-implements them inside InvenTree (see [Tools](#tools) and
+[Credits](#credits)). Results are compact, fixed JSON shapes. The write tools are
+blocked by default: the `MCP_READ_ONLY` setting (see [Plugin settings](#plugin-settings)) refuses them regardless of the
+calling user's permissions until an administrator turns it off. The set of tools an MCP client sees can be filtered
+to what the calling user can actually use (`MCP_FILTER_TOOL_LIST`), though every call is permission-checked in full
+regardless of what was advertised.
 
 Users connect Claude by signing in through the browser ([Connect with OAuth](#connect-with-oauth)), with the
 instance's single sign-on and its group-based access control; scripts keep using InvenTree API tokens. What a user
@@ -195,6 +193,127 @@ of their groups ([Two permission sets](#two-permission-sets)). Supported auth me
 
 Session/cookie auth is not supported (not meaningful for a machine client).
 
+## Tools
+
+26 tools, all in the four resources below. `id` arguments are database primary keys. Numbers and booleans sent as
+strings (`"32"`, `"true"`) are accepted. A `0` or empty value means "omit" for ids and text fields, as in the Go
+server. List results are `{"count": n, "results": [...]}` (no `next`/`previous`); `limit` is clamped to 500.
+
+Typical workflow (also in the server instructions the client receives):
+
+- **Search before you create.** `search_parts` before `create_part`, `search_part_categories` before
+  `create_part_category`, `search_stock_locations` before `create_stock_location`.
+- **Categories form a hierarchy.** `list_part_categories` shows the full tree (read the `pathstring` fields), pick the
+  deepest category that fits, and if none does create one under the right parent with `create_part_category`. Do not
+  put a part into an unrelated category and do not create top-level categories for parts that belong under an
+  existing parent. Parts should always have a category.
+- **Part descriptions from part numbers.** When a part has a manufacturer part number, write a short, useful
+  description for it (what the part is, key values) instead of repeating the number.
+
+### Parts
+
+| Tool | Inputs | What it does |
+|---|---|---|
+| `search_parts` | `search` (required), `limit` (25) | Find parts by name or keyword. |
+| `get_part` | `id` | One part. |
+| `list_parts` | `category` (0 = all), `limit` (50), `offset` | List parts, optionally of one category. |
+| `create_part` | `name` (required), `description`, `category`, `IPN`, `keywords`, `units`, `minimum_stock`, `purchaseable`, `component`, `assembly`, `trackable`, `virtual`, `image_url` | Create a part; returns it with its id. `image_url` needs `IMAGE_DOWNLOAD_ENABLED`. |
+| `update_part` | `id`, `name`, `description`, `category`, `active`, `IPN`, `keywords`, `units`, `minimum_stock`, `image_url` | Change the given fields only; "no fields to update" when none. `image_url` needs `IMAGE_DOWNLOAD_ENABLED`. |
+| `delete_part` | `id` | Deactivate and delete a part. Refused when the part has stock items (delete the stock first); a failed delete reactivates the part. |
+| `set_part_image` | `id`, `image_url` (required) | Download an image and set it as the part's image. Needs `IMAGE_DOWNLOAD_ENABLED`. |
+| `search_part_images` | `query` (required), `num` (1 to 10, default 5) | Google image search for product photos; returns links, thumbnails, sizes. Needs `GOOGLE_API_KEY` and `GOOGLE_CSE_ID`. The only tool that leaves InvenTree. |
+
+### Part categories
+
+| Tool | Inputs | What it does |
+|---|---|---|
+| `search_part_categories` | `search` (required), `limit` (25) | Find categories by name. |
+| `list_part_categories` | `parent` (0 = all), `limit` (100), `offset` | List categories with their `pathstring`. |
+| `create_part_category` | `name` (required), `description`, `parent` (0 = top level), `default_location`, `structural` | Create a category. |
+| `update_part_category` | `id`, `name`, `description`, `parent`, `default_location` | Change the given fields only. |
+| `delete_part_category` | `id` | Delete a category; its parts and sub-categories move to its parent (see [Delete semantics](#delete-semantics)). |
+
+### Stock items
+
+| Tool | Inputs | What it does |
+|---|---|---|
+| `get_stock` | `part` (0 = all), `location` (0 = all), `limit` (50), `offset` | List stock items, optionally of one part and/or location. |
+| `get_stock_item` | `id` | One stock item. |
+| `add_stock` | `part`, `quantity` (required), `location`, `batch`, `serial`, `notes` | Create a stock item. `serial` is sent as InvenTree's `serial_numbers`. |
+| `stock_add_quantity` | `items` (required, `[{pk, quantity}]`), `notes` | Increase the quantity of existing stock items. |
+| `stock_remove_quantity` | `items` (required, `[{pk, quantity}]`), `notes` | Decrease it. Removing more than is there removes what is there and InvenTree deletes the emptied item; it is not an error. |
+| `stock_transfer` | `items` (required, `[{pk, quantity}]`), `location` (required), `notes` | Move stock to a location; a partial quantity splits the item. |
+| `delete_stock_item` | `id` | Delete a stock item. |
+
+`part_detail` on a stock item (`pk`, `name`, `full_name` of its part) is `null` for a user who may not view parts;
+that is InvenTree's own field permission.
+
+### Stock locations
+
+| Tool | Inputs | What it does |
+|---|---|---|
+| `search_stock_locations` | `search` (required), `limit` (25) | Find locations by name or description. |
+| `get_stock_location` | `id` | One location. |
+| `list_stock_locations` | `parent` (0 = all), `limit` (100), `offset` | List locations with their `pathstring`. |
+| `create_stock_location` | `name` (required), `description`, `parent` (0 = top level), `structural` | Create a location. |
+| `update_stock_location` | `id`, `name`, `description`, `parent` | Change the given fields only. |
+| `delete_stock_location` | `id` | Delete a location; its stock and sub-locations move to its parent (see [Delete semantics](#delete-semantics)). |
+
+### Write requirements
+
+A write tool works only when all of these hold:
+
+1. **`MCP_READ_ONLY` is off** (it is on by default). While on, every write tool answers "This MCP server is running in
+   read-only mode" and the write tools stay in the tool list (unless `MCP_FILTER_TOOL_LIST` hides them from users
+   who may not use them).
+2. **The user's groups hold the matching MCP roles** ([Two permission sets](#two-permission-sets)), on the role of the
+   resource (`part`, `part_category`, `stock`, `stock_location`):
+   - *add*: `create_part`, `create_part_category`, `add_stock`, `create_stock_location`, **and the three stock
+     adjustments** `stock_add_quantity`, `stock_remove_quantity`, `stock_transfer`;
+   - *change*: `update_part`, `update_part_category`, `update_stock_location`, `set_part_image`;
+   - *delete*: `delete_part_category`, `delete_stock_item`, `delete_stock_location`, and `delete_part`, which needs
+     *change* as well as *delete* on `part` (it deactivates the part first) and also reads the part, so *view*.
+3. **The user holds the same interactive InvenTree roles** (the MCP roles never grant more than the interactive
+   roles), plus *view* on whatever the call reads.
+
+The three stock adjustment tools need the stock *add* role, not *change*: InvenTree's `StockAdd`, `StockRemove` and
+`StockTransfer` endpoints are `POST` views, which InvenTree maps to the *add* action. InvenTree's OAuth scope check
+declares only a general read scope for them, so the plugin checks the stock *add* permission itself before calling
+them (otherwise a token with only the MCP stock *view* role would be able to adjust stock).
+
+A refused write answers `permission denied (403)`; a missing record `not found (404)`; invalid input
+`validation failed (400)` with one `field: message` line per problem.
+
+**Images.** InvenTree removed downloading an image from a URL (`remote_image`, API version 489) because it is a
+server-side request forgery risk. `image_url` (`create_part`, `update_part`) and `set_part_image` are therefore
+implemented by the plugin and off by default: turn on the plugin setting **Allow Image Downloads**
+(`IMAGE_DOWNLOAD_ENABLED`). The download then goes through InvenTree's own helper (URL validation, private-address
+guard, 1 MB size cap, image validation), only for users who may change the part, and only after the read-only and
+permission checks. With the setting off, a call with an `image_url` answers an error naming the setting and changes
+nothing. `search_part_images` is independent: it needs the **Google API Key** (`GOOGLE_API_KEY`, a Google Cloud key with
+the Custom Search API enabled) and **Google Custom Search Engine ID** (`GOOGLE_CSE_ID`, a Programmable Search Engine
+with image search on); without them it reports that image search is not configured.
+
+### Delete semantics
+
+- `delete_part_category`: the category's parts and sub-categories are **moved to its parent**, nothing else is deleted.
+- `delete_stock_location`: the location's stock items and sub-locations are **moved to its parent**, nothing is deleted.
+- `delete_part`: **refused for a part with stock items** (the error says to delete the stock first). InvenTree would
+  otherwise delete the stock together with the part. The part is deactivated before the delete (InvenTree requires
+  it) and reactivated when the delete fails.
+- `delete_stock_item`: deletes the item.
+
+The tool descriptions a client sees say that a category or location "must be empty"; that is the Go server's wording,
+InvenTree itself re-parents the contents as described above.
+
+### Credits
+
+The tool design (names, inputs, descriptions, workflow guidance, result shapes) comes from
+[syntaxerr66/inventree-mcp](https://github.com/syntaxerr66/inventree-mcp), a Go MCP server for InvenTree that talks
+to the REST API with an API key. This plugin keeps that tool set and runs it inside InvenTree through the plugin's
+proxy, with InvenTree's permissions, OAuth and the MCP roles instead of an API key. The Go server remains the
+reference for what a tool should do.
+
 ## Administration
 
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) is the operator's guide: the go-live checklist (each item with the
@@ -264,8 +383,10 @@ Under **Settings > Plugin Settings**:
 
 - **Require Authentication** (`REQUIRE_AUTH`, default `True`): reject unauthenticated requests.
   Only disable for local testing.
-- **Read Only** (`MCP_READ_ONLY`, default `True`): block all write actions via MCP, regardless of
-  the calling user's permissions. A plugin-wide kill switch, independent of per-user roles.
+- **Read Only** (`MCP_READ_ONLY`, default `True`): block every write tool (the 15 create, update, delete,
+  stock adjustment and image tools of [Tools](#tools)), regardless of the calling user's permissions and MCP roles. A
+  plugin-wide kill switch, independent of per-user roles. While on, MCP write roles are not granted either. Turn it off
+  to use the write tools; the [write requirements](#write-requirements) then apply.
 - **Log Tool Calls** (`MCP_LOG_TOOL_CALLS`, default `False`): log every tool call for debugging.
 - **Hide Unavailable Tools** (`MCP_FILTER_TOOL_LIST`, default `False`): list only the tools the calling user may
   use. Off, every tool is listed and a call the user may not make fails with a permission error; the
@@ -274,6 +395,14 @@ Under **Settings > Plugin Settings**:
   MCP scope regardless of their groups' MCP roles ([Two permission sets](#two-permission-sets)).
 - **Allow Basic Authentication** (`MCP_ALLOW_BASIC_AUTH`, default `False`): accept username and
   password on the MCP endpoint. Off: OAuth and InvenTree API tokens only.
+- **Allow Image Downloads** (`IMAGE_DOWNLOAD_ENABLED`, default `False`): let `image_url` of `create_part` /
+  `update_part` and `set_part_image` download an image from a URL on the server. InvenTree removed this feature as a
+  security risk; this re-enables it for MCP only, through InvenTree's URL validation, private-address guard, 1 MB cap
+  and image validation, for users who may change the part. Off: `image_url` is refused.
+- **Google API Key** (`GOOGLE_API_KEY`, protected, default empty) and **Google Custom Search Engine ID**
+  (`GOOGLE_CSE_ID`, default empty): for `search_part_images`. A Google Cloud API key with the Custom Search API
+  enabled, and a Programmable Search Engine configured for image search. Empty: the tool reports that image search is
+  not configured.
 
 OAuth sign-in (see [Connect with OAuth](#connect-with-oauth)):
 
@@ -512,4 +641,6 @@ More in [`docs/OPERATIONS.md`](docs/OPERATIONS.md) §6 (failure modes) and §8 (
 - End-to-end suite against that stack: `python3 dev/e2e/run.py` (`--list`, `--only N`, `--skip-outage`). It runs the
   go-live checklist of [`docs/OPERATIONS.md`](docs/OPERATIONS.md) as ten scenarios, prints PASS/FAIL lines, exits
   non-zero on a failure and restores everything it changes.
+- Live round trip of the write tools against that stack: `python3 dev/tools_e2e.py` (category, part, stock item,
+  adjustments, transfer, deletes, then the read-only refusal; restores the settings it changes).
 - Frontend: `frontend/` (React), built into `inventree_mcp/static/` with `npm ci && npm run build`.

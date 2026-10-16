@@ -9,8 +9,8 @@ installed on the host and nothing is published on ports 5432, 80 or 443. Compose
 ```bash
 dev/up.sh                 # bring everything up (idempotent; first run pulls ~2 GB and takes ~5 minutes)
 dev/test.sh               # the whole plugin suite (label inventree_mcp)
-dev/test.sh inventree_mcp.test_mcp                     # upstream suite only
-dev/test.sh inventree_mcp.test_mcp.MCPTransportTest -v 2   # extra manage.py test args are passed through
+dev/test.sh inventree_mcp.tests.test_transport         # one module (one label per call)
+dev/test.sh inventree_mcp.tests.test_transport.MCPTransportTest -v 2   # extra manage.py test args are passed through
 dev/shell.sh              # Django shell in the server container (dev/shell.sh -c "print(1)" works too)
 dev/manage.sh <args>      # manage.py in the server container, files it creates are chowned back to you
 dev/manage.sh makemigrations inventree_mcp             # generates inventree_mcp/migrations/ owned by your user
@@ -21,6 +21,7 @@ python3 dev/authentik/bootstrap.py set-groups e2e-member inventree-users   # cha
 python3 dev/authentik/bootstrap.py                     # full bootstrap again: restores the intended memberships
 python3 dev/authentik/sso_smoke.py                     # scripted SSO round trip for the four test users
 python3 dev/e2e/run.py                                 # the end-to-end suite (go-live checklist), see below
+python3 dev/tools_e2e.py                               # live round trip of the write tools, see below
 dev/down.sh               # stop (keeps volumes and data)
 dev/down.sh -v            # stop and delete volumes and dev/data/ (fresh start next time)
 ```
@@ -39,14 +40,14 @@ pinned release):
 ```bash
 dev/test-image.sh up latest            # or any tag; pulls the image, runs invoke update, installs the checkout editable
 dev/test-image.sh test                 # the whole suite (--keepdb; edits are picked up without a restart)
-dev/test-image.sh test inventree_mcp.tests.test_policy inventree_mcp.test_mcp.PluginSettingsTest -v 2
+dev/test-image.sh test inventree_mcp.tests.test_policy inventree_mcp.tests.test_transport.PluginSettingsTest -v 2
 dev/test-image.sh shell                # bash in the container (/home/inventree/src/backend)
 dev/test-image.sh down
 ```
 
 InvenTree 1.6+ (core PR #13007) purges and re-imports the plugin's modules on every registry collect, which the test
 runner does for every test class. `inventree_mcp/tests/__init__.py` disables that purge for the test run (otherwise
-every `unittest.mock.patch` target misses and the model classes duplicate), and `test_mcp.py` patches the module
+every `unittest.mock.patch` target misses and the model classes duplicate), and `tests/test_transport.py` patches the module
 objects it imported rather than dotted paths. Keep both rules when writing tests.
 
 ## Frontend (plugin pages)
@@ -136,6 +137,7 @@ API token for curl: `curl -s -u admin:admin http://localhost:8080/api/user/token
 | `authentik/sso_smoke.py` | scripted SSO login round trip; importable: `sso_login(username)`, `browse(..., stop=...)`, `Browser` |
 | `configure_inventree.py` | global settings, groups `Users` and `MCP Users` (MCP roles: view on every role; admin is a member) (run by `up.sh`) |
 | `oauth_smoke.py`, `membership_e2e.py`, `permissions_e2e.py` | live checks: OAuth façade, membership re-checks, MCP permission set |
+| `tools_e2e.py` | live round trip of the write tools through the MCP endpoint (see Tools end-to-end run) |
 | `e2e/run.py` | the end-to-end suite: one runner for the ten go-live scenarios, built on the scripts above (see below) |
 | `ui_smoke.py` | headless-browser check of the plugin pages with a scratch group (see Frontend) |
 | `data/` | InvenTree data dir (config, static, media, secret key), git-ignored |
@@ -183,6 +185,27 @@ callback (gunicorn's access log, django-structlog at `INVENTREE_LOG_LEVEL=INFO`)
 see `docs/OPERATIONS.md` §7. Its proxy check fails while `Caddyfile` logs the authorize redirect's `Location`
 header unfiltered (see Troubleshooting). On a stack where the plugin's code is newer than the database (a migration not applied
 yet) the Django-shell helpers fail: run `dev/up.sh` or restart the server first.
+
+## Tools end-to-end run
+
+`dev/tools_e2e.py` (standard library only, host python) exercises the 26-tool set's write path against the running
+stack with the API token of `admin` (`admin` / `admin`, requested from `/api/user/token/`). It uses `dev/shell.sh` to
+switch the plugin setting `MCP_READ_ONLY` off and to grant every MCP role to admin's groups (`MCP Users`), then calls,
+one `PASS` line per step: `tools/list` (26 tools), `search_part_categories`, `create_part_category` (under an existing
+category), `create_part`, `add_stock`, `stock_add_quantity`, `stock_remove_quantity`, `create_stock_location`,
+`stock_transfer` (a partial quantity, which splits the item), `get_stock` (verifies the totals and the new location),
+`delete_stock_item` (every item of the part, before the part), `delete_part`, `delete_part_category`,
+`delete_stock_location`. The last step turns `MCP_READ_ONLY` back on and checks that a write answers the read-only text.
+
+```bash
+python3 dev/tools_e2e.py [--base-url http://localhost:8080]
+```
+
+Exit code 1 on any failure. A `finally` deletes what a failed run left behind, restores `MCP_READ_ONLY` and the MCP
+flags of admin's groups to their previous values and deletes the script's API token. The server must run the current
+plugin code (`dev/compose.sh restart inventree-server inventree-worker` after code changes), otherwise `tools/list`
+shows an older tool set. `permissions_e2e.py` and `e2e/run.py` switch `MCP_FILTER_TOOL_LIST` on for their runs (the
+plugin default is off, their tool list checks need it) and restore it.
 
 ## Authentik reachability
 

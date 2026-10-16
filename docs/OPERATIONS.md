@@ -19,7 +19,7 @@ the production instance before opening it to users.
 |---|---|---|---|
 | 1 | Authentik's discovery document lists `offline_access`, InvenTree requests it, and a login stores an upstream refresh token | `<issuer>/.well-known/openid-configuration` has `offline_access` in `scopes_supported`; after a login, *Social application tokens* in the Django admin shows a token secret for the user | 2 (the upstream token exists and rotates at a due re-check); `dev/authentik/sso_smoke.py` ("refresh token stored") |
 | 2 | A member connects Claude, uses tools, and is not asked to sign in again when the access token is renewed | refresh with a fresh check makes no upstream call; refresh with a due check redeems the upstream token and succeeds | 2 |
-| 3 | Real tool calls work behind the reverse proxy, with OAuth tokens and with API tokens (paginated list plus a detail call) | `list_parts {"limit": 1}` returns a row and a `next` link on the public host; `get_part` returns it | 2 |
+| 3 | Real tool calls work behind the reverse proxy, with OAuth tokens and with API tokens (paginated list plus a detail call) | `list_parts {"limit": 1}` returns `count` and a row on the public host; `get_part` returns it | 2 |
 | 4 | Removed from the MCP group in Authentik: the next due refresh fails with `invalid_grant`, the user is blocked, MCP requests get `401`, the authorize page says *Access revoked*; back in the group, the next SSO login lifts the block | `revoked_reason` `not_in_required_groups` | 3 |
 | 5 | Authentik down: refreshes keep working for `MEMBERSHIP_GRACE_HOURS`, then `invalid_grant` with nothing revoked; the same refresh token works once Authentik is back | `last_recheck_error` `connection_error` | 4 |
 | 6 | Users without MCP access are refused: interactive-only users and users without any InvenTree group see *No MCP access*, users outside the Authentik application binding are refused by Authentik | | 5 |
@@ -84,9 +84,12 @@ workers), no restart needed.
 | Setting | Default | Production | Notes |
 |---|---|---|---|
 | `REQUIRE_AUTH` | `True` | `True` | off only for local testing |
-| `MCP_READ_ONLY` | `True` | `True` | strips the add / change / delete scopes; MCP write roles take effect only when off |
+| `MCP_READ_ONLY` | `True` | `True` for a read-only service; `False` to allow the 15 write tools | blocks every write tool (create / update / delete, the three stock adjustments, `set_part_image`) whatever the user's permissions and MCP roles, and strips the add / change / delete scopes; MCP write roles take effect only when off (see §6 "A write is refused") |
 | `MCP_FILTER_TOOL_LIST` | `False` | `False` | on: `tools/list` shows only the tools the caller may use; off: every tool is listed and a refused call fails with a permission error (enforcement is per call either way) |
 | `MCP_LOG_TOOL_CALLS` | `False` | `False` | logs tool name, arguments and the calling **username**; for debugging only (see §7) |
+| `IMAGE_DOWNLOAD_ENABLED` | `False` | `False` unless image attachment is wanted | lets `image_url` (`create_part`, `update_part`) and `set_part_image` download an image on the server. InvenTree removed URL downloads (`remote_image`, API 489) as a security risk; this re-enables them for MCP only, through InvenTree's URL validation, private-address (SSRF) guard, 1 MB cap and image validation, after the read-only and permission checks. Off: `image_url` answers an error naming the setting |
+| `GOOGLE_API_KEY` | empty | set only for `search_part_images` | protected setting; a Google Cloud API key with the Custom Search API enabled. Empty: the tool reports that image search is not configured. This is the only tool that makes an outbound call (10 s timeout), and the key never appears in a tool error |
+| `GOOGLE_CSE_ID` | empty | set with `GOOGLE_API_KEY` | ID of a Google Programmable Search Engine with image search enabled |
 | `MCP_SUPERUSER_FULL_ACCESS` | `False` | `False` | superusers are limited by their groups' MCP roles like everybody else |
 | `MCP_ALLOW_BASIC_AUTH` | `False` | `False` | username and password on `/mcp/`; prefer API tokens for scripts |
 | `OAUTH_ENABLED` | `False` | `True` | serves discovery and `/plugin/inventree-mcp/oauth/*`; injects the DOT values (instance-wide) |
@@ -154,6 +157,23 @@ DOT's tokens (*Django OAuth Toolkit*) and the upstream tokens (*Social applicati
 `MCPRuleSet` are not registered in the Django admin.
 
 ## 6. Failure modes and what to do
+
+**A write is refused.** A write tool answers a ToolError; the text says which gate refused it:
+
+| Text | Cause and fix |
+|---|---|
+| "This MCP server is running in read-only mode ..." | `MCP_READ_ONLY` is on. Turn it off (the write tools stay listed while it is on). |
+| `permission denied (403): your MCP roles or your InvenTree permissions do not allow this` | the user lacks the MCP role (group MCP roles: *add* for creates and for `stock_add_quantity`, `stock_remove_quantity`, `stock_transfer`; *change* for updates and `set_part_image`; *delete* for deletes, `delete_part` needs *change* and *delete* on `part`) or lacks the same interactive InvenTree role. Check with `GET api/effective/<pk>/`. |
+| an error naming `IMAGE_DOWNLOAD_ENABLED` | `image_url` / `set_part_image` with image downloads off; nothing was changed. |
+| `image download failed: ...` | InvenTree's helper refused the URL (private address, not an image, over 1 MB, unreachable). |
+| `part N has K stock item(s): delete its stock first` | `delete_part` refuses parts with stock; delete or move the stock items first. |
+| `validation failed (400): field: message` | InvenTree rejected the input (for example `serial` for a part that is not trackable). |
+
+InvenTree's stock adjustment endpoints (`StockAdd`, `StockRemove`, `StockTransfer`) declare only a general read scope
+for OAuth tokens, so core would let a token with just the MCP stock *view* role call them. The plugin therefore checks
+the stock *add* permission itself (read-only gate and `StockList` POST permission) before calling the adjustment
+views, and lists the three tools only for users who pass it. Deleting a part category or a stock location moves its
+contents to the parent; it never deletes parts or stock (README, "Delete semantics").
 
 **Identity provider down.** Nothing to do for up to `MEMBERSHIP_GRACE_HOURS` (4 h after each user's last successful
 check): refreshes keep working. After that refreshes get `invalid_grant` and Claude asks the user to sign in, which
@@ -245,7 +265,8 @@ What is outside the plugin and needs the operator:
   `code` and `state` in the reverse proxy's access log (below). The dev stack runs at `INFO` and with
   gunicorn's default access log, so e2e scenario 9 reports these lines as `WARN`, not `FAIL`.
 - **Usernames.** Core's SSO group sync logs "Adding group … to user …" / "Removing group … from …" with the username,
-  at every login and re-check (INFO). `MCP_LOG_TOOL_CALLS` logs the calling username and the tool arguments. If SSO
+  at every login and re-check (INFO). `MCP_LOG_TOOL_CALLS` logs the calling username and the tool arguments, which for the write tools are the payloads
+  (part names, descriptions, notes, quantities, image URLs). If SSO
   usernames are e-mail addresses, keep the log level at `WARNING` and tool-call logging off.
 - **Reverse proxy.** Strip `code` and `state` from logged request query strings **and from the logged `Location`
   response header**: the authorize endpoint answers the consent (and a trusted client's skipped consent) with a `302`

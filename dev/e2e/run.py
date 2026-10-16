@@ -66,11 +66,17 @@ import sso_smoke as sso
 USER = membership.USER  # e2e-member
 MEMBER_GROUPS = membership.MEMBER_GROUPS
 REQUIRED_GROUP = membership.REQUIRED_GROUP  # "MCP Users"
-MANAGED_SETTINGS = ("OAUTH_ENABLED", "MEMBERSHIP_ENFORCED", "MCP_REQUIRED_GROUPS")
+MANAGED_SETTINGS = (
+    "OAUTH_ENABLED",
+    "MEMBERSHIP_ENFORCED",
+    "MCP_REQUIRED_GROUPS",
+    "MCP_FILTER_TOOL_LIST",
+)
 RUN_SETTINGS = {
     "OAUTH_ENABLED": True,
     "MEMBERSHIP_ENFORCED": True,
     "MCP_REQUIRED_GROUPS": REQUIRED_GROUP,
+    "MCP_FILTER_TOOL_LIST": True,  # scenario 6 checks the narrowed tool list (the plugin default is off)
 }
 TRUSTED_ORIGIN = "https://claude.ai"
 CIMD_CLIENT_ID = "https://claude.ai/oauth/inventree-mcp-e2e-client"  # never fetched: the row is pre-created
@@ -448,11 +454,11 @@ def scenario_member(ctx: Context) -> None:
     permissions.real_tool_calls(
         agent, ctx.base, f"Bearer {tokens['access_token']}", "2", "OAuth token:"
     )
-    check("2 paginated list_parts and get_part with the OAuth token", True)
+    check("2 list_parts and get_part with the OAuth token", True)
     key = api_token()
     try:
         permissions.real_tool_calls(agent, ctx.base, f"Token {key}", "2", "API token:")
-        check("2 paginated list_parts and get_part with an InvenTree API token", True)
+        check("2 list_parts and get_part with an InvenTree API token", True)
     finally:
         membership.delete_api_tokens()
 
@@ -652,10 +658,10 @@ def scenario_narrowing(ctx: Context) -> None:
             and not names & permissions.STOCK_TOOLS,
             f"{len(names)} tools",
         )
-        result = permissions.call_tool(agent, ctx.base, bearer, "list_stock_items")
+        result = permissions.call_tool(agent, ctx.base, bearer, "get_stock")
         message = (result.get("content") or [{}])[0].get("text", "")
         check(
-            "6 tools/call list_stock_items is refused",
+            "6 tools/call get_stock is refused",
             bool(result.get("isError")) and "permission" in message,
         )
         permissions.real_tool_calls(agent, ctx.base, bearer, "6", "OAuth token:")
@@ -674,7 +680,7 @@ def scenario_narrowing(ctx: Context) -> None:
                 status == 200 and tool_names(payload) == names,
             )
             result = permissions.call_tool(
-                agent, ctx.base, f"Token {key}", "list_stock_items"
+                agent, ctx.base, f"Token {key}", "get_stock"
             )
             check(
                 "6 the API token's stock tool call on /mcp/ is refused",

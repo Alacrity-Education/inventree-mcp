@@ -28,7 +28,10 @@ Authentik accounts, Postgres 16). The first start migrates the database forward 
 - claude.ai / Desktop: add a custom connector with that URL. Sign in to InvenTree in the browser when asked.
 
 MCP access comes from the MCP roles of a user's groups. `up.sh` gives the groups in `MCP_GROUPS` (default `ItAdmins`)
-view on everything through MCP and makes them the groups MCP requires. Your SSO group sync rewrites memberships at
+view on everything through MCP and makes them the groups MCP requires. With `MCP_WRITE=1` (the default in `.env.example`)
+it also switches the plugin's `MCP_READ_ONLY` setting off and gives those groups all four MCP flags (view, add, change,
+delete) on `part`, `part_category`, `stock` and `stock_location`, so the 15 write tools work (the users need the same
+interactive roles); `MCP_WRITE=0` keeps `MCP_READ_ONLY` on. Your SSO group sync rewrites memberships at
 every login, so use groups that Authentik maps, not manual ones. Staff change MCP roles under *MCP Access* and in the
 group editor's "MCP Roles" panel.
 

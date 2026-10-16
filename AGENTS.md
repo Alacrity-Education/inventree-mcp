@@ -1,7 +1,8 @@
 # AGENTS.md
 
 InvenTree plugin (entry point `inventree_mcp.core:InvenTreeMCP`) exposing an MCP (Model Context
-Protocol) server over Streamable HTTP so MCP clients can query InvenTree data. Only runs installed
+Protocol) server over Streamable HTTP so MCP clients can query and edit InvenTree parts, categories, stock and
+locations (26 tools). Only runs installed
 inside a real InvenTree instance - there is no standalone dev server for this repo.
 
 ## Core design rule
@@ -15,6 +16,39 @@ rather than reimplementing filtering/serialization by hand.
 `call_view()` also enforces the `MCP_READ_ONLY` plugin setting (default `True`): any non-GET call
 raises `ToolError` unless an administrator has turned it off. This is a shared chokepoint - don't
 duplicate the check per-tool or bypass `call_view()`.
+
+## Tool set rule
+
+The tool set (names, inputs, defaults, descriptions, result shapes) is that of the Go server
+[syntaxerr66/inventree-mcp](https://github.com/syntaxerr66/inventree-mcp), the **reference for tool semantics**: when
+a tool's behaviour is in question, the Go source (`internal/tools/*.go`) decides, except where InvenTree itself differs.
+`docs/plans/tools/00-overview.md` is the binding contract (sections 6a to 6c record the differences: `serial` is sent
+as `serial_numbers`, delete bodies, over-removal clamps, category / location deletes move contents to the parent,
+`delete_part` refuses parts with stock, the three stock adjustments need the stock add role, image URLs go through
+the plugin's own download behind `IMAGE_DOWNLOAD_ENABLED`). Tool descriptions are the Go ones verbatim (they carry the
+workflow guidance); do not reword them. Tools return compact fixed shapes (`PART_FIELDS` etc.), no output schema.
+
+### `tools/_common.py`
+
+The only shared tool code; tool modules hold no copies of these helpers.
+
+- `tool(name, title=, read_only=, destructive=, idempotent=, open_world=)` registers a tool and sets its four
+  annotation hints: the one place annotations are set. Never call `@mcp.tool()` directly.
+- `access(tool_name, view_loader, method)` / `ACCESS` declare the InvenTree view and HTTP method whose permission
+  decides tool visibility (`tool_visibility.py` reads it). Every tool except `search_part_images` registers exactly one
+  entry; `tests/test_tools_framework.py` enforces it and pins the table. The three stock adjustment tools declare
+  `StockList` POST (InvenTree scopes their own views to a general read scope only).
+- `listing(view_loader, path, params, limit=, default=, fields=)` is a paged GET reduced to `{"count", "results"}`
+  (`DEFAULTS`, `MAX_LIMIT` = 500); `fetch()` is one call reduced with `compact()` (get, create, update).
+- `compact(obj, fields)` keeps only the given fields in order (missing keys become `None`; `part_detail` is reduced
+  to `pk`, `name`, `full_name`); `PART_FIELDS`, `STOCK_ITEM_FIELDS`, `LOCATION_FIELDS`, `CATEGORY_FIELDS` are the
+  contract tuples and are asserted literally in the tests.
+- `clean(**kwargs)` builds payloads with the Go omission rules (drops `None`, empty strings and `0` for ids and
+  `minimum_stock`; booleans only when given); `changes()` is `clean()` that raises "no fields to update" when empty.
+- `text(message)` for plain-text results; `require_access(view_loader, method)` checks the read-only gate and the
+  caller's permission before a tool acts (image download, stock adjustments).
+- Writes go through `proxy.call_view()` like everything else; the `MCP_READ_ONLY` gate stays there. Network code
+  that is not an InvenTree call (`tools/images.py`: Google search, the image download) is the only exception.
 
 ## OAuth façade rule
 
@@ -55,14 +89,17 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   view, and works around upstream InvenTree OAuth2 scope-enforcement bugs, including splitting
   multi-role scope requirements into "any one role's scope" (as core's role check accepts any one
   role; `_any_role_alternatives` retires with `docs/upstream/` patch 4).
-- `tools/` - one module per resource, each a thin async wrapper around `call_view()`;
-  `discovery.py` holds `describe_filters()`.
-- `schema_introspection.py` / `output_schemas.py` - derive each tool's MCP `outputSchema` from the
-  real DRF serializer.
-- `filter_introspection.py` - derives each list tool's `filters` argument from a view's real
-  `filterset_class`/`search_fields`/`ordering_fields`.
-- `expand_introspection.py` - derives optional output-expansion flags (e.g. `part_detail`) from a
-  view's real `output_options`.
+- `tools/` - the 26 tools, one module per resource, each a thin async wrapper around `call_view()`:
+  `_common.py` (helpers above), `parts.py` (search_parts, get_part, list_parts, create_part, update_part,
+  delete_part, set_part_image), `categories.py` (search / list / create / update / delete_part_category),
+  `stock.py` (get_stock, get_stock_item, add_stock, stock_add_quantity, stock_remove_quantity, stock_transfer,
+  delete_stock_item), `locations.py` (search / get / list / create / update / delete_stock_location), `images.py`
+  (search_part_images via Google Custom Search, and the `image_url` download used by `parts.py`). `mcp_server.py`
+  imports them for their registration side effect and holds the server instructions (the workflow guidance).
+- `tool_visibility.py` - `MCP_FILTER_TOOL_LIST`: tools/list shows only the tools whose `ACCESS` view and method the
+  caller may use (via `proxy.user_has_access()`); never a security boundary.
+- `tool_logging.py` - `MCP_LOG_TOOL_CALLS`: logs every tool call (name, user, arguments) and its outcome.
+- `view_resolution.py` - lazy, cached resolution of InvenTree view classes (`resolve_view`, `resolve_view_any`).
 - `core.py` - the `InvenTreePlugin` subclass: settings (incl. the OAuth ones), URL wiring (the
   OAuth façade only when `auth.facade_supported()`), well-known entries, scheduled tasks; injects
   DOT settings at load. UI (`UserInterfaceMixin`): `get_ui_routes()` (pages `groups` and
@@ -168,8 +205,18 @@ and reason codes). Every façade view is `auth_exempt` (InvenTree's `AuthRequire
   unless a class sets `mcp_roles`), membership re-checks (`test_membership.py`, a fake OIDC provider
   at the `requests` boundary), the MCP permission set (`test_policy.py`, `test_api.py`), the UI
   features (`test_ui.py`: routes, navigation and panel per user kind incl. staff without the admin
-  role, the once-per-process logging, the UI feature API; needs the built bundles);
-  `test_mcp.py` holds the original suite.
+  role, the once-per-process logging, the UI feature API; needs the built bundles).
+  Tool tests: `test_transport.py` (transport, logging, settings, server card, view resolution, the read-only gate,
+  **and the scaffolding for tool tests**: `MCPClientMixin`, `MCPToolTestCase` (a user with every interactive and MCP
+  role, `call_tool()`), `WriteToolTestCase` (`MCP_READ_ONLY` off, `assert_denied_without_mcp_role()`,
+  `assert_denied_without_inventree_role()`, `assert_denied()`), and the error-text constants `NOT_FOUND`, `DENIED`,
+  `READ_ONLY`; tool test files import them from there, never redefine them), `test_tools_framework.py` (the `_common`
+  helpers, annotations, `ACCESS` completeness and the exact 26 tools, coercion, error texts, the role / action table),
+  `test_tools_parts.py`, `test_tools_categories.py`, `test_tools_stock.py`, `test_tools_locations.py`,
+  `test_tools_images.py`. The original `test_mcp.py` is gone (removed with the old tools in 0.5.0).
+- `dev/tools_e2e.py` - live round trip of the write tools against the dev stack (admin API token): category, part,
+  stock item, add / remove / transfer, deletes, then the read-only refusal. It switches `MCP_READ_ONLY` off and grants
+  admin's groups every MCP role through `dev/shell.sh`, and restores both in a `finally`.
 - `dev/ui_smoke.py` - live browser check of the plugin pages (playwright) against the dev stack,
   on a scratch group; needs a host with plugin routes (InvenTree 1.6+ / `latest`), exits 3 on
   1.5.x.
@@ -184,13 +231,15 @@ With the docker dev environment (`dev/`, see `dev/README.md`), from this repo:
 
 ```
 dev/up.sh                                   # once: InvenTree + Authentik + demo data
-dev/test.sh                                 # whole package (test_mcp.py + tests/)
+dev/test.sh                                 # whole package (tests/)
 dev/test.sh inventree_mcp.tests.test_auth_flow
-dev/test.sh inventree_mcp.test_mcp          # the original suite
+dev/test.sh inventree_mcp.tests.test_transport   # one module (one label per call)
 dev/test-image.sh up latest && dev/test-image.sh test   # the suite in another InvenTree image (CI's `latest` = master)
 dev/oauth_smoke.py                          # live OAuth flow against http://localhost:8080
 dev/membership_e2e.py                       # live membership re-checks against the dev Authentik
 dev/permissions_e2e.py                      # live MCP permission set (parts-only MCP role) as e2e-member
+dev/tools_e2e.py                            # live round trip of the write tools (MCP_READ_ONLY off, restored)
+dev/e2e/run.py                              # the ten go-live scenarios of docs/OPERATIONS.md
 dev/ui_smoke.py                             # live plugin pages in a headless browser (1.6+ host)
 ```
 
@@ -199,14 +248,14 @@ Inside the InvenTree devcontainer instead:
 ```
 # from this repo, inside the InvenTree devcontainer:
 ./run_tests.sh                                            # full suite, --keepdb
-./run_tests.sh inventree_mcp.test_mcp.MCPTransportTest     # one class
+./run_tests.sh inventree_mcp.tests.test_transport.MCPTransportTest   # one class
 ```
 
 Equivalent by hand:
 
 ```
 pip install -e dev/InvenTreeMCP --no-deps
-invoke dev.test -r inventree_mcp.test_mcp.MCPToolPermissionTest
+invoke dev.test -r inventree_mcp.tests.test_tools_framework.ToolSetContractTest
 ```
 
 CI (`.github/workflows/ci.yaml`) runs ruff, the frontend job (`npm ci`, lint, vitest, build,
@@ -222,7 +271,7 @@ modules keep the old module objects, the code under test lazily imports the fres
 class is never the registry's: compare models by `_meta.label`, not identity, never rely on
 `on_delete=CASCADE` from a core model into a plugin table (`auth/signals.py` deletes the plugin's
 rows itself on `pre_delete`), and have every receiver connected to a plugin model check
-`instance._meta.label` (Django matches senders by `id()`, and a dead class's id gets reused). In `test_mcp.py`, patch the module objects it imported
+`instance._meta.label` (Django matches senders by `id()`, and a dead class's id gets reused). In `test_transport.py`, patch the module objects it imported
 (`patch.object(view_resolution, ...)`), not dotted paths.
 
 ## Frontend
@@ -258,4 +307,5 @@ ruff format --preview inventree_mcp
 `--preview` matches `.pre-commit-config.yaml`, which pins ruff `v0.16.0`; CI pins the same
 version (`RUFF_VERSION: "0.16.0"` in `ci.yaml`). Run the pinned version with `uvx ruff@0.16.0 check --preview inventree_mcp` and
 `uvx ruff@0.16.0 format --preview inventree_mcp`. `tests/` is excluded by the repo config; check it
-with `--isolated`.
+with `--isolated`. The host-side scripts are linted the same way:
+`uvx ruff@0.16.0 check --isolated dev/*.py dev/e2e/*.py deploy/beta/*.py`.

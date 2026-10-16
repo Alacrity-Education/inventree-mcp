@@ -93,7 +93,7 @@ fi
 # --- 6. configuration (every run) --------------------------------------------------------------------------------
 sso_configured=0; [[ -n "${AUTHENTIK_ISSUER:-}" && -n "${AUTHENTIK_CLIENT_ID:-}" && -n "${AUTHENTIK_CLIENT_SECRET:-}" ]] && sso_configured=1
 configure() {
-    dc exec -T -e "SSO_GROUP_MAP=${SSO_GROUP_MAP:-}" -e "SSO_CONFIGURED=$sso_configured" -e "MCP_GROUPS=${MCP_GROUPS:-ItAdmins}" inventree-server \
+    dc exec -T -e "SSO_GROUP_MAP=${SSO_GROUP_MAP:-}" -e "SSO_CONFIGURED=$sso_configured" -e "MCP_GROUPS=${MCP_GROUPS:-ItAdmins}" -e "MCP_WRITE=${MCP_WRITE:-1}" inventree-server \
         python src/backend/InvenTree/manage.py shell < configure_inventree.py 2>&1 | tee data/configure.log \
         | grep -v "^SETTINGS_CHANGED" || true
 }

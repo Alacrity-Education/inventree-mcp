@@ -8,6 +8,9 @@ server container:
 - the admin account only created when no user "admin" exists (existing passwords are never changed);
 - the groups in MCP_GROUPS (default ItAdmins) get the MCP view roles and are the groups MCP requires (existing groups
   that the SSO group sync maintains; a group that does not exist is created without interactive roles);
+- MCP_WRITE (default 1): the plugin setting MCP_READ_ONLY is switched off and the groups in MCP_GROUPS get all four MCP
+  flags (view, add, change, delete) on part, part_category, stock and stock_location (view on every other role stays);
+  MCP_WRITE=0 keeps MCP_READ_ONLY on and grants nothing beyond view;
 - the plugin's settings: OAuth on; the SSO-bound settings follow whether a social login provider is configured
   (through .env or the restored database).
 """
@@ -21,6 +24,8 @@ from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 
+MCP_WRITE = (os.environ.get('MCP_WRITE') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
+WRITE_ROLES = ('part', 'part_category', 'stock', 'stock_location')
 MCP_GROUPS = [g.strip() for g in (os.environ.get('MCP_GROUPS') or 'ItAdmins').split(',') if g.strip()]
 
 
@@ -84,10 +89,11 @@ if not User.objects.filter(username='admin').exists():
 else:
     print(f'users: {User.objects.count()} (restored, passwords untouched)')
 
-from inventree_mcp.auth.signals import ensure_rulesets
-from inventree_mcp.models import MCPRuleSet
 from users.models import RuleSet
 from users.ruleset import RULESET_CHOICES
+
+from inventree_mcp.auth.signals import ensure_rulesets
+from inventree_mcp.models import MCPRuleSet
 
 for group_name in MCP_GROUPS:
     group, created = Group.objects.get_or_create(name=group_name)
@@ -100,6 +106,11 @@ for group_name in MCP_GROUPS:
     if granted == 0:
         granted = MCPRuleSet.objects.filter(group=group).update(can_view=True)
     print(f'group {group_name}: {"created, " if created else ""}{granted} MCP roles with view, {group.user_set.count()} members')
+    if MCP_WRITE:
+        wrote = MCPRuleSet.objects.filter(group=group, name__in=WRITE_ROLES).update(
+            can_view=True, can_add=True, can_change=True, can_delete=True
+        )
+        print(f'group {group_name}: {wrote} MCP roles ({", ".join(WRITE_ROLES)}) with view, add, change and delete')
 
 from plugin import registry
 
@@ -115,12 +126,14 @@ plugin_values = {
     'SSO_PROVIDER_ID': provider_id if sso_login else '',
     'MEMBERSHIP_ENFORCED': sso_login,
     'MCP_REQUIRED_GROUPS': ','.join(MCP_GROUPS) if sso_login else '',
+    'MCP_READ_ONLY': not MCP_WRITE,
 }
 plugin_changed = []
 for key, value in plugin_values.items():
     if not _same(plugin.get_setting(key), value):
         plugin.set_setting(key, value)
         plugin_changed.append(key)
+print(f'MCP_WRITE={int(MCP_WRITE)} (MCP_READ_ONLY {"off" if MCP_WRITE else "on"})')
 print(f'plugin settings changed: {", ".join(plugin_changed) or "none"}')
 print('configure_inventree: done')
 if changed:
