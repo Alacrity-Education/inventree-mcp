@@ -1,7 +1,7 @@
 # Beta deployment (i.beta.alacrity.ro)
 
 InvenTree from the fork's patched image (`ghcr.io/alacrity-education/inventree:1.6.0-alacrity.1`: master plus the
-five core patches) with `inventree-mcp` 0.4.0 baked in, Postgres, Redis and a local Caddy on port **8999**. The
+five core patches) with `inventree-mcp` 0.5.0 baked in, Postgres, Redis and a local Caddy on port **8999**. The
 external reverse proxy terminates TLS for `https://i.beta.alacrity.ro` and forwards to this port unchanged; the local
 Caddy does the rest (discovery rewrites, static/media, the public origin headers, code-free access log).
 

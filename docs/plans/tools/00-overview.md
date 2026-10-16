@@ -207,6 +207,23 @@ was verified and how.
 - Test scaffolding for tool tests (`MCPToolTestCase`, `WriteToolTestCase`, the error-text constants) lives in
   `tests/test_transport.py`; tool test files import from there.
 
+## 6d. Corrections recorded after the InvenTree master run
+
+- InvenTree master's stock item serializer has no `notes` field: `add_stock`'s `notes` is stored on 1.5.x and silently
+  ignored on master (the tool keeps sending it, as the Go server does; the test asserts it only where the field exists).
+- Master keys list validation errors by index (`{"items": {"0": {...}}}`); the proxy renders both shapes as `items[0].pk`.
+
+## 6e. Corrections recorded after the final review
+
+- The descriptions of `create_part`, `update_part` and `set_part_image` carry one appended sentence naming
+  `IMAGE_DOWNLOAD_ENABLED`; `search_part_images`'s names the plugin settings. Everything else is the Go text verbatim.
+- Minor payload deviations, accepted: `part=0` / `location=0` filters are dropped (Go: same), a negative `minimum_stock`
+  is sent to InvenTree, which refuses it (Go sends it too), `delete_part` needs view rights for its pre-read.
+- With `MCP_READ_ONLY` on, `delete_part` and the empty-payload updates may answer their own pre-check error before the
+  read-only text; nothing is written either way.
+- The Google API key travels in the `X-Goog-Api-Key` header, never in the query string.
+- The beta image prefers a local wheel in `deploy/beta/image/`: it must be the 0.5.0 build (or absent) at release time.
+
 ## 7. Acceptance
 
 - `tools/list` returns exactly the 26 names of section 4 with titles and annotations as specified.

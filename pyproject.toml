@@ -38,6 +38,7 @@ InvenTreeMCP = "inventree_mcp.core:InvenTreeMCP"
 
 [tool.setuptools.packages.find]
 where = [""]
+exclude = ["build*", "dist*", "dev*", "deploy*", "docs*", "frontend*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "inventree_mcp.PLUGIN_VERSION"} 

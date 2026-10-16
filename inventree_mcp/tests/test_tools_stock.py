@@ -157,7 +157,14 @@ class StockWriteToolsTest(WriteToolTestCase):
         self.assertEqual(body["quantity"], 12.5)
         self.assertEqual(body["location"], self.loc_a.pk)
         self.assertEqual(body["batch"], "B-MCP")
-        self.assertEqual(body["notes"], "added by test")
+        # InvenTree 1.5.x stores the note; master's stock item serializer has no
+        # notes field at all, so the tool's note cannot be stored there.
+        from stock.serializers import StockItemSerializer
+
+        if "notes" in StockItemSerializer().fields:
+            self.assertEqual(body["notes"], "added by test")
+        else:
+            self.assertIn("notes", body)
         item = self.read(body["pk"])
         self.assertEqual(item.quantity, 12.5)
         # Read back through the read tool.

@@ -38,7 +38,7 @@ This fork is not on PyPI. Install the wheel attached to the latest release on
 `pip install` it into the InvenTree environment:
 
 ```bash
-pip install https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.2/inventree_mcp-0.4.2-py3-none-any.whl
+pip install https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.5.0/inventree_mcp-0.5.0-py3-none-any.whl
 ```
 
 Then enable the plugin under **Admin > Plugins**, switch on URL, app, schedule and interface integration for plugins

@@ -3,7 +3,7 @@
 # (image/*.whl, git-ignored) wins over PLUGIN_WHEEL, for testing a build before its release.
 ARG BASE_IMAGE=ghcr.io/alacrity-education/inventree:1.6.0-alacrity.1
 FROM ${BASE_IMAGE}
-ARG PLUGIN_WHEEL=https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.4.2/inventree_mcp-0.4.2-py3-none-any.whl
+ARG PLUGIN_WHEEL=https://github.com/Alacrity-Education/inventree-mcp/releases/download/0.5.0/inventree_mcp-0.5.0-py3-none-any.whl
 COPY . /tmp/image/
 RUN set -e; \
     if ls /tmp/image/*.whl >/dev/null 2>&1; then src="$(ls /tmp/image/*.whl | head -1)"; else src="${PLUGIN_WHEEL}"; fi; \

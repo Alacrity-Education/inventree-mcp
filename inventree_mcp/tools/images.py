@@ -53,15 +53,14 @@ def _scrub(message: str, api_key: str) -> str:
 
 def _search(api_key: str, cse_id: str, query: str, num: int) -> list[dict]:
     """One Google Custom Search image query (blocking); the result rows of the tool."""
-    params = {
-        "key": api_key,
-        "cx": cse_id,
-        "q": query,
-        "searchType": "image",
-        "num": num,
-    }
+    params = {"cx": cse_id, "q": query, "searchType": "image", "num": num}
+    # The key travels in a header, not in the query string: HTTP client debug
+    # logs record request URLs, never headers.
+    headers = {"X-Goog-Api-Key": api_key}
     try:
-        response = requests.get(SEARCH_URL, params=params, timeout=TIMEOUT_SECONDS)
+        response = requests.get(
+            SEARCH_URL, params=params, headers=headers, timeout=TIMEOUT_SECONDS
+        )
     except requests.RequestException as exc:
         raise ToolError(
             _scrub(

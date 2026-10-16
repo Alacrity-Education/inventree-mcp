@@ -1,6 +1,3 @@
-ignore:
-  - "inventree_mcp/test_mcp.py"
-
 coverage:
   status:
     project:

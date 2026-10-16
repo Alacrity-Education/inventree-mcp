@@ -90,7 +90,8 @@ def _error_lines(body: Any, prefix: str = "") -> list[str]:
     """InvenTree's validation error body as "field: message" lines.
 
     {"name": ["required"], "items": [{}, {"quantity": ["> 0"]}], "non_field_errors": ["x"]}
-    -> ["name: required", "items[1].quantity: > 0", "x"].
+    -> ["name: required", "items[1].quantity: > 0", "x"]; a list item keyed by its index
+    ({"items": {"1": {...}}}, InvenTree master) renders the same way.
     """
     lead = f"{prefix}: " if prefix else ""
     if isinstance(body, dict):
@@ -98,6 +99,10 @@ def _error_lines(body: Any, prefix: str = "") -> list[str]:
         for key, value in body.items():
             if key in _UNPREFIXED_KEYS:
                 child = prefix
+            elif str(key).isdigit():
+                # a list item keyed by its index (InvenTree master answers
+                # {"items": {"0": {...}}} where 1.5.x answers a list)
+                child = f"{prefix}[{key}]"
             else:
                 child = f"{prefix}.{key}" if prefix else str(key)
             lines.extend(_error_lines(value, child))

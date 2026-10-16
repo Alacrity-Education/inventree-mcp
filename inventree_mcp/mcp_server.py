@@ -48,8 +48,8 @@ Workflow:
   lists.
 - Images: search_part_images finds product image URLs (needs the plugin settings
   GOOGLE_API_KEY and GOOGLE_CSE_ID); pass a URL to create_part / update_part (image_url) or
-  set_part_image. InvenTree downloads it server-side when its "download from URL" setting is
-  enabled.
+  set_part_image. The plugin downloads the image server-side (InvenTree's own URL checks)
+  only when the plugin setting IMAGE_DOWNLOAD_ENABLED is on; it is off by default.
 
 Write tools (create, update, delete, stock adjustments) work only when an administrator has
 turned off the plugin's "Read Only" setting and the user holds the matching MCP write roles

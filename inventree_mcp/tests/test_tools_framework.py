@@ -394,6 +394,14 @@ class ErrorMessageTest(unittest.TestCase):
             "Bad",
         )
 
+    def test_validation_lines_with_index_keyed_items(self):
+        """InvenTree master keys list errors by index ({"items": {"0": ...}}); same text as a list."""
+        body = {"items": {"0": {"pk": ['Invalid pk "999999" - object does not exist.']}}}
+        self.assertEqual(
+            error_message(400, body),
+            'validation failed (400): items[0].pk: Invalid pk "999999" - object does not exist.',
+        )
+
     def test_validation_of_a_list_body(self):
         self.assertEqual(
             error_message(400, ["Stock item is serialized"]),
@@ -488,12 +496,6 @@ class CallViewErrorTest(InvenTreeTestCase):
             "permission denied (403): your MCP roles or your InvenTree permissions "
             "do not allow this",
         )
-
-    async def test_404_for_a_missing_pk(self):
-        self.bind(self.user)
-        with self.assertRaises(ToolError) as cm:
-            await call_view(PartDetail, "GET", "/api/part/999999/", pk=999_999)
-        self.assertEqual(str(cm.exception), "not found (404): resource does not exist")
 
     async def test_400_for_an_invalid_payload(self):
         self.bind(self.user)

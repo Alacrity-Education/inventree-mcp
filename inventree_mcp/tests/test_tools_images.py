@@ -113,14 +113,9 @@ class SearchPartImagesTest(WriteToolTestCase):
         self.assertEqual(kwargs["timeout"], 10)
         self.assertEqual(
             kwargs["params"],
-            {
-                "key": API_KEY,
-                "cx": "cse-1",
-                "q": "R 2k2 0805",
-                "searchType": "image",
-                "num": 5,
-            },
+            {"cx": "cse-1", "q": "R 2k2 0805", "searchType": "image", "num": 5},
         )
+        self.assertEqual(kwargs["headers"], {"X-Goog-Api-Key": API_KEY})  # never in the URL
 
     def test_num_is_clamped(self):
         self.configure()
