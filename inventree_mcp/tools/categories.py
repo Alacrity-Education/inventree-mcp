@@ -1,90 +1,73 @@
-"""MCP tools for querying InvenTree PartCategory data."""
+"""Part category tools: search_part_categories, list_part_categories (T1); writes follow (T2).
+
+Thin wrappers around part.api.CategoryList / CategoryDetail through proxy.call_view(). Names,
+inputs, defaults and descriptions are the Go server's (docs/plans/tools/00-overview.md).
+"""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated
 
-from ..mcp_server import mcp
-from ..proxy import call_view
+from pydantic import Field
+
 from ..view_resolution import resolve_view
-from ._common import build_query_params
+from ._common import CATEGORY_FIELDS, DEFAULTS, access, listing, tool
 
 
-@mcp.tool()
-async def list_categories(
-    search: str | None = None,
-    parent: int | None = None,
-    ordering: str | None = None,
-    filters: dict[str, Any] | None = None,
-    limit: int = 100,
-    offset: int = 0,
+def _category_list() -> type | None:
+    return resolve_view("part.api", "CategoryList")
+
+
+def _category_detail() -> type | None:
+    return resolve_view("part.api", "CategoryDetail")
+
+
+@tool("search_part_categories", title="Search part categories", read_only=True)
+async def search_part_categories(
+    search: Annotated[
+        str, Field(description="Search query to find categories by name")
+    ],
+    limit: Annotated[
+        int, Field(description="Maximum number of results (default 25)")
+    ] = DEFAULTS["search"],
 ) -> dict:
-    """List part categories.
-
-    Returns a paginated envelope: {count, next, previous, results}. Each
-    entry in `results` has the same shape as get_category's return value -
-    use its `pk` field with get_category to fetch full detail for one of
-    them.
-
-    Args:
-        search: free-text search against name/description.
-        parent: restrict to direct children of this PartCategory ID. Omit to
-            get only top-level (root) categories by default - pass
-            filters={"cascade": true} to include categories at every level
-            instead, or filters={"parent": <id>, "cascade": true} to get all
-            descendants of a specific category rather than just its direct
-            children.
-        ordering: field to sort results by, e.g. "name" ('-' prefix for
-            descending, omit it for ascending). Call describe_filters("category")
-            and check its ordering_fields list for valid values - an
-            unrecognized field is silently ignored (no error, no sort) rather
-            than rejected.
-        filters: additional filter parameters beyond the named arguments
-            above - call describe_filters("category") to see what's available.
-        limit: maximum number of results to return - defaults to 100 (the
-            maximum) to minimize round trips for large result sets; pass a
-            smaller value to page through results in smaller batches.
-        offset: pagination offset.
+    """Search for part categories by name. Use this to find the right category when
+    creating parts. Returns categories with their full path (e.g., 'Electronic
+    Components/Resistors/Through Hole').
     """
-    base: dict[str, Any] = {}
-    if search is not None:
-        base["search"] = search
-    if parent is not None:
-        base["parent"] = parent
-    if ordering is not None:
-        base["ordering"] = ordering
-
-    params = build_query_params(base, filters, limit, offset)
-
-    return await call_view(
-        resolve_view("part.api", "CategoryList"),
-        "GET",
+    return await listing(
+        _category_list,
         "/api/part/category/",
-        query_params=params,
+        {"search": search},
+        limit=limit,
+        default=DEFAULTS["search"],
+        fields=CATEGORY_FIELDS,
     )
 
 
-@mcp.tool()
-async def get_category(category_id: int, filters: dict[str, Any] | None = None) -> dict:
-    """Get full detail for a single part category by its ID.
-
-    Returns the same object shape as one entry in list_categories's
-    `results` array. Get a valid ID from list_categories (its `pk` field)
-    if you don't already have one.
-
-    Args:
-        category_id: the PartCategory's database ID.
-        filters: optional-field toggles beyond what's returned by default -
-            call describe_filters("category") and check its optional_fields.
-
-    Raises:
-        ToolError: no category exists with that ID, or the caller doesn't
-            have permission to view it.
+@tool("list_part_categories", title="List part categories", read_only=True)
+async def list_part_categories(
+    parent: Annotated[
+        int,
+        Field(description="Filter by parent category ID. 0 or omit to list all."),
+    ] = 0,
+    limit: Annotated[
+        int, Field(description="Maximum number of results (default 100)")
+    ] = DEFAULTS["tree"],
+    offset: Annotated[int, Field(description="Offset for pagination")] = 0,
+) -> dict:
+    """List all part categories, optionally filtered by parent category. Shows the category
+    hierarchy with pathstrings and part counts.
     """
-    return await call_view(
-        resolve_view("part.api", "CategoryDetail"),
-        "GET",
-        f"/api/part/category/{category_id}/",
-        pk=category_id,
-        query_params=filters,
+    return await listing(
+        _category_list,
+        "/api/part/category/",
+        {"parent": parent, "offset": offset},
+        limit=limit,
+        default=DEFAULTS["tree"],
+        fields=CATEGORY_FIELDS,
     )
+
+
+access("search_part_categories", _category_list, "GET")
+access("list_part_categories", _category_list, "GET")

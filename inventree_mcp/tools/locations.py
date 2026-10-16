@@ -1,90 +1,98 @@
-"""MCP tools for querying InvenTree StockLocation data."""
+"""Stock location tools: search_stock_locations, get_stock_location, list_stock_locations (T1);
+the location write tools follow (T3).
+
+Thin wrappers around stock.api.StockLocationList / StockLocationDetail through
+proxy.call_view(). Names, inputs, defaults and descriptions are the Go server's
+(docs/plans/tools/00-overview.md).
+"""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated
 
-from ..mcp_server import mcp
-from ..proxy import call_view
+from pydantic import Field
+
 from ..view_resolution import resolve_view
-from ._common import build_query_params
+from ._common import DEFAULTS, LOCATION_FIELDS, access, fetch, listing, tool
 
 
-@mcp.tool()
-async def list_locations(
-    search: str | None = None,
-    parent: int | None = None,
-    ordering: str | None = None,
-    filters: dict[str, Any] | None = None,
-    limit: int = 100,
-    offset: int = 0,
+def _location_list() -> type | None:
+    return resolve_view("stock.api", "StockLocationList")
+
+
+def _location_detail() -> type | None:
+    return resolve_view("stock.api", "StockLocationDetail")
+
+
+@tool("search_stock_locations", title="Search stock locations", read_only=True)
+async def search_stock_locations(
+    search: Annotated[
+        str,
+        Field(
+            description="Search query to find locations by name or description. "
+            "Supports partial/fuzzy matching (e.g. 'green' finds 'Green 1')."
+        ),
+    ],
+    limit: Annotated[
+        int, Field(description="Maximum number of results (default 25)")
+    ] = DEFAULTS["search"],
 ) -> dict:
-    """List stock locations.
-
-    Returns a paginated envelope: {count, next, previous, results}. Each
-    entry in `results` has the same shape as get_location's return value -
-    use its `pk` field with get_location to fetch full detail for one of
-    them.
-
-    Args:
-        search: free-text search against name/description.
-        parent: restrict to direct children of this StockLocation ID. Omit to
-            get only top-level (root) locations by default - pass
-            filters={"cascade": true} to include locations at every level
-            instead, or filters={"parent": <id>, "cascade": true} to get all
-            descendants of a specific location rather than just its direct
-            children.
-        ordering: field to sort results by, e.g. "name" ('-' prefix for
-            descending, omit it for ascending). Call describe_filters("location")
-            and check its ordering_fields list for valid values - an
-            unrecognized field is silently ignored (no error, no sort) rather
-            than rejected.
-        filters: additional filter parameters beyond the named arguments
-            above - call describe_filters("location") to see what's available.
-        limit: maximum number of results to return - defaults to 100 (the
-            maximum) to minimize round trips for large result sets; pass a
-            smaller value to page through results in smaller batches.
-        offset: pagination offset.
+    """Search for stock locations by name or description. Use this to find locations when
+    the user gives an approximate name (e.g., 'green box 2' or 'office'). Returns matching
+    locations with their full path (e.g., 'Office/Green 1'). The pathstring field shows the
+    hierarchical location path.
     """
-    base: dict[str, Any] = {}
-    if search is not None:
-        base["search"] = search
-    if parent is not None:
-        base["parent"] = parent
-    if ordering is not None:
-        base["ordering"] = ordering
-
-    params = build_query_params(base, filters, limit, offset)
-
-    return await call_view(
-        resolve_view("stock.api", "StockLocationList"),
-        "GET",
+    return await listing(
+        _location_list,
         "/api/stock/location/",
-        query_params=params,
+        {"search": search},
+        limit=limit,
+        default=DEFAULTS["search"],
+        fields=LOCATION_FIELDS,
     )
 
 
-@mcp.tool()
-async def get_location(location_id: int, filters: dict[str, Any] | None = None) -> dict:
-    """Get full detail for a single stock location by its ID.
-
-    Returns the same object shape as one entry in list_locations's
-    `results` array. Get a valid ID from list_locations (its `pk` field)
-    if you don't already have one.
-
-    Args:
-        location_id: the StockLocation's database ID.
-        filters: optional-field toggles beyond what's returned by default -
-            call describe_filters("location") and check its optional_fields.
-
-    Raises:
-        ToolError: no location exists with that ID, or the caller doesn't
-            have permission to view it.
+@tool("get_stock_location", title="Get stock location", read_only=True)
+async def get_stock_location(
+    id: Annotated[int, Field(description="The location ID (pk) to retrieve")],
+) -> dict:
+    """Get detailed information about a specific stock location by its ID, including its
+    parent path and number of items.
     """
-    return await call_view(
-        resolve_view("stock.api", "StockLocationDetail"),
+    return await fetch(
+        _location_detail,
         "GET",
-        f"/api/stock/location/{location_id}/",
-        pk=location_id,
-        query_params=filters,
+        f"/api/stock/location/{id}/",
+        fields=LOCATION_FIELDS,
+        pk=id,
     )
+
+
+@tool("list_stock_locations", title="List stock locations", read_only=True)
+async def list_stock_locations(
+    parent: Annotated[
+        int,
+        Field(description="Filter by parent location ID. 0 or omit to list all."),
+    ] = 0,
+    limit: Annotated[
+        int, Field(description="Maximum number of results (default 100)")
+    ] = DEFAULTS["tree"],
+    offset: Annotated[int, Field(description="Offset for pagination")] = 0,
+) -> dict:
+    """List all stock locations, optionally filtered by parent location. Returns the full
+    location hierarchy with pathstrings. Use this to see all available locations and their
+    structure.
+    """
+    return await listing(
+        _location_list,
+        "/api/stock/location/",
+        {"parent": parent, "offset": offset},
+        limit=limit,
+        default=DEFAULTS["tree"],
+        fields=LOCATION_FIELDS,
+    )
+
+
+access("search_stock_locations", _location_list, "GET")
+access("get_stock_location", _location_detail, "GET")
+access("list_stock_locations", _location_list, "GET")

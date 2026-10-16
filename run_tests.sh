@@ -8,15 +8,15 @@
 #
 # Usage:
 #   ./run_tests.sh                                                  # full suite
-#   ./run_tests.sh inventree_mcp.test_mcp.MCPTransportTest
-#   ./run_tests.sh inventree_mcp.test_mcp --keepdb -v 2             # extra manage.py test args
+#   ./run_tests.sh inventree_mcp.tests.test_transport.MCPTransportTest
+#   ./run_tests.sh inventree_mcp.tests.test_transport -v 2          # extra manage.py test args
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="${INVENTREE_VENV:-/home/inventree/dev/venv}"
 BACKEND_DIR="${INVENTREE_BACKEND_DIR:-/home/inventree/src/backend}"
 
-TEST_TARGET="${1:-inventree_mcp.test_mcp}"
+TEST_TARGET="${1:-inventree_mcp}"
 if [ "$#" -gt 0 ]; then
     shift
 fi

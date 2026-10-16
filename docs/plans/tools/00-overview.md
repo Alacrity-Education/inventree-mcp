@@ -169,6 +169,18 @@ Rules for every agent: no edits outside the owned files; no duplicated helper co
 `dev/test-image.sh up latest && dev/test-image.sh test` (InvenTree master); each stage ends with a report listing what
 was verified and how.
 
+## 6a. Corrections recorded after T1 (binding for T2/T3/T4)
+
+- Ten read tools, not eleven: `search_part_images` counts as a T2 tool (its only "read" is Google).
+- T1 created the four `tests/test_tools_*.py` files with the read tests; T2/T3 append their write tests to them.
+- `_raw_api_token` and `API_TOKEN_V2_MIN_API_VERSION` live in `tests/oauth_helpers.py`.
+- `part_detail` on stock items is `null` unless the caller may view parts (InvenTree 1.5.7); `tags` is `null` in the
+  API output on 1.5.7. Both are InvenTree behaviour, not tool bugs; tests assert the key, not a value.
+- Every error text a client sees is prefixed by the SDK with `Error executing tool <name>: `; tests match on the
+  plugin's part of the text.
+- The SDK (mcp 2.3.0) coerces `"1"` to 1 and `"true"` to True itself; `ToolAnnotations` fields are snake_case in Python.
+- `test_policy`'s request-host test now checks that a paged call succeeds (the `next` link is no longer returned).
+
 ## 7. Acceptance
 
 - `tools/list` returns exactly the 26 names of section 4 with titles and annotations as specified.

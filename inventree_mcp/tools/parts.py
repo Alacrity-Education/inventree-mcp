@@ -1,95 +1,84 @@
-"""MCP tools for querying InvenTree Part data.
+"""Part tools: search_parts, get_part, list_parts (T1); the part write tools follow (T2).
 
-Every tool here is a thin wrapper around the real part API views
-(part.api.PartList / PartDetail) via proxy.call_view(), so permissions,
-filtering, and serialization always match the regular REST API exactly.
+Thin wrappers around part.api.PartList / PartDetail through proxy.call_view(), so permissions,
+filtering and serialization are InvenTree's own. Names, inputs, defaults and descriptions are
+the Go server's (docs/plans/tools/00-overview.md, section 4).
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated
 
-from ..mcp_server import mcp
-from ..proxy import call_view
+from pydantic import Field
+
 from ..view_resolution import resolve_view
-from ._common import build_query_params
+from ._common import DEFAULTS, PART_FIELDS, access, fetch, listing, tool
 
 
-@mcp.tool()
-async def list_parts(
-    search: str | None = None,
-    category: int | None = None,
-    active: bool | None = None,
-    ordering: str | None = None,
-    filters: dict[str, Any] | None = None,
-    limit: int = 100,
-    offset: int = 0,
+def _part_list() -> type | None:
+    return resolve_view("part.api", "PartList")
+
+
+def _part_detail() -> type | None:
+    return resolve_view("part.api", "PartDetail")
+
+
+@tool("search_parts", title="Search parts", read_only=True)
+async def search_parts(
+    search: Annotated[
+        str, Field(description="Search query to find parts by name or keyword")
+    ],
+    limit: Annotated[
+        int, Field(description="Maximum number of results to return (default 25)")
+    ] = DEFAULTS["search"],
 ) -> dict:
-    """List parts in the InvenTree database.
-
-    Returns a paginated envelope: {count, next, previous, results}. Each
-    entry in `results` has the same shape as get_part's return value - use
-    its `pk` field with get_part to fetch full detail for one of them.
-
-    Args:
-        search: free-text search against name, description, IPN, and keywords.
-        category: restrict to parts in this PartCategory ID (includes sub-categories).
-        active: True for only active (non-discontinued) parts, False for only
-            inactive ones, omit to include both.
-        ordering: field to sort results by, e.g. "-in_stock" for highest stock
-            first ('-' prefix for descending, omit it for ascending). Combine
-            with limit to get a "top N by X" result, e.g. ordering="-in_stock",
-            limit=5 for the 5 parts with the most stock. Call
-            describe_filters("part") and check its ordering_fields list for
-            valid values - an unrecognized field is silently ignored (no
-            error, no sort) rather than rejected.
-        filters: additional filter parameters beyond the named arguments
-            above - call describe_filters("part") to see what's available,
-            e.g. filters={"is_variant": true}.
-        limit: maximum number of results to return - defaults to 100 (the
-            maximum) to minimize round trips for large result sets; pass a
-            smaller value to page through results in smaller batches.
-        offset: pagination offset.
+    """Search for parts by name, keyword, or description. Use this to find existing parts
+    before creating new ones. Returns matching parts with their IDs, names, categories, and
+    stock levels.
     """
-    base: dict[str, Any] = {}
-    if search is not None:
-        base["search"] = search
-    if category is not None:
-        base["category"] = category
-    if active is not None:
-        base["active"] = active
-    if ordering is not None:
-        base["ordering"] = ordering
-
-    params = build_query_params(base, filters, limit, offset)
-
-    return await call_view(
-        resolve_view("part.api", "PartList"), "GET", "/api/part/", query_params=params
+    return await listing(
+        _part_list,
+        "/api/part/",
+        {"search": search},
+        limit=limit,
+        default=DEFAULTS["search"],
+        fields=PART_FIELDS,
     )
 
 
-@mcp.tool()
-async def get_part(part_id: int, filters: dict[str, Any] | None = None) -> dict:
-    """Get full detail for a single part by its ID.
-
-    Returns the same object shape as one entry in list_parts's `results`
-    array. Get a valid ID from list_parts (its `pk` field) if you don't
-    already have one.
-
-    Args:
-        part_id: the Part's database ID.
-        filters: optional-field toggles beyond what's returned by default -
-            call describe_filters("part") and check its optional_fields, e.g.
-            filters={"category_detail": true}.
-
-    Raises:
-        ToolError: no part exists with that ID, or the caller doesn't have
-            permission to view it.
-    """
-    return await call_view(
-        resolve_view("part.api", "PartDetail"),
-        "GET",
-        f"/api/part/{part_id}/",
-        pk=part_id,
-        query_params=filters,
+@tool("get_part", title="Get part", read_only=True)
+async def get_part(
+    id: Annotated[int, Field(description="The part ID (pk) to retrieve")],
+) -> dict:
+    """Get detailed information about a specific part by its ID."""
+    return await fetch(
+        _part_detail, "GET", f"/api/part/{id}/", fields=PART_FIELDS, pk=id
     )
+
+
+@tool("list_parts", title="List parts", read_only=True)
+async def list_parts(
+    category: Annotated[
+        int, Field(description="Filter by category ID. 0 or omit to list all.")
+    ] = 0,
+    limit: Annotated[
+        int, Field(description="Maximum number of results (default 50)")
+    ] = DEFAULTS["list"],
+    offset: Annotated[int, Field(description="Offset for pagination")] = 0,
+) -> dict:
+    """List all parts, optionally filtered by category. Use search_parts for finding
+    specific parts by name.
+    """
+    return await listing(
+        _part_list,
+        "/api/part/",
+        {"category": category, "offset": offset},
+        limit=limit,
+        default=DEFAULTS["list"],
+        fields=PART_FIELDS,
+    )
+
+
+access("search_parts", _part_list, "GET")
+access("get_part", _part_detail, "GET")
+access("list_parts", _part_list, "GET")

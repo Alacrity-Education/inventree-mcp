@@ -7,13 +7,13 @@ the calling user and arguments for real debugging value, and a second line on
 completion with the outcome and duration.
 
 This deliberately does not touch mcp.call_tool (the MCPServer-level method) -
-tests that call it directly (see test_mcp.py) exercise tool dispatch without
+tests that call it directly (see tests/test_transport.py) exercise tool dispatch without
 the transport/logging layer, same as tool_visibility.py leaves mcp.list_tools
 untouched for the same reason. What actually sees every real client
 tools/call request (see mcp_transport.py) is the low-level
 mcp.server.lowlevel.Server's registered "tools/call" request handler, so this
 reaches into that internal and re-registers it - the same "no public API for
-this" approach output_schemas.py and tool_visibility.py already use.
+this" approach tool_visibility.py already uses.
 
 mcp 2.0's rewrite moved the exception -> CallToolResult(is_error=True)
 normalization that used to live in the lowlevel Server's `.call_tool()`

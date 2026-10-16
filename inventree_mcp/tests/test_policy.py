@@ -26,10 +26,10 @@ from ..mcp_server import mcp
 from ..mcp_transport import scoped_token_for
 from ..models import MCPRuleSet, MCPUserState
 from ..oauth2_bridge import scoped_view_class
-from ..test_mcp import _raw_api_token
 from .oauth_helpers import (
     MCP_URL,
     OAuthFacadeTestMixin,
+    _raw_api_token,
     grant_mcp,
     make_token_pair,
     pkce_pair,
@@ -213,7 +213,7 @@ class TransportNarrowingTest(PermissionSetTestCase):
         super().setUpTestData()
         category = PartCategory.objects.create(name="WP3")
         Part.objects.create(name="WP3 part", description="x", category=category)
-        # A second part, so list_parts {"limit": 1} has a "next" link.
+        # A second part, so the view builds a "next" link for list_parts {"limit": 1}.
         Part.objects.create(name="WP3 part 2", description="x", category=category)
 
     def setUp(self):
@@ -260,11 +260,11 @@ class TransportNarrowingTest(PermissionSetTestCase):
         self.assertEqual(token_tools, oauth_tools)
         self.assertIn("list_parts", token_tools)
         # Interactive stock view, but no MCP stock role.
-        self.assertNotIn("list_stock_items", token_tools)
-        self.assertNotIn("list_locations", token_tools)
+        self.assertNotIn("get_stock", token_tools)
+        self.assertNotIn("list_stock_locations", token_tools)
 
         result = self.call_tool(
-            "list_stock_items", HTTP_AUTHORIZATION=f"Token {self.api_token}"
+            "get_stock", HTTP_AUTHORIZATION=f"Token {self.api_token}"
         )["result"]
         self.assertTrue(result["isError"])
         result = self.call_tool(
@@ -306,8 +306,8 @@ class TransportNarrowingTest(PermissionSetTestCase):
 
         tools = self.tools(**bearer)
         self.assertIn("list_parts", tools)
-        self.assertNotIn("list_stock_items", tools)
-        result = self.call_tool("list_stock_items", **bearer)["result"]
+        self.assertNotIn("get_stock", tools)
+        result = self.call_tool("get_stock", **bearer)["result"]
         self.assertTrue(result["isError"])
         self.assertIn("permission", result["content"][0]["text"])
         result = self.call_tool("list_parts", {"limit": 1}, **bearer)["result"]
@@ -343,7 +343,12 @@ class TransportNarrowingTest(PermissionSetTestCase):
 
     @override_settings(ALLOWED_HOSTS=["mcp.example"])
     def test_paginated_list_uses_the_request_host(self):
-        """F2: proxied requests carry the MCP request's host, not "testserver"."""
+        """F2: proxied requests carry the MCP request's host, not "testserver".
+
+        list_parts drops next/previous (the Go server's output), but the view still
+        builds its "next" link from the request host: with "testserver" outside
+        ALLOWED_HOSTS that raises DisallowedHost and the call fails.
+        """
         for authorization in (
             f"Token {self.api_token}",
             "Bearer "
@@ -362,9 +367,8 @@ class TransportNarrowingTest(PermissionSetTestCase):
                 result["content"][0]["text"]
             )
             self.assertEqual(len(body["results"]), 1)
-            self.assertTrue(
-                body["next"].startswith("http://mcp.example/"), body["next"]
-            )
+            self.assertGreater(body["count"], 1)  # so the view built a "next" link
+            self.assertNotIn("next", body)
 
     @override_settings(ALLOWED_HOSTS=["mcp.example"])
     def test_write_call_carries_the_request_meta(self):
@@ -450,7 +454,7 @@ class TransportNarrowingTest(PermissionSetTestCase):
         self.set_setting("MCP_ALLOW_BASIC_AUTH", True)
         tools = self.tools(HTTP_AUTHORIZATION=f"Basic {basic}")
         self.assertIn("list_parts", tools)
-        self.assertNotIn("list_stock_items", tools)
+        self.assertNotIn("get_stock", tools)
 
     def test_scoped_token_is_unsaved_and_carries_the_effective_scopes(self):
         token = scoped_token_for(self.user)
@@ -507,7 +511,7 @@ class TransportNarrowingTest(PermissionSetTestCase):
             tool.name for tool in await mcp.list_tools()
         )
         self.assertIn("list_parts", names)
-        self.assertNotIn("list_stock_items", names)
+        self.assertNotIn("get_stock", names)
 
         from stock.api import StockList
 

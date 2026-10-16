@@ -20,10 +20,10 @@ from part.models import Part, PartCategory
 from users.models import ApiToken
 
 from ..auth import policy
-from ..test_mcp import _raw_api_token
 from .oauth_helpers import (
     MCP_URL,
     OAuthFacadeTestMixin,
+    _raw_api_token,
     consent_form_data,
     pkce_pair,
     query,
@@ -241,12 +241,12 @@ class PermissionSetFlowTest(OAuthFacadeTestMixin, InvenTreeTestCase):
         names = {tool["name"] for tool in response.json()["result"]["tools"]}
         self.assertIn("list_parts", names)
         self.assertIn("get_part", names)
-        self.assertNotIn("list_stock_items", names)
+        self.assertNotIn("get_stock", names)
         self.assertNotIn("get_stock_item", names)
 
         result = self.call_tool(tokens["access_token"], "list_parts")
         self.assertFalse(result.get("isError"), result)
-        result = self.call_tool(tokens["access_token"], "list_stock_items")
+        result = self.call_tool(tokens["access_token"], "get_stock")
         self.assertTrue(result["isError"])
         self.assertIn("permission", result["content"][0]["text"])
 

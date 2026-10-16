@@ -28,7 +28,7 @@ class UiTestCase(InvenTreeAPITestCase):
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
-        # load and activate the plugin, as test_mcp.py does
+        # load and activate the plugin, as test_transport.py does
         registry.reload_plugins(full_reload=True, collect=True)
         registry.set_plugin_state("inventree-mcp", True)
         cls.plain = User.objects.create_user(username="ui-plain", password="pw")

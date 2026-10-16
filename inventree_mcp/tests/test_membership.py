@@ -39,9 +39,9 @@ from users.models import ApiToken
 from ..auth import membership, policy, tasks
 from ..auth.membership import Outcome
 from ..models import MCPRuleSet, MCPUserState
-from ..test_mcp import _raw_api_token
 from .oauth_helpers import (
     OAuthFacadeTestMixin,
+    _raw_api_token,
     grant_mcp,
     make_token_pair,
     pkce_pair,
@@ -981,7 +981,7 @@ class TransportTest(MembershipTestCase):
     def setUp(self):
         super().setUp()
         # The usable credential is only available right after creation (hmac
-        # digest storage on InvenTree master, see test_mcp._raw_api_token).
+        # digest storage on InvenTree master, see oauth_helpers._raw_api_token).
         self.api_token = ApiToken.objects.create(user=self.user, name="mcp test")
         self.raw_api_token = _raw_api_token(self.api_token)
 

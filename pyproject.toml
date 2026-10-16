@@ -59,4 +59,3 @@ src=["inventree_mcp"]
 
 [tool.coverage.run]
 source = ["inventree_mcp"]
-omit = ["*/test_mcp.py"]

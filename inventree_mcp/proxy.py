@@ -5,11 +5,29 @@ directly. Dispatching through the real DRF view class means the exact same
 authentication, RolePermission / ModelPermission checks, filtering, and
 serialization that the normal REST API enforces also apply here - a user can
 never see or change more via MCP than they could via the regular API.
+
+Failures become a ToolError whose text starts like the Go server's
+(github.com/syntaxerr66/inventree-mcp, internal/client/client.go):
+
+- 401 "authentication failed (401)"
+- 403 "permission denied (403): your MCP roles or your InvenTree permissions do not allow this"
+- 404 "not found (404): resource does not exist"
+- 400 "validation failed (400): " followed by one "field: message" line per field of
+  InvenTree's error body (lists joined with "; ", nested fields as "items[0].quantity",
+  non_field_errors and detail without a prefix)
+- anything else "API error <status>: <body>" ("API error <status> (empty response)")
+
+Error details are cut at 500 characters, and credential-shaped "Token <value>",
+"Bearer <value>" and "Basic <value>" strings (16+ token characters) are redacted from them. The MCP SDK prefixes the text it sends with
+"Error executing tool <name>: ". Two more ToolErrors come from here: the read-only gate
+(any non-GET call while the MCP_READ_ONLY setting is on, the default) and a view class
+that could not be resolved on the running InvenTree version.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from asgiref.sync import sync_to_async
@@ -28,6 +46,109 @@ from .oauth2_bridge import authentication_classes_for, scoped_view_class
 from .settings import get_plugin_setting
 
 _factory = APIRequestFactory()
+
+#: Longest error detail passed on (the Go server's limit).
+MAX_ERROR_DETAIL = 500
+
+#: Error body keys whose messages are not about one field.
+_UNPREFIXED_KEYS = frozenset({"non_field_errors", "detail", "__all__"})
+
+#: Credentials that must never reach a tool result.
+#: Case-sensitive and credential-shaped (16+ token characters), so ordinary words in
+#: validation messages ("Basic units", "token expired") are left alone.
+_CREDENTIAL = re.compile(r"\b(Token|Bearer|Basic) [A-Za-z0-9._~+/=-]{16,}")
+
+_STATUS_TEXT = {
+    401: "authentication failed (401)",
+    403: (
+        "permission denied (403): your MCP roles or your InvenTree permissions "
+        "do not allow this"
+    ),
+    404: "not found (404): resource does not exist",
+}
+
+
+def _truncate(detail: str) -> str:
+    """*detail* without credentials, cut at MAX_ERROR_DETAIL characters."""
+    detail = _CREDENTIAL.sub(r"\1 [REDACTED]", detail.strip())
+    if len(detail) > MAX_ERROR_DETAIL:
+        return detail[:MAX_ERROR_DETAIL] + "..."
+    return detail
+
+
+def _is_scalar(value: Any) -> bool:
+    return not isinstance(value, dict | list)
+
+
+def _error_lines(body: Any, prefix: str = "") -> list[str]:
+    """InvenTree's validation error body as "field: message" lines.
+
+    {"name": ["required"], "items": [{}, {"quantity": ["> 0"]}], "non_field_errors": ["x"]}
+    -> ["name: required", "items[1].quantity: > 0", "x"].
+    """
+    lead = f"{prefix}: " if prefix else ""
+    if isinstance(body, dict):
+        lines = []
+        for key, value in body.items():
+            if key in _UNPREFIXED_KEYS:
+                child = prefix
+            else:
+                child = f"{prefix}.{key}" if prefix else str(key)
+            lines.extend(_error_lines(value, child))
+        return lines
+    if isinstance(body, list):
+        if all(_is_scalar(item) for item in body):
+            messages = [str(item) for item in body if str(item)]
+            return [lead + "; ".join(messages)] if messages else []
+        lines = []
+        for index, item in enumerate(body):
+            if _is_scalar(item):
+                lines.extend(_error_lines([item], prefix))
+            else:
+                lines.extend(_error_lines(item, f"{prefix}[{index}]"))
+        return lines
+    if body is None or str(body) == "":
+        return []
+    return [lead + str(body)]
+
+
+def error_message(status: int, body: Any) -> str:
+    """The ToolError text for an InvenTree response with HTTP *status* and parsed *body*.
+
+    *body* is the decoded JSON, or the raw text when the response was not JSON.
+    """
+    if status in _STATUS_TEXT:
+        return _STATUS_TEXT[status]
+    if status == 400:
+        lines = _error_lines(body)
+        return "validation failed (400): " + _truncate(
+            "\n".join(lines) if lines else _body_text(body)
+        )
+    detail = _body_text(body)
+    if not detail:
+        return f"API error {status} (empty response)"
+    return f"API error {status}: {_truncate(detail)}"
+
+
+def _body_text(body: Any) -> str:
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body.strip()
+    if isinstance(body, dict | list) and not body:
+        return ""
+    return json.dumps(body, ensure_ascii=False)
+
+
+def _parse_body(content: bytes) -> Any:
+    """The JSON of *content*, {} when empty, or its text when it is not JSON."""
+    if not content:
+        return {}
+    try:
+        return json.loads(content)
+    except ValueError:
+        return content.decode("utf-8", errors="replace")
+
 
 # HTTP method -> ViewSet action, for the case where a pk *is* present
 # (GET/'retrieve' is the odd one out - see _viewset_actions()).
@@ -58,8 +179,9 @@ def _viewset_actions(
         return None
 
     method = method.upper()
-    if method == "GET" and "pk" not in view_kwargs:
-        action = "list"
+    if "pk" not in view_kwargs and method in ("GET", "POST"):
+        # List routes: GET lists, POST creates (the write tools' POSTs).
+        action = "list" if method == "GET" else "create"
     else:
         action = _DETAIL_ACTIONS[method]
     return {method.lower(): action}
@@ -121,13 +243,10 @@ def _call_view_sync(
     response = view(request, **view_kwargs)
     response.render()
 
-    body = json.loads(response.rendered_content or b"{}")
+    body = _parse_body(response.rendered_content)
 
     if response.status_code >= 400:
-        detail = body.get("detail") if isinstance(body, dict) else None
-        raise ToolError(
-            detail or f"Request failed with status {response.status_code}: {body}"
-        )
+        raise ToolError(error_message(response.status_code, body))
 
     return body
 
@@ -199,10 +318,11 @@ async def user_has_access(view_cls: type[APIView], method: str = "GET") -> bool:
     never the view's business logic, so it doesn't touch the database for
     real data and doesn't need a valid object id for detail views.
 
-    Deliberately checks the "GET" permission even for tools that end up
-    wrapping a different underlying view (list vs detail) - see
-    tool_visibility.py's module docstring for why a literal HTTP OPTIONS
-    request is the wrong tool for this: InvenTree's OAuth2 scope resolver
+    tool_visibility.py passes the method each tool declared with
+    tools._common.access() (GET for the read tools, POST / PATCH / DELETE for
+    the write tools). Never OPTIONS - see tool_visibility.py's module
+    docstring for why a literal HTTP OPTIONS request is the wrong tool for
+    this: InvenTree's OAuth2 scope resolver
     (map_scope() in InvenTree/permissions.py) hardcodes OPTIONS to a generic
     "g:read" scope regardless of resource, while GET requires the real
     resource-specific scope (e.g. "r:view:part") - an OPTIONS-based check
@@ -214,8 +334,8 @@ async def user_has_access(view_cls: type[APIView], method: str = "GET") -> bool:
 
     Args:
         view_cls: the view class to check (e.g. part.api.PartList).
-        method: the HTTP method whose permission to check - "GET" for every
-            tool that exists today (all read-only).
+        method: the HTTP method whose permission to check (the tool's
+            declared method, see tools._common.ACCESS).
 
     Returns:
         True if the current user (and OAuth2 token, if applicable) has
@@ -255,7 +375,8 @@ async def call_view(
             not found, validation error, ...), method is not GET while the
             plugin's MCP_READ_ONLY setting is enabled (the default), or
             view_cls is None. The message is safe to surface to the calling
-            agent.
+            agent; the texts are listed in the module docstring
+            (error_message()).
 
     Note:
         MCPServer calls tool functions directly in the request's event loop, and
@@ -275,7 +396,7 @@ async def call_view(
         # reaches this through resolve_view(), so this is the one place a
         # missing endpoint turns into the same clean ToolError a real
         # permission or validation failure would give the caller, instead of
-        # each of the ~50 call sites needing its own None check.
+        # each call site needing its own None check.
         raise ToolError(
             "This tool is unavailable: its underlying InvenTree API endpoint "
             "could not be found. This usually means the InvenTree MCP "

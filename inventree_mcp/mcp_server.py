@@ -23,51 +23,47 @@ __all__: list[str] = []
 
 from mcp.server.mcpserver import MCPServer
 
-mcp = MCPServer(
-    name="InvenTree MCP",
-    instructions=(
-        "MCP server for querying InvenTree inventory management data - "
-        "parts, stock, purchase/sales/return orders, build orders, "
-        "companies (suppliers/customers/manufacturers) and their catalog "
-        "parts, BOMs, attachments, and more. Every tool here only reads "
-        "data (no create/update/delete tools exist yet). "
-        "Tools follow a list_X/get_X pattern per resource (e.g. "
-        "list_parts/get_part). To find out more about a resource beyond "
-        "its tools' named arguments - available search fields, sort "
-        "fields, extra filters, and optional fields you can inline to save "
-        "a round trip - call describe_filters(resource) first. "
-        "When your response mentions a specific record that has a "
-        "standalone web UI page (e.g. a part, build order, purchase order, "
-        "stock item, or company - see make_web_link's docstring for the "
-        "full list), call make_web_link with its type and ID to give the "
-        "user a clickable link to it."
-    ),
-)
+from . import PLUGIN_VERSION
 
-# Import tool modules for their side effect of registering @mcp.tool() functions.
-# Must run after the tool imports above - output_schemas.apply() attaches
-# output schemas to already-registered tools, and tool_visibility.apply()
-# needs discovery.RESOURCE_LOADERS (defined once discovery.py has run).
-from . import output_schemas, tool_logging, tool_visibility
-from .tools import (  # noqa: F401
-    attachments,
-    bom,
-    build_orders,
-    categories,
-    companies,
-    discovery,
-    locations,
-    parameters,
-    parts,
-    project_codes,
-    purchase_orders,
-    return_orders,
-    sales_orders,
-    stock,
-    stock_history,
-    supplier_parts,
-)
+INSTRUCTIONS = """\
+MCP server for InvenTree inventory management: parts, part categories, stock items and
+stock locations. Every tool runs through InvenTree's own API as the signed-in user, so the
+user's InvenTree permissions and MCP roles apply. `id` arguments are database primary keys
+(pk) returned by the search, list and get tools.
 
-output_schemas.apply()
+Workflow:
+- Search before you create: use search_parts (and search_part_categories /
+  search_stock_locations) to find existing records before creating new ones, and reuse them.
+- Categories: list the hierarchy with list_part_categories and read the pathstring fields.
+  Categories can be nested many levels deep (e.g. Electronic Components/Resistors/Through
+  Hole/1/8 Watt): always pick the deepest, most specific category that fits. If none fits,
+  create one with create_part_category under the most appropriate parent; do not put a part
+  in an unrelated category just because it exists, and do not create top-level categories
+  when the part belongs under an existing parent. Parts should always have a category.
+- Part descriptions from part numbers: when the user gives only a part number (e.g. LM7805,
+  ESP32-S3-WROOM-1), look up or infer what the part is and write a short descriptive
+  description. Never leave the description blank or just repeat the part number.
+- Stock: add_stock creates a new stock item for a part; stock_add_quantity,
+  stock_remove_quantity and stock_transfer take stock item pks (not part ids), which get_stock
+  lists.
+- Images: search_part_images finds product image URLs (needs the plugin settings
+  GOOGLE_API_KEY and GOOGLE_CSE_ID); pass a URL to create_part / update_part (image_url) or
+  set_part_image. InvenTree downloads it server-side when its "download from URL" setting is
+  enabled.
+
+Write tools (create, update, delete, stock adjustments) work only when an administrator has
+turned off the plugin's "Read Only" setting and the user holds the matching MCP write roles
+(add, change, delete) as well as the InvenTree permissions; otherwise they answer with an
+error. Delete tools cannot be undone: confirm with the user first.
+"""
+
+mcp = MCPServer(name="InvenTree MCP", instructions=INSTRUCTIONS, version=PLUGIN_VERSION)
+
+# Import the tool modules for their side effect of registering their tools
+# (tools._common.tool()) and their ACCESS entries; tool_visibility.apply()
+# reads ACCESS, so it runs after these imports.
+from . import tool_logging, tool_visibility
+from .tools import categories, images, locations, parts, stock  # noqa: F401
+
 tool_visibility.apply()
 tool_logging.apply()

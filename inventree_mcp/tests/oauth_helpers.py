@@ -14,6 +14,7 @@ from django.core.cache import cache
 from django.test import Client
 from django.urls import reverse
 from django.utils import timezone
+from InvenTree.api_version import INVENTREE_API_VERSION
 from oauth2_provider.models import (
     get_access_token_model,
     get_application_model,
@@ -29,6 +30,28 @@ REDIRECT_URI = "https://client.example/callback"
 TRUSTED_CIMD_CLIENT_ID = "https://claude.ai/oauth/mcp-test-client-metadata"
 TRUSTED_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 LOOPBACK_REDIRECT_URI = "http://127.0.0.1/callback"
+
+
+# API version from which ApiToken switched to hmac-digest ("v2") storage
+# (core PR #12850). Below this version, `ApiToken.key` holds the raw,
+# usable plaintext token and `.token` returns a *masked* display string once
+# saved. From this version on, `.key` is only the public identifier and the
+# raw usable token is available via `.token` - but only in-memory, right
+# after `.create()`/`.save()` (the raw secret itself is never persisted).
+API_TOKEN_V2_MIN_API_VERSION = 547
+
+
+def _raw_api_token(token) -> str:
+    """Return the raw, usable value of an ApiToken right after creation.
+
+    Compatible with both pre- and post-#12850 core (see
+    API_TOKEN_V2_MIN_API_VERSION above) - the field that holds a usable
+    bearer credential right after `ApiToken.objects.create(...)` differs
+    between the two.
+    """
+    if INVENTREE_API_VERSION >= API_TOKEN_V2_MIN_API_VERSION:
+        return token.token
+    return token.key
 
 
 def url(name: str, **kwargs) -> str:
@@ -124,7 +147,7 @@ class OAuthFacadeTestMixin:
 
     @classmethod
     def setUpTestData(cls):
-        """Load and activate the plugin, as test_mcp.py does; grant the MCP roles."""
+        """Load and activate the plugin, as test_transport.py does; grant the MCP roles."""
         super().setUpTestData()
         registry.reload_plugins(full_reload=True, collect=True)
         registry.set_plugin_state("inventree-mcp", True)

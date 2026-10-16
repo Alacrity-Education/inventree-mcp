@@ -3,15 +3,16 @@
 Every MCP tool wraps one specific DRF view class from InvenTree core (e.g.
 part.api.PartList) - see proxy.py's module docstring for why dispatch has to
 go through the real view rather than the ORM. Those view classes are
-imported lazily, from inside each tool's function body (and from
-tools/discovery.py's RESOURCE_LOADERS), specifically so a class renamed or
+imported lazily, through the tool modules' view loaders (called from
+each tool's function body and by tool_visibility.py via
+tools._common.ACCESS), specifically so a class renamed or
 removed between InvenTree core versions surfaces as a normal, catchable
 failure at first real use - not an AppRegistryNotReady crash at plugin load
 time, and not a bare ImportError propagating out of a tool call either.
 
 This module is the one place that failure is caught, cached, and logged, so
 callers (mostly proxy.call_view(), which turns a None into a clean ToolError)
-don't need to repeat that handling at each of the ~50 call sites that import
+don't need to repeat that handling at each of the call sites that import
 a view class.
 """
 

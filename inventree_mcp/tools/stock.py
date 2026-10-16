@@ -1,99 +1,69 @@
-"""MCP tools for querying InvenTree StockItem data."""
+"""Stock item tools: get_stock, get_stock_item (T1); the stock write tools follow (T3).
+
+Thin wrappers around stock.api.StockList / StockDetail (and StockAdd / StockRemove /
+StockTransfer for T3) through proxy.call_view(). Both reads ask for ?part_detail=true so
+every item carries its part's (pk, name, full_name). Names, inputs, defaults and
+descriptions are the Go server's (docs/plans/tools/00-overview.md).
+"""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated
 
-from ..mcp_server import mcp
-from ..proxy import call_view
+from pydantic import Field
+
 from ..view_resolution import resolve_view
-from ._common import build_query_params
+from ._common import DEFAULTS, STOCK_ITEM_FIELDS, access, fetch, listing, tool
 
 
-@mcp.tool()
-async def list_stock_items(
-    part: int | None = None,
-    location: int | None = None,
-    in_stock: bool | None = None,
-    ordering: str | None = None,
-    filters: dict[str, Any] | None = None,
-    limit: int = 100,
-    offset: int = 0,
+def _stock_list() -> type | None:
+    return resolve_view("stock.api", "StockList")
+
+
+def _stock_detail() -> type | None:
+    return resolve_view("stock.api", "StockDetail")
+
+
+@tool("get_stock", title="List stock items", read_only=True)
+async def get_stock(
+    part: Annotated[
+        int, Field(description="Filter by part ID. 0 or omit to list all.")
+    ] = 0,
+    location: Annotated[
+        int, Field(description="Filter by location ID. 0 or omit to list all.")
+    ] = 0,
+    limit: Annotated[
+        int, Field(description="Maximum number of results (default 50)")
+    ] = DEFAULTS["list"],
+    offset: Annotated[int, Field(description="Offset for pagination")] = 0,
 ) -> dict:
-    """List stock items.
-
-    Returns a paginated envelope: {count, next, previous, results}. Each
-    entry in `results` has the same shape as get_stock_item's return value -
-    use its `pk` field with get_stock_item to fetch full detail for one of
-    them.
-
-    Args:
-        part: restrict to stock of this Part ID (includes variants of the part).
-        location: restrict to stock held at this StockLocation ID.
-        in_stock: True for only items that are actually usable right now -
-            quantity > 0, not allocated to a sales order/customer/build, not
-            currently mid-build, and in an "available" status (excludes e.g.
-            rejected/destroyed/lost stock). False for the inverse. Omit to
-            include both.
-        ordering: field to sort results by, e.g. "-quantity" for highest
-            quantity first ('-' prefix for descending, omit it for
-            ascending). Combine with limit to get a "top N by X" result, e.g.
-            ordering="-quantity", limit=5 for the 5 largest stock items. Call
-            describe_filters("stock") and check its ordering_fields list for
-            valid values - an unrecognized field is silently ignored (no
-            error, no sort) rather than rejected.
-        filters: additional filter parameters beyond the named arguments
-            above - call describe_filters("stock") to see what's available,
-            e.g. filters={"low_stock": true}.
-        limit: maximum number of results to return - defaults to 100 (the
-            maximum) to minimize round trips for large result sets; pass a
-            smaller value to page through results in smaller batches.
-        offset: pagination offset.
+    """List stock items, optionally filtered by part ID and/or location ID. Returns stock
+    quantities, locations, and status for each item.
     """
-    base: dict[str, Any] = {}
-    if part is not None:
-        base["part"] = part
-    if location is not None:
-        base["location"] = location
-    if in_stock is not None:
-        base["in_stock"] = in_stock
-    if ordering is not None:
-        base["ordering"] = ordering
-
-    params = build_query_params(base, filters, limit, offset)
-
-    return await call_view(
-        resolve_view("stock.api", "StockList"),
-        "GET",
+    return await listing(
+        _stock_list,
         "/api/stock/",
-        query_params=params,
+        {"part": part, "location": location, "offset": offset, "part_detail": "true"},
+        limit=limit,
+        default=DEFAULTS["list"],
+        fields=STOCK_ITEM_FIELDS,
     )
 
 
-@mcp.tool()
+@tool("get_stock_item", title="Get stock item", read_only=True)
 async def get_stock_item(
-    stock_item_id: int, filters: dict[str, Any] | None = None
+    id: Annotated[int, Field(description="The stock item ID (pk) to retrieve")],
 ) -> dict:
-    """Get full detail for a single stock item by its ID.
-
-    Returns the same object shape as one entry in list_stock_items's
-    `results` array. Get a valid ID from list_stock_items (its `pk` field)
-    if you don't already have one.
-
-    Args:
-        stock_item_id: the StockItem's database ID.
-        filters: optional-field toggles beyond what's returned by default -
-            call describe_filters("stock") and check its optional_fields,
-            e.g. filters={"tests": true} to include test results inline.
-
-    Raises:
-        ToolError: no stock item exists with that ID, or the caller doesn't
-            have permission to view it.
-    """
-    return await call_view(
-        resolve_view("stock.api", "StockDetail"),
+    """Get detailed information about a specific stock item by its ID."""
+    return await fetch(
+        _stock_detail,
         "GET",
-        f"/api/stock/{stock_item_id}/",
-        pk=stock_item_id,
-        query_params=filters,
+        f"/api/stock/{id}/",
+        fields=STOCK_ITEM_FIELDS,
+        query_params={"part_detail": "true"},
+        pk=id,
     )
+
+
+access("get_stock", _stock_list, "GET")
+access("get_stock_item", _stock_detail, "GET")

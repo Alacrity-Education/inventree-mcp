@@ -77,7 +77,7 @@ class InvenTreeMCP(
         },
         "MCP_READ_ONLY": {
             "name": "Read Only",
-            "description": "Block all write actions via the MCP endpoint, regardless of the calling user's permissions.",
+            "description": "Block every write tool (create_part, update_part, delete_part, set_part_image, create/update/delete_part_category, add_stock, stock_add_quantity, stock_remove_quantity, stock_transfer, delete_stock_item, create/update/delete_stock_location), regardless of the calling user's permissions and MCP roles. While on, MCP write roles are not granted.",
             "validator": bool,
             "default": True,
         },
@@ -202,6 +202,17 @@ class InvenTreeMCP(
             "description": "Superusers get every MCP scope regardless of the MCP roles of their groups. Off: superusers are limited by the MCP roles like everybody else.",
             "validator": bool,
             "default": False,
+        },
+        "GOOGLE_API_KEY": {
+            "name": "Google API Key",
+            "description": "Google Cloud API key with the Custom Search API enabled, for the search_part_images tool. Empty: the tool reports that image search is not configured.",
+            "default": "",
+            "protected": True,
+        },
+        "GOOGLE_CSE_ID": {
+            "name": "Google Custom Search Engine ID",
+            "description": "ID of a Google Programmable Search Engine configured for image search, for the search_part_images tool.",
+            "default": "",
         },
         "MCP_ALLOW_BASIC_AUTH": {
             "name": "Allow Basic Authentication",
