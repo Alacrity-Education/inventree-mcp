@@ -58,6 +58,12 @@ _UNPREFIXED_KEYS = frozenset({"non_field_errors", "detail", "__all__"})
 #: validation messages ("Basic units", "token expired") are left alone.
 _CREDENTIAL = re.compile(r"\b(Token|Bearer|Basic) [A-Za-z0-9._~+/=-]{16,}")
 
+#: The read-only gate's ToolError text (MCP_READ_ONLY).
+READ_ONLY_TEXT = (
+    "This MCP server is running in read-only mode; write actions are disabled. "
+    "An administrator must disable the 'Read Only' plugin setting to allow them."
+)
+
 _STATUS_TEXT = {
     401: "authentication failed (401)",
     403: (
@@ -187,6 +193,17 @@ def _viewset_actions(
     return {method.lower(): action}
 
 
+def ensure_writable(method: str = "POST") -> None:
+    """The read-only gate: ToolError(READ_ONLY_TEXT) for a non-GET *method* while
+    MCP_READ_ONLY is on (blocking; reads a plugin setting).
+
+    call_view() applies it to every call; tools that do work before their first write
+    (the image download in tools/images.py) call it first themselves.
+    """
+    if method.upper() != "GET" and get_plugin_setting("MCP_READ_ONLY"):
+        raise ToolError(READ_ONLY_TEXT)
+
+
 def _call_view_sync(
     view_cls: type[APIView],
     method: str,
@@ -194,17 +211,14 @@ def _call_view_sync(
     *,
     query_params: dict[str, Any] | None = None,
     data: dict[str, Any] | None = None,
+    files: dict[str, Any] | None = None,
     **view_kwargs: Any,
 ) -> Any:
     user = get_current_user()
     oauth2_token = get_current_oauth2_token()
     method = method.upper()
 
-    if method != "GET" and get_plugin_setting("MCP_READ_ONLY"):
-        raise ToolError(
-            "This MCP server is running in read-only mode; write actions are disabled. "
-            "An administrator must disable the 'Read Only' plugin setting to allow them."
-        )
+    ensure_writable(method)
 
     factory_method = getattr(_factory, method.lower())
     # The originating request's resolved host, scheme and client address
@@ -215,6 +229,11 @@ def _call_view_sync(
 
     if method == "GET":
         request = factory_method(path, data=query_params or {}, **meta)
+    elif files:
+        # File uploads (the part image): a multipart body with the files next to *data*.
+        request = factory_method(
+            path, data={**(data or {}), **files}, format="multipart", **meta
+        )
     else:
         request = factory_method(path, data=data or {}, format="json", **meta)
 
@@ -352,6 +371,7 @@ async def call_view(
     *,
     query_params: dict[str, Any] | None = None,
     data: dict[str, Any] | None = None,
+    files: dict[str, Any] | None = None,
     **view_kwargs: Any,
 ) -> Any:
     """Invoke an existing InvenTree DRF view class as the current MCP user.
@@ -364,7 +384,10 @@ async def call_view(
         method: HTTP method to simulate ('GET', 'POST', 'PATCH', ...).
         path: the API path being emulated (only used for logging/routing context, not resolved).
         query_params: query string parameters (GET requests).
-        data: request body (write requests).
+        data: request body (write requests), sent as JSON.
+        files: uploaded files (field name -> django File, e.g. SimpleUploadedFile) for a
+            write request; when given, the body is sent as multipart with *data* beside
+            the files instead of JSON.
         view_kwargs: extra kwargs the URL pattern would normally supply (e.g. pk=...).
 
     Returns:
@@ -409,5 +432,6 @@ async def call_view(
         path,
         query_params=query_params,
         data=data,
+        files=files,
         **view_kwargs,
     )

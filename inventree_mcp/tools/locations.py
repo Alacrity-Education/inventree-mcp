@@ -4,6 +4,11 @@ create_stock_location, update_stock_location, delete_stock_location.
 Thin wrappers around stock.api.StockLocationList / StockLocationDetail through
 proxy.call_view(). Names, inputs, defaults and descriptions are the Go server's
 (docs/plans/tools/00-overview.md).
+
+delete_stock_location never deletes contents: it sends delete_stock_items and
+delete_sub_locations as false, and InvenTree moves the location's stock items and
+sub-locations to its parent (no location / top level when it has none). The Go description
+("must be empty") is kept verbatim but is not enforced.
 """
 
 from __future__ import annotations

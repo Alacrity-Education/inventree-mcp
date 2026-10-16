@@ -4,6 +4,16 @@ set_part_image (T2).
 Thin wrappers around part.api.PartList / PartDetail through proxy.call_view(), so permissions,
 filtering and serialization are InvenTree's own. Names, inputs, defaults and descriptions are
 the Go server's (docs/plans/tools/00-overview.md, section 4).
+
+Plugin behaviour beyond the Go server (overview 6c):
+
+- image_url (create_part, update_part) and set_part_image: InvenTree no longer downloads
+  images (remote_image is gone since API 489); tools/images.py does it behind the plugin
+  setting IMAGE_DOWNLOAD_ENABLED, with every check before any call. create_part creates the
+  part first; when only the image step fails, the error says the part exists and its pk.
+- delete_part refuses a part with stock items (InvenTree would delete them with the part:
+  StockItem.part is CASCADE), deactivates, deletes, and reactivates the part when the
+  delete step fails after its deactivation.
 """
 
 from __future__ import annotations
@@ -21,11 +31,14 @@ from ._common import (
     access,
     changes,
     clean,
+    compact,
     fetch,
     listing,
     text,
     tool,
 )
+from .images import ensure_image_allowed, upload_part_image
+from .stock import _stock_list
 
 
 def _part_list() -> type | None:
@@ -139,8 +152,11 @@ async def create_part(
     create_part_category under the most appropriate parent — do NOT put a part in an
     unrelated category just because it exists, and do NOT create top-level categories when
     the part belongs under an existing parent, (5) create the part with the correct
-    category ID. Parts should always have a category.
+    category ID. Parts should always have a category. Setting an image from image_url
+    requires the plugin setting IMAGE_DOWNLOAD_ENABLED.
     """
+    if image_url:
+        await ensure_image_allowed(_part_detail)
     payload = clean(
         name=name,
         description=description,
@@ -154,11 +170,20 @@ async def create_part(
         assembly=assembly,
         trackable=trackable,
         virtual=virtual,
-        remote_image=image_url,
     )
-    return await fetch(
+    part = await fetch(
         _part_list, "POST", "/api/part/", fields=PART_FIELDS, data=payload
     )
+    if not image_url:
+        return part
+    try:
+        body = await upload_part_image(_part_detail, part["pk"], image_url)
+    except ToolError as exc:
+        # The model must not retry the create: the part exists.
+        raise ToolError(
+            f"part {part['pk']} was created, but setting its image failed: {exc}"
+        ) from None
+    return compact(body, PART_FIELDS)
 
 
 @tool(
@@ -194,27 +219,35 @@ async def update_part(
     ] = "",
 ) -> dict:
     """Update an existing part's fields. Only provided fields are changed. Use this to rename
-    parts, change categories, update descriptions, or deactivate parts.
+    parts, change categories, update descriptions, or deactivate parts. Setting an image
+    from image_url requires the plugin setting IMAGE_DOWNLOAD_ENABLED.
     """
-    payload = changes(
-        name=name,
-        description=description,
-        category=category,
-        active=active,
-        IPN=IPN,
-        keywords=keywords,
-        units=units,
-        minimum_stock=minimum_stock,
-        remote_image=image_url,
-    )
-    return await fetch(
-        _part_detail,
-        "PATCH",
-        f"/api/part/{id}/",
-        fields=PART_FIELDS,
-        data=payload,
-        pk=id,
-    )
+    fields = {
+        "name": name,
+        "description": description,
+        "category": category,
+        "active": active,
+        "IPN": IPN,
+        "keywords": keywords,
+        "units": units,
+        "minimum_stock": minimum_stock,
+    }
+    if not image_url:
+        return await fetch(
+            _part_detail,
+            "PATCH",
+            f"/api/part/{id}/",
+            fields=PART_FIELDS,
+            data=changes(**fields),
+            pk=id,
+        )
+    await ensure_image_allowed(_part_detail, id)
+    payload = clean(**fields)
+    if payload:
+        await call_view(
+            _part_detail(), "PATCH", f"/api/part/{id}/", data=payload, pk=id
+        )
+    return compact(await upload_part_image(_part_detail, id, image_url), PART_FIELDS)
 
 
 @tool("delete_part", title="Delete part", read_only=False, destructive=True)
@@ -227,10 +260,35 @@ async def delete_part(
     """
     path = f"/api/part/{id}/"
     part = await call_view(_part_detail(), "GET", path, pk=id)
+    stock_items = part.get("stock_item_count")
+    if stock_items is None:  # not serialized: count through the stock list
+        stock = await call_view(
+            _stock_list(), "GET", "/api/stock/", query_params={"part": id, "limit": 1}
+        )
+        stock_items = stock.get("count", 0) if isinstance(stock, dict) else len(stock)
+    if stock_items:
+        # InvenTree would delete the stock with the part (StockItem.part is CASCADE).
+        raise ToolError(
+            f"part {id} has {stock_items} stock item(s): delete its stock first"
+        )
+    deactivated = False
     if part.get("active"):
         # InvenTree only deletes inactive parts.
         await call_view(_part_detail(), "PATCH", path, data={"active": False}, pk=id)
-    await call_view(_part_detail(), "DELETE", path, pk=id)
+        deactivated = True
+    try:
+        await call_view(_part_detail(), "DELETE", path, pk=id)
+    except ToolError:
+        if deactivated:
+            # Undo the deactivation (403 on delete, used in an assembly, locked, ...);
+            # the delete's error is the one reported.
+            try:
+                await call_view(
+                    _part_detail(), "PATCH", path, data={"active": True}, pk=id
+                )
+            except ToolError:
+                pass
+        raise
     return text(f"Part {id} deleted successfully.")
 
 
@@ -250,18 +308,12 @@ async def set_part_image(
 ) -> dict:
     """Set or replace the image for an existing part by providing an image URL. InvenTree
     downloads the image from the URL server-side. Use this after search_part_images to
-    attach a product photo to a part.
+    attach a product photo to a part. Requires the plugin setting IMAGE_DOWNLOAD_ENABLED.
     """
     if not image_url:
         raise ToolError("image_url is required")
-    return await fetch(
-        _part_detail,
-        "PATCH",
-        f"/api/part/{id}/",
-        fields=PART_FIELDS,
-        data={"remote_image": image_url},
-        pk=id,
-    )
+    await ensure_image_allowed(_part_detail, id)
+    return compact(await upload_part_image(_part_detail, id, image_url), PART_FIELDS)
 
 
 access("search_parts", _part_list, "GET")

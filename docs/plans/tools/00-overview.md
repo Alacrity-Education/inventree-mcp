@@ -117,9 +117,9 @@ descriptions verbatim (they carry the workflow guidance the user wants), with "e
 | get_stock | List stock items | R | part:int=0, location:int=0, limit=50, offset=0 | GET StockList ?part&location&part_detail=true | stock/view | listing(STOCK_ITEM_FIELDS) |
 | get_stock_item | Get stock item | R | id | GET StockDetail pk ?part_detail=true | stock/view | compact(STOCK_ITEM_FIELDS) |
 | add_stock | Add stock | W, destructive=false | part (req), quantity:float (req), location, batch, serial, notes | POST StockList {part, quantity, location?, batch?, serial?, notes?}; the view may answer a list -> return the first item | stock/add | compact(STOCK_ITEM_FIELDS) |
-| stock_add_quantity | Add stock quantity | W, destructive=false | items:[{pk:int, quantity:float}] (req), notes | POST StockAdd {items, notes?} | stock/change | text "Stock quantity updated successfully." |
-| stock_remove_quantity | Remove stock quantity | W, destructive=true | items, notes | POST StockRemove | stock/change | text "Stock quantity removed successfully." |
-| stock_transfer | Transfer stock | W, destructive=false | items (req), location:int (req), notes | POST StockTransfer {items, location, notes?} | stock/change | text "Stock transferred successfully." |
+| stock_add_quantity | Add stock quantity | W, destructive=false | items:[{pk:int, quantity:float}] (req), notes | POST StockAdd {items, notes?} | stock/add | text "Stock quantity updated successfully." |
+| stock_remove_quantity | Remove stock quantity | W, destructive=true | items, notes | POST StockRemove | stock/add | text "Stock quantity removed successfully." |
+| stock_transfer | Transfer stock | W, destructive=false | items (req), location:int (req), notes | POST StockTransfer {items, location, notes?} | stock/add | text "Stock transferred successfully." |
 | delete_stock_item | Delete stock item | W, destructive=true | id | DELETE StockDetail | stock/delete | text "Stock item N deleted successfully." |
 | search_stock_locations | Search stock locations | R | search (req), limit=25 | GET StockLocationList ?search | stock_location/view | listing(LOCATION_FIELDS) |
 | get_stock_location | Get stock location | R | id | GET StockLocationDetail | stock_location/view | compact |
@@ -189,6 +189,23 @@ was verified and how.
   location must be empty" is not enforced by InvenTree. The description stays verbatim.
 - `stock_remove_quantity` never fails below zero: InvenTree removes what is there and deletes the emptied item. The e2e
   script must not expect an error for over-removal.
+
+## 6c. Corrections recorded after the T2/T3 review
+
+- The three stock adjustment tools (`stock_add_quantity`, `stock_remove_quantity`, `stock_transfer`) need the stock
+  **add** role in InvenTree, not change (the table above is corrected); the beta grants and the README follow.
+- `remote_image` is gone from InvenTree's Part API since API v489 (removed as a security hole, together with the
+  `INVENTREE_DOWNLOAD_*` settings). `image_url` / `set_part_image` are implemented by the plugin itself behind an
+  opt-in plugin setting `IMAGE_DOWNLOAD_ENABLED` (default off): permission check first, then
+  `InvenTree.helpers_model.download_image_from_url` (URL validation, SSRF guard, size cap, image validation), re-encode,
+  and a multipart PATCH of the part's `image` field through `call_view`. With the setting off, a given `image_url`
+  answers a ToolError that names the setting. Section 4's remark about `INVENTREE_DOWNLOAD_FROM_URL` is void.
+- `delete_part` refuses a part with stock items (`stock_item_count > 0`) and reactivates the part if the delete step
+  fails after the deactivation.
+- Deleting a category or a location moves its parts/sub-categories or stock/sub-locations to the parent; the tools do
+  not delete contents (both booleans false) and the README says so.
+- Test scaffolding for tool tests (`MCPToolTestCase`, `WriteToolTestCase`, the error-text constants) lives in
+  `tests/test_transport.py`; tool test files import from there.
 
 ## 7. Acceptance
 

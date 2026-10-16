@@ -2,6 +2,11 @@
 
 Thin wrappers around part.api.CategoryList / CategoryDetail through proxy.call_view(). Names,
 inputs, defaults and descriptions are the Go server's (docs/plans/tools/00-overview.md).
+
+delete_part_category never deletes contents: it sends delete_parts and
+delete_child_categories as false, and InvenTree moves the category's parts and
+sub-categories to its parent (top level when it has none). The Go description ("must have no
+parts or sub-categories") is kept verbatim but is not enforced.
 """
 
 from __future__ import annotations

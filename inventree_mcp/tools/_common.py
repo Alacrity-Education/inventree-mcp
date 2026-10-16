@@ -11,6 +11,9 @@
 - clean(): a payload / query builder with the Go server's omission rules.
 - changes(): clean() for the update tools; "no fields to update" when nothing is left.
 - text(): a plain-text result.
+- require_access(): the read-only gate and the caller's permission for a view + method, checked
+  before a tool does anything (the image download; the stock adjustments, whose own views
+  InvenTree does not scope).
 
 The tool set, names, inputs, defaults and descriptions follow the Go server
 github.com/syntaxerr66/inventree-mcp (see docs/plans/tools/00-overview.md).
@@ -22,11 +25,12 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
+from asgiref.sync import sync_to_async
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from ..mcp_server import mcp
-from ..proxy import call_view
+from ..proxy import call_view, ensure_writable, error_message, user_has_access
 
 #: Go defaults: search 25; list_parts / get_stock 50; the location and category lists 100.
 DEFAULTS = {"search": 25, "list": 50, "tree": 100}
@@ -280,3 +284,19 @@ def changes(**kwargs: Any) -> dict:
 def text(message: str) -> str:
     """A plain-text tool result ("Part 12 deleted successfully.")."""
     return message
+
+
+async def require_access(view_loader: ViewLoader, method: str) -> None:
+    """Refuse unless the caller may call *view_loader*'s view with *method*, without calling it.
+
+    The read-only gate first (its text, as call_view() would answer), then
+    proxy.user_has_access() (the InvenTree role and the MCP scope of the bound token):
+    ToolError with the 403 text. An unresolvable view answers call_view()'s "unavailable"
+    text.
+    """
+    await sync_to_async(ensure_writable)(method)
+    view_cls = view_loader()
+    if view_cls is None:
+        await call_view(None, method, "")  # raises the "tool is unavailable" ToolError
+    if not await user_has_access(view_cls, method):
+        raise ToolError(error_message(403, None))

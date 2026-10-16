@@ -8,28 +8,19 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Group
 from django.test import override_settings
 from part.models import Part
 from stock.models import StockItem, StockLocation
-from users.models import ApiToken
 
 from ..tools._common import STOCK_ITEM_FIELDS
-from .oauth_helpers import _raw_api_token, grant_mcp
-from .test_transport import MCPToolTestCase
-
-READ_ONLY_TEXT = (
-    "Error executing tool {name}: This MCP server is running in read-only mode; "
-    "write actions are disabled. An administrator must disable the 'Read Only' "
-    "plugin setting to allow them."
-)
-FORBIDDEN = (
-    "permission denied (403): your MCP roles or your InvenTree permissions "
-    "do not allow this"
+from .test_transport import (
+    DENIED,
+    NOT_FOUND,
+    READ_ONLY,
+    MCPToolTestCase,
+    WriteToolTestCase,
 )
 
-NOT_FOUND = "not found (404): resource does not exist"
 STOCK_FIXTURES = [
     "category",
     "part",
@@ -94,12 +85,13 @@ class StockReadToolsTest(MCPToolTestCase):
         )
 
 
+#: title, destructiveHint, idempotentHint (openWorldHint is false for all).
 STOCK_WRITE_TOOLS = {
-    "add_stock": ("Add stock", False, True, False),
-    "stock_add_quantity": ("Add stock quantity", False, True, False),
-    "stock_remove_quantity": ("Remove stock quantity", True, False, False),
-    "stock_transfer": ("Transfer stock", False, True, False),
-    "delete_stock_item": ("Delete stock item", True, False, False),
+    "add_stock": ("Add stock", False, False),
+    "stock_add_quantity": ("Add stock quantity", False, False),
+    "stock_remove_quantity": ("Remove stock quantity", True, False),
+    "stock_transfer": ("Transfer stock", False, False),
+    "delete_stock_item": ("Delete stock item", True, False),
 }
 
 # Valid arguments per write tool (stock item 1 / location 1 exist in the fixtures).
@@ -112,8 +104,7 @@ STOCK_WRITE_CALLS = {
 }
 
 
-@override_settings(PLUGIN_TESTING_SETUP=True)
-class StockWriteToolsTest(MCPToolTestCase):
+class StockWriteToolsTest(WriteToolTestCase):
     roles: ClassVar[list[str]] = [
         "stock.view",
         "stock.add",
@@ -125,7 +116,6 @@ class StockWriteToolsTest(MCPToolTestCase):
 
     def setUp(self):
         super().setUp()
-        self.set_setting("MCP_READ_ONLY", False)
         self.part = Part.objects.get(pk=1)
         self.loc_a = StockLocation.objects.create(name="MCP Shelf A")
         self.loc_b = StockLocation.objects.create(name="MCP Shelf B")
@@ -138,19 +128,14 @@ class StockWriteToolsTest(MCPToolTestCase):
 
     def test_tools_list_titles_and_annotations(self):
         tools = self.list_tools()
-        for name, (
-            title,
-            destructive,
-            idempotent_ignored,
-            open_world,
-        ) in STOCK_WRITE_TOOLS.items():
+        for name, (title, destructive, idempotent) in STOCK_WRITE_TOOLS.items():
             tool = tools[name]
             self.assertEqual(tool["title"], title)
             hints = tool["annotations"]
             self.assertFalse(hints["readOnlyHint"], name)
             self.assertEqual(hints["destructiveHint"], destructive, name)
-            self.assertFalse(hints["idempotentHint"], name)
-            self.assertEqual(hints["openWorldHint"], open_world, name)
+            self.assertEqual(hints["idempotentHint"], idempotent, name)
+            self.assertFalse(hints["openWorldHint"], name)
             self.assertNotIn("outputSchema", tool)
         items_schema = tools["stock_transfer"]["inputSchema"]
         self.assertEqual(set(items_schema["required"]), {"items", "location"})
@@ -206,7 +191,7 @@ class StockWriteToolsTest(MCPToolTestCase):
         self.assertEqual(body["quantity"], 1)
         self.assertEqual(self.read(body["pk"]).serial, "SN-77")
 
-    def test_add_stock_validation_and_404(self):
+    def test_add_stock_validation(self):
         error = self.tool_error("add_stock", {"part": 999_999, "quantity": 1})
         self.assertIn(
             "validation failed (400): part: Valid part must be supplied", error
@@ -339,52 +324,57 @@ class StockWriteToolsTest(MCPToolTestCase):
             self.tool_error("delete_stock_item", {"id": 999_999}).endswith(NOT_FOUND)
         )
 
+    def test_tools_need_the_mcp_write_role(self):
+        """InvenTree roles present, MCP role missing: 403, filter off and on.
 
-@override_settings(PLUGIN_TESTING_SETUP=True)
-class StockWriteGatesTest(MCPToolTestCase):
-    """Read-only gate and missing InvenTree roles."""
+        The three adjustments are POSTs on StockAdd / StockRemove / StockTransfer, which
+        InvenTree maps to the stock *add* role (overview 6c).
+        """
+        adjust = (["stock.view", "stock.add"], ["stock.view"])
+        cases = {
+            "add_stock": (["stock.view", "stock.add"], ["stock.view"]),
+            "stock_add_quantity": adjust,
+            "stock_remove_quantity": adjust,
+            "stock_transfer": adjust,
+            "delete_stock_item": (
+                ["stock.view", "stock.add", "stock.change", "stock.delete"],
+                ["stock.view", "stock.change"],
+            ),
+        }
+        count = StockItem.objects.count()
+        for name, (interactive, mcp) in cases.items():
+            with self.subTest(tool=name):
+                self.assert_denied_without_mcp_role(
+                    name, STOCK_WRITE_CALLS[name], interactive=interactive, mcp=mcp
+                )
+        self.assertEqual(StockItem.objects.count(), count)
+        item = StockItem.objects.get(pk=1)
+        self.assertEqual((item.quantity, item.location_id), (4000, 3))
+
+
+class StockWriteGatesTest(WriteToolTestCase):
+    """Read-only gate and missing InvenTree roles (MCP roles present)."""
 
     roles: ClassVar[list[str]] = ["stock.view"]
     fixtures: ClassVar[list[str]] = STOCK_FIXTURES
 
     def test_read_only_gate(self):
-        # MCP_READ_ONLY is on by default: every stock write tool answers the gate text.
+        self.set_setting("MCP_READ_ONLY", True)
         for name, arguments in STOCK_WRITE_CALLS.items():
             with self.subTest(tool=name):
                 self.assertEqual(
                     self.tool_error(name, arguments),
-                    READ_ONLY_TEXT.format(name=name),
+                    f"Error executing tool {name}: {READ_ONLY}",
                 )
         self.assertTrue(StockItem.objects.filter(pk=1).exists())
         # The write tools are still listed.
         self.assertTrue(set(STOCK_WRITE_TOOLS) <= self.list_tool_names())
 
     def test_missing_inventree_role_is_forbidden(self):
-        self.set_setting("MCP_READ_ONLY", False)
         for name, arguments in STOCK_WRITE_CALLS.items():
             with self.subTest(tool=name):
                 self.assertTrue(
-                    self.tool_error(name, arguments).endswith(FORBIDDEN),
+                    self.tool_error(name, arguments).endswith(DENIED),
                     name,
                 )
         self.assertTrue(StockItem.objects.filter(pk=1).exists())
-
-    def test_missing_mcp_role_is_forbidden(self):
-        # Interactive roles are fine, the MCP roles are not granted to this user.
-        self.set_setting("MCP_READ_ONLY", False)
-        group = Group.objects.create(name="mcp-no-roles")
-        self.assignRole("stock.view", group=group)
-        self.assignRole("stock.add", group=group)
-        user = get_user_model().objects.create_user(username="mcp-norole", password="x")
-        user.groups.add(group)
-        token = _raw_api_token(ApiToken.objects.create(user=user, name="no-mcp-role"))
-        grant_mcp(group, "stock.view")
-        response = self.mcp_post(
-            "tools/call",
-            {"name": "add_stock", "arguments": STOCK_WRITE_CALLS["add_stock"]},
-            HTTP_AUTHORIZATION=f"Token {token}",
-        )
-        self.assertEqual(response.status_code, 200, response.content)
-        result = response.json()["result"]
-        self.assertTrue(result["isError"], result)
-        self.assertTrue(result["content"][0]["text"].endswith(FORBIDDEN))

@@ -10,11 +10,15 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from django.test import override_settings
-from part.models import PartCategory
+from part.models import Part, PartCategory
 
 from ..tools._common import CATEGORY_FIELDS
-from .test_tools_parts import NOT_FOUND, READ_ONLY, WriteToolTestCase
-from .test_transport import MCPToolTestCase
+from .test_transport import (
+    NOT_FOUND,
+    READ_ONLY,
+    MCPToolTestCase,
+    WriteToolTestCase,
+)
 
 
 @override_settings(PLUGIN_TESTING_SETUP=True)
@@ -176,13 +180,31 @@ class CategoryWriteToolsTest(WriteToolTestCase):
             self.tool_error("delete_part_category", {"id": 999_999}).endswith(NOT_FOUND)
         )
 
-    def test_delete_part_category_keeps_children_and_parts(self):
-        """The API's delete_child_categories / delete_parts default to false."""
-        child_pk = self.child.pk
+    def test_delete_part_category_moves_children_and_parts_to_the_parent(self):
+        """The tool sends delete_child_categories / delete_parts false: InvenTree moves the
+        category's sub-categories and parts to its parent instead of deleting them."""
+        middle = PartCategory.objects.create(name="MCP Middle", parent=self.root)
+        grandchild = PartCategory.objects.create(name="MCP Grandchild", parent=middle)
+        nested = Part.objects.create(name="MCP Nested Part", description="n", category=middle)
+        top_part = Part.objects.create(
+            name="MCP Root Part", description="r", category=self.root
+        )
+
+        self.tool_text("delete_part_category", {"id": middle.pk})
+        self.assertFalse(PartCategory.objects.filter(pk=middle.pk).exists())
+        grandchild.refresh_from_db()
+        nested.refresh_from_db()
+        self.assertEqual(grandchild.parent_id, self.root.pk)
+        self.assertEqual(nested.category_id, self.root.pk)
+
+        # A top-level category: its contents become top-level / uncategorised.
         self.tool_text("delete_part_category", {"id": self.root.pk})
-        self.assertFalse(PartCategory.objects.filter(pk=self.root.pk).exists())
-        child = PartCategory.objects.get(pk=child_pk)  # moved up, not deleted
-        self.assertIsNone(child.parent)
+        for category in (self.child, grandchild):
+            category.refresh_from_db()
+            self.assertIsNone(category.parent_id)
+        for part in (nested, top_part):
+            part.refresh_from_db()
+            self.assertIsNone(part.category_id)
 
     def test_tools_need_the_mcp_write_role(self):
         cases = [
@@ -210,8 +232,22 @@ class CategoryWriteToolsTest(WriteToolTestCase):
                 self.assert_denied_without_mcp_role(
                     name, arguments, interactive=interactive, mcp=mcp
                 )
-                self.set_setting("MCP_FILTER_TOOL_LIST", False)
         self.assertTrue(PartCategory.objects.filter(pk=self.child.pk).exists())
+        self.assertEqual(PartCategory.objects.get(pk=self.child.pk).name, "MCP Child")
+        self.assertFalse(PartCategory.objects.filter(name="Nope").exists())
+
+    def test_tools_need_the_inventree_role(self):
+        """Every MCP role, only part_category.view in InvenTree: 403, filter off and on."""
+        cases = {
+            "create_part_category": {"name": "Nope"},
+            "update_part_category": {"id": self.child.pk, "name": "Nope"},
+            "delete_part_category": {"id": self.child.pk},
+        }
+        for name, arguments in cases.items():
+            with self.subTest(tool=name):
+                self.assert_denied_without_inventree_role(
+                    name, arguments, interactive=["part_category.view"]
+                )
         self.assertEqual(PartCategory.objects.get(pk=self.child.pk).name, "MCP Child")
         self.assertFalse(PartCategory.objects.filter(name="Nope").exists())
 

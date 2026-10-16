@@ -214,6 +214,12 @@ class InvenTreeMCP(
             "description": "ID of a Google Programmable Search Engine configured for image search, for the search_part_images tool.",
             "default": "",
         },
+        "IMAGE_DOWNLOAD_ENABLED": {
+            "name": "Allow Image Downloads",
+            "description": "Let the image_url input of create_part / update_part and the set_part_image tool download an image from a URL on the server and attach it to the part. InvenTree removed downloading images from URLs (remote_image) as a security risk; this re-enables it for MCP only, through InvenTree's own checks (URL validation, private-address (SSRF) guard, 1 MB size cap, image validation) and only for users who may change the part. Off: image_url is refused.",
+            "validator": bool,
+            "default": False,
+        },
         "MCP_ALLOW_BASIC_AUTH": {
             "name": "Allow Basic Authentication",
             "description": "Accept username and password (HTTP Basic) on the MCP endpoint. Off: only OAuth and InvenTree API tokens.",

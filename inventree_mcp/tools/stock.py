@@ -5,6 +5,15 @@ Thin wrappers around stock.api.StockList / StockDetail (and StockAdd / StockRemo
 StockTransfer for T3) through proxy.call_view(). Both reads ask for ?part_detail=true so
 every item carries its part's (pk, name, full_name). Names, inputs, defaults and
 descriptions are the Go server's (docs/plans/tools/00-overview.md).
+
+The MCP scope of the three adjustments (stock_add_quantity, stock_remove_quantity,
+stock_transfer): InvenTree's OAuth scope resolver gives StockAdd / StockRemove /
+StockTransfer only "g:read" for every method (1.5.7), so their views enforce the
+interactive stock.add role but not the token's r:add:stock scope, and an MCP user without
+the MCP stock add role could adjust stock. The tools therefore check POST on StockList
+(stock.add for InvenTree's role check and r:add:stock for the scope, the same role the
+adjustment views need) before they call their own view, and ACCESS uses that check too,
+so tool visibility matches.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ from ._common import (
     clean,
     fetch,
     listing,
+    require_access,
     text,
     tool,
 )
@@ -55,6 +65,17 @@ class StockAdjustment(BaseModel):
         float,
         Field(description="Quantity to add (use stock_remove for subtraction)"),
     ]
+
+
+def _items(items: list[StockAdjustment]) -> list[dict]:
+    """The adjustment items as the JSON payload of StockAdd / StockRemove / StockTransfer."""
+    return [item.model_dump() for item in items]
+
+
+async def _adjust(view_loader, path: str, payload: dict) -> None:
+    """POST an adjustment after the stock add check on StockList (see the module docstring)."""
+    await require_access(_stock_list, "POST")
+    await call_view(view_loader(), "POST", path, data=payload)
 
 
 @tool("get_stock", title="List stock items", read_only=True)
@@ -156,11 +177,8 @@ async def stock_add_quantity(
     creating new stock entries. Provide the stock item PK (not part ID) and the quantity to
     add.
     """
-    await call_view(
-        _stock_add(),
-        "POST",
-        "/api/stock/add/",
-        data=clean(items=[i.model_dump() for i in items], notes=notes),
+    await _adjust(
+        _stock_add, "/api/stock/add/", clean(items=_items(items), notes=notes)
     )
     return text("Stock quantity updated successfully.")
 
@@ -178,11 +196,8 @@ async def stock_remove_quantity(
     """Remove quantity from existing stock items. Provide the stock item PK (not part ID)
     and the quantity to remove.
     """
-    await call_view(
-        _stock_remove(),
-        "POST",
-        "/api/stock/remove/",
-        data=clean(items=[i.model_dump() for i in items], notes=notes),
+    await _adjust(
+        _stock_remove, "/api/stock/remove/", clean(items=_items(items), notes=notes)
     )
     return text("Stock quantity removed successfully.")
 
@@ -199,13 +214,10 @@ async def stock_transfer(
     """Transfer stock items to a different location. Moves the specified quantity of each
     stock item to the target location.
     """
-    await call_view(
-        _stock_transfer(),
-        "POST",
+    await _adjust(
+        _stock_transfer,
         "/api/stock/transfer/",
-        data=clean(
-            items=[i.model_dump() for i in items], location=location, notes=notes
-        ),
+        clean(items=_items(items), location=location, notes=notes),
     )
     return text("Stock transferred successfully.")
 
@@ -222,7 +234,8 @@ async def delete_stock_item(
 access("get_stock", _stock_list, "GET")
 access("get_stock_item", _stock_detail, "GET")
 access("add_stock", _stock_list, "POST")
-access("stock_add_quantity", _stock_add, "POST")
-access("stock_remove_quantity", _stock_remove, "POST")
-access("stock_transfer", _stock_transfer, "POST")
+# The adjustments: StockList POST, the check they make first (see the module docstring).
+access("stock_add_quantity", _stock_list, "POST")
+access("stock_remove_quantity", _stock_list, "POST")
+access("stock_transfer", _stock_list, "POST")
 access("delete_stock_item", _stock_detail, "DELETE")

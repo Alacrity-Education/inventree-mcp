@@ -14,18 +14,20 @@ from part.models import Part
 from stock.models import StockItem, StockLocation
 
 from ..tools._common import LOCATION_FIELDS
-from .test_transport import MCPToolTestCase
+from .test_transport import (
+    DENIED,
+    NOT_FOUND,
+    READ_ONLY,
+    MCPToolTestCase,
+    WriteToolTestCase,
+)
 
-NOT_FOUND = "not found (404): resource does not exist"
-FORBIDDEN = (
-    "permission denied (403): your MCP roles or your InvenTree permissions "
-    "do not allow this"
-)
-READ_ONLY_TEXT = (
-    "Error executing tool {name}: This MCP server is running in read-only mode; "
-    "write actions are disabled. An administrator must disable the 'Read Only' "
-    "plugin setting to allow them."
-)
+LOCATION_ROLES = [
+    "stock_location.view",
+    "stock_location.add",
+    "stock_location.change",
+    "stock_location.delete",
+]
 LOCATION_WRITE_TOOLS = {
     "create_stock_location": ("Create stock location", False, False),
     "update_stock_location": ("Update stock location", False, True),
@@ -109,18 +111,11 @@ class LocationReadToolsTest(MCPToolTestCase):
         )
 
 
-@override_settings(PLUGIN_TESTING_SETUP=True)
-class LocationWriteToolsTest(MCPToolTestCase):
-    roles: ClassVar[list[str]] = [
-        "stock_location.view",
-        "stock_location.add",
-        "stock_location.change",
-        "stock_location.delete",
-    ]
+class LocationWriteToolsTest(WriteToolTestCase):
+    roles: ClassVar[list[str]] = [*LOCATION_ROLES]
 
     def setUp(self):
         super().setUp()
-        self.set_setting("MCP_READ_ONLY", False)
         self.parent = StockLocation.objects.create(name="MCP Parent")
 
     def test_tools_list_titles_and_annotations(self):
@@ -250,38 +245,79 @@ class LocationWriteToolsTest(MCPToolTestCase):
             )
         )
 
-    def test_delete_does_not_enforce_empty_on_1_5_7(self):
-        # The Go description says "must be empty", but InvenTree's delete moves sub-locations
-        # and stock to the parent when both delete flags are false, which the tool sends.
-        child = StockLocation.objects.create(name="MCP Kept", parent=self.parent)
-        item = StockItem.objects.create(
-            part=Part.objects.create(name="MCP Loc Part", description="x"),
-            quantity=1,
-            location=self.parent,
-        )
-        result = self.call_tool("delete_stock_location", {"id": self.parent.pk})
-        self.assertFalse(result.get("isError"), result)
+    def test_delete_moves_contents_to_the_parent(self):
+        """The Go description says "must be empty", but the tool sends both delete flags
+        false and InvenTree moves sub-locations and stock to the parent (not enforced)."""
+        middle = StockLocation.objects.create(name="MCP Middle", parent=self.parent)
+        child = StockLocation.objects.create(name="MCP Kept", parent=middle)
+        part = Part.objects.create(name="MCP Loc Part", description="x")
+        item = StockItem.objects.create(part=part, quantity=1, location=middle)
+        top_item = StockItem.objects.create(part=part, quantity=2, location=self.parent)
+
+        self.tool_text("delete_stock_location", {"id": middle.pk})
+        self.assertFalse(StockLocation.objects.filter(pk=middle.pk).exists())
         child.refresh_from_db()
         item.refresh_from_db()
+        self.assertEqual(child.parent_id, self.parent.pk)
+        self.assertEqual((item.location_id, item.quantity), (self.parent.pk, 1))
+
+        # A top-level location: its contents become top-level / without a location.
+        self.tool_text("delete_stock_location", {"id": self.parent.pk})
+        child.refresh_from_db()
         self.assertIsNone(child.parent_id)
-        self.assertIsNone(item.location_id)
+        for stock in (item, top_item):
+            stock.refresh_from_db()
+            self.assertIsNone(stock.location_id)
+
+    def test_tools_need_the_mcp_write_role(self):
+        """InvenTree roles present, MCP role missing: 403, filter off and on."""
+        location = StockLocation.objects.create(name="MCP Guarded", parent=self.parent)
+        cases = [
+            (
+                "create_stock_location",
+                {"name": "MCP Nope"},
+                ["stock_location.view", "stock_location.add"],
+                ["stock_location.view"],
+            ),
+            (
+                "update_stock_location",
+                {"id": location.pk, "name": "MCP Nope"},
+                ["stock_location.view", "stock_location.change"],
+                ["stock_location.view"],
+            ),
+            (
+                "delete_stock_location",
+                {"id": location.pk},
+                LOCATION_ROLES,
+                ["stock_location.view", "stock_location.change"],
+            ),
+        ]
+        for name, arguments, interactive, mcp in cases:
+            with self.subTest(tool=name):
+                self.assert_denied_without_mcp_role(
+                    name, arguments, interactive=interactive, mcp=mcp
+                )
+        location.refresh_from_db()
+        self.assertEqual(location.name, "MCP Guarded")
+        self.assertFalse(StockLocation.objects.filter(name="MCP Nope").exists())
 
 
-@override_settings(PLUGIN_TESTING_SETUP=True)
-class LocationWriteGatesTest(MCPToolTestCase):
+class LocationWriteGatesTest(WriteToolTestCase):
+    """Read-only gate and missing InvenTree roles (MCP roles present)."""
+
     roles: ClassVar[list[str]] = ["stock_location.view"]
 
     def test_read_only_gate(self):
-        # MCP_READ_ONLY is on by default.
+        self.set_setting("MCP_READ_ONLY", True)
         for name, arguments in LOCATION_WRITE_CALLS.items():
             with self.subTest(tool=name):
                 self.assertEqual(
-                    self.tool_error(name, arguments), READ_ONLY_TEXT.format(name=name)
+                    self.tool_error(name, arguments),
+                    f"Error executing tool {name}: {READ_ONLY}",
                 )
         self.assertTrue(set(LOCATION_WRITE_TOOLS) <= self.list_tool_names())
 
     def test_missing_inventree_role_is_forbidden(self):
-        self.set_setting("MCP_READ_ONLY", False)
         location = StockLocation.objects.create(name="MCP Guarded")
         calls = {
             "create_stock_location": {"name": "MCP Gate"},
@@ -290,6 +326,6 @@ class LocationWriteGatesTest(MCPToolTestCase):
         }
         for name, arguments in calls.items():
             with self.subTest(tool=name):
-                self.assertTrue(self.tool_error(name, arguments).endswith(FORBIDDEN))
+                self.assertTrue(self.tool_error(name, arguments).endswith(DENIED))
         location.refresh_from_db()
         self.assertEqual(location.name, "MCP Guarded")

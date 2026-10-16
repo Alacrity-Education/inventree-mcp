@@ -1,16 +1,35 @@
-"""search_part_images over the real MCP endpoint, with requests.get mocked."""
+"""Part images over the real MCP endpoint.
+
+search_part_images with requests.get mocked; the image download behind image_url
+(create_part, update_part) and set_part_image with InvenTree's download_image_from_url mocked
+(one test runs the real helper's private-address refusal, which needs no network).
+"""
 
 from __future__ import annotations
 
 import json
+import shutil
+import sys
+import tempfile
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import requests
+from django.core.exceptions import ValidationError
 from django.test import override_settings
+from part.models import Part
+from PIL import Image
 
-from ..tools.images import NOT_CONFIGURED, SEARCH_URL
-from .test_tools_parts import WriteToolTestCase
+from ..tools.images import (
+    IMAGE_DISABLED,
+    IMAGE_MAX_BYTES,
+    IMAGE_TIMEOUT_SECONDS,
+    IMAGE_UNAVAILABLE,
+    IMAGE_USER_AGENT,
+    NOT_CONFIGURED,
+    SEARCH_URL,
+)
+from .test_transport import DENIED, NOT_FOUND, READ_ONLY, WriteToolTestCase
 
 API_KEY = "AIza-secret-key-1234567890"
 GET = "inventree_mcp.tools.images.requests.get"
@@ -120,7 +139,8 @@ class SearchPartImagesTest(WriteToolTestCase):
 
     def test_no_images(self):
         self.configure()
-        for body in ({}, {"items": []}):
+        # A JSON body that is not an object counts as no hits.
+        for body in ({}, {"items": []}, ["unexpected"], "text"):
             with patch(GET, return_value=_response(body=body)):
                 result = self.call_tool("search_part_images", {"query": "nothing here"})
             self.assertFalse(result.get("isError"), result)
@@ -199,3 +219,249 @@ class SearchPartImagesTest(WriteToolTestCase):
         with patch(GET, return_value=_response(body={"items": [_item(1)]})):
             result = self.call_tool("search_part_images", {"query": "x"})
         self.assertEqual(json.loads(result["content"][0]["text"])["count"], 1)
+
+
+DOWNLOAD = "InvenTree.helpers_model.download_image_from_url"
+IMAGE_URL = "https://img.test/part.png"
+GO_SET_PART_IMAGE = (
+    "Set or replace the image for an existing part by providing an image URL. InvenTree "
+    "downloads the image from the URL server-side. Use this after search_part_images to "
+    "attach a product photo to a part."
+)
+
+
+def _image(mode: str = "RGB") -> Image.Image:
+    return Image.new(mode, (8, 8))
+
+
+class PartImageDownloadTest(WriteToolTestCase):
+    """image_url / set_part_image: the plugin downloads and uploads the image (overview 6c)."""
+
+    roles: ClassVar[list[str]] = ["part.view", "part.add", "part.change"]
+    fixtures: ClassVar[list[str]] = ["category", "part", "location"]
+
+    def setUp(self):
+        super().setUp()
+        media = tempfile.mkdtemp(prefix="mcp-media-")
+        self.addCleanup(shutil.rmtree, media, ignore_errors=True)
+        media_settings = override_settings(MEDIA_ROOT=media)
+        media_settings.enable()
+        self.addCleanup(media_settings.disable)
+        self.part = Part.objects.get(name="R_2K2_0805")
+
+    def enable(self) -> None:
+        self.set_setting("IMAGE_DOWNLOAD_ENABLED", True)
+
+    def test_setting_defaults_off(self):
+        from ..core import InvenTreeMCP
+
+        setting = InvenTreeMCP.SETTINGS["IMAGE_DOWNLOAD_ENABLED"]
+        self.assertIs(setting["default"], False)
+        self.assertIn("InvenTree removed", setting["description"])
+
+    def test_disabled_by_default(self):
+        self.assertEqual(
+            IMAGE_DISABLED,
+            "setting a part image from a URL is disabled: an administrator must enable "
+            "the plugin setting IMAGE_DOWNLOAD_ENABLED",
+        )
+        calls = {
+            "set_part_image": {"id": self.part.pk, "image_url": IMAGE_URL},
+            "update_part": {"id": self.part.pk, "name": "Changed", "image_url": IMAGE_URL},
+            "create_part": {"name": "MCP With Image", "image_url": IMAGE_URL},
+        }
+        with patch(DOWNLOAD) as download:
+            for name, arguments in calls.items():
+                with self.subTest(tool=name):
+                    message = self.tool_error(name, arguments)
+                    self.assertTrue(message.endswith(IMAGE_DISABLED), message)
+        download.assert_not_called()
+        self.part.refresh_from_db()
+        self.assertEqual(self.part.name, "R_2K2_0805")  # nothing changed first
+        self.assertFalse(Part.objects.filter(name="MCP With Image").exists())
+
+    def test_read_only_answers_before_anything_else(self):
+        self.enable()
+        self.set_setting("MCP_READ_ONLY", True)
+        with patch(DOWNLOAD) as download:
+            message = self.tool_error(
+                "set_part_image", {"id": self.part.pk, "image_url": IMAGE_URL}
+            )
+        self.assertTrue(message.endswith(READ_ONLY), message)
+        download.assert_not_called()
+
+    def test_no_download_without_the_change_permission(self):
+        self.enable()
+        token = self.make_token("img-viewer", ["part.view"], ["all"])
+        with patch(DOWNLOAD) as download:
+            for name, arguments in {
+                "set_part_image": {"id": self.part.pk, "image_url": IMAGE_URL},
+                "update_part": {"id": self.part.pk, "image_url": IMAGE_URL},
+            }.items():
+                with self.subTest(tool=name, missing="InvenTree role"):
+                    self.assertTrue(self.error_as(token, name, arguments).endswith(DENIED))
+            token = self.make_token("img-no-mcp", ["part.view", "part.change"], ["part"])
+            with self.subTest(missing="MCP role"):
+                message = self.error_as(
+                    token, "set_part_image", {"id": self.part.pk, "image_url": IMAGE_URL}
+                )
+                self.assertTrue(message.endswith(DENIED), message)
+        # (create_part checks the same PATCH permission before its POST; a user with add
+        # but without change does not exist: InvenTree's and the MCP rulesets imply change
+        # from add.)
+        download.assert_not_called()
+        self.assertFalse(self.part.image)
+
+    def test_unknown_part_is_404_without_a_download(self):
+        self.enable()
+        with patch(DOWNLOAD) as download:
+            message = self.tool_error(
+                "set_part_image", {"id": 999_999, "image_url": IMAGE_URL}
+            )
+        self.assertTrue(message.endswith(NOT_FOUND), message)
+        download.assert_not_called()
+
+    def test_set_part_image(self):
+        self.enable()
+        with patch(DOWNLOAD, return_value=_image("RGB")) as download:
+            body = self.tool_json(
+                "set_part_image", {"id": self.part.pk, "image_url": IMAGE_URL}
+            )
+        download.assert_called_once_with(
+            IMAGE_URL,
+            timeout=IMAGE_TIMEOUT_SECONDS,
+            user_agent=IMAGE_USER_AGENT,
+            max_size=IMAGE_MAX_BYTES,
+        )
+        self.part.refresh_from_db()
+        self.assertTrue(self.part.image)
+        self.assertRegex(self.part.image.name, rf"part_{self.part.pk}[^/]*\.jpg$")
+        self.assertTrue(body["image"].endswith(self.part.image.name.rsplit("/", 1)[-1]))
+        self.assertTrue(body["thumbnail"])
+        with Image.open(self.part.image.path) as stored:
+            self.assertEqual((stored.format, stored.size), ("JPEG", (8, 8)))
+
+    def test_transparent_images_stay_png(self):
+        self.enable()
+        with patch(DOWNLOAD, return_value=_image("RGBA")):
+            self.tool_json("set_part_image", {"id": self.part.pk, "image_url": IMAGE_URL})
+        self.part.refresh_from_db()
+        self.assertRegex(self.part.image.name, rf"part_{self.part.pk}[^/]*\.png$")
+        with Image.open(self.part.image.path) as stored:
+            self.assertEqual(stored.format, "PNG")
+
+    def test_update_part_with_fields_and_image(self):
+        self.enable()
+        with patch(DOWNLOAD, return_value=_image()):
+            body = self.tool_json(
+                "update_part",
+                {"id": self.part.pk, "keywords": "with-image", "image_url": IMAGE_URL},
+            )
+        self.assertEqual(body["keywords"], "with-image")
+        self.assertTrue(body["image"])
+        self.part.refresh_from_db()
+        self.assertEqual(self.part.keywords, "with-image")
+        self.assertTrue(self.part.image)
+
+    def test_update_part_with_only_the_image(self):
+        self.enable()
+        with patch(DOWNLOAD, return_value=_image()):
+            body = self.tool_json(
+                "update_part", {"id": self.part.pk, "image_url": IMAGE_URL}
+            )
+        self.assertTrue(body["image"])
+
+    def test_create_part_with_image(self):
+        self.enable()
+        with patch(DOWNLOAD, return_value=_image()):
+            body = self.tool_json(
+                "create_part",
+                {"name": "MCP Pictured", "category": 2, "image_url": IMAGE_URL},
+            )
+        part = Part.objects.get(pk=body["pk"])
+        self.assertEqual(part.name, "MCP Pictured")
+        self.assertTrue(part.image)
+        self.assertTrue(body["image"])
+
+    def test_create_part_keeps_the_part_when_the_image_fails(self):
+        self.enable()
+        with patch(DOWNLOAD, side_effect=ValueError("Image size is too large")):
+            message = self.tool_error(
+                "create_part", {"name": "MCP Half Done", "image_url": IMAGE_URL}
+            )
+        part = Part.objects.get(name="MCP Half Done")
+        self.assertTrue(
+            message.endswith(
+                f"part {part.pk} was created, but setting its image failed: "
+                "image download failed: Image size is too large"
+            ),
+            message,
+        )
+        self.assertFalse(part.image)
+
+    def test_download_errors(self):
+        self.enable()
+        cases = [
+            (ValidationError("Enter a valid URL."), "Enter a valid URL."),
+            (ValueError("Image download exceeded maximum size"), "exceeded maximum"),
+            (TypeError("Supplied URL is not a valid image file"), "not a valid image"),
+            (requests.Timeout("read timed out"), "read timed out"),
+            (requests.HTTPError("Server responded with invalid status code: 404"), "404"),
+            (Exception("Connection error: refused"), "Connection error: refused"),
+        ]
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__), patch(DOWNLOAD, side_effect=error):
+                message = self.tool_error(
+                    "set_part_image", {"id": self.part.pk, "image_url": IMAGE_URL}
+                )
+                self.assertIn("image download failed: ", message)
+                self.assertIn(expected, message)
+        self.part.refresh_from_db()
+        self.assertFalse(self.part.image)
+
+    def test_errors_never_carry_the_url_credentials(self):
+        self.enable()
+        url = "https://bob:hunter2-secret@img.test/a.png?token=tok-0123456789"
+        error = Exception(
+            f"Exception occurred: HTTPSConnectionPool(host='img.test'): Max retries "
+            f"exceeded with url: /a.png?token=tok-0123456789 ({url})"
+        )
+        with patch(DOWNLOAD, side_effect=error):
+            message = self.tool_error(
+                "set_part_image", {"id": self.part.pk, "image_url": url}
+            )
+        self.assertIn("image download failed: ", message)
+        for secret in ("hunter2-secret", "tok-0123456789", "bob:"):
+            self.assertNotIn(secret, message)
+
+    def test_the_real_helper_refuses_private_addresses(self):
+        self.enable()
+        message = self.tool_error(
+            "set_part_image", {"id": self.part.pk, "image_url": "http://127.0.0.1/a.png"}
+        )
+        self.assertIn("image download failed: ", message)
+        self.part.refresh_from_db()
+        self.assertFalse(self.part.image)
+
+    def test_helper_missing(self):
+        self.enable()
+        with patch.dict(sys.modules, {"InvenTree.helpers_model": None}):
+            message = self.tool_error(
+                "set_part_image", {"id": self.part.pk, "image_url": IMAGE_URL}
+            )
+        self.assertTrue(message.endswith(IMAGE_UNAVAILABLE), message)
+
+    def test_descriptions_name_the_setting(self):
+        tools = self.list_tools()
+        self.assertEqual(
+            tools["set_part_image"]["description"],
+            GO_SET_PART_IMAGE + " Requires the plugin setting IMAGE_DOWNLOAD_ENABLED.",
+        )
+        for name in ("create_part", "update_part"):
+            self.assertTrue(
+                tools[name]["description"].endswith(
+                    "Setting an image from image_url requires the plugin setting "
+                    "IMAGE_DOWNLOAD_ENABLED."
+                ),
+                name,
+            )

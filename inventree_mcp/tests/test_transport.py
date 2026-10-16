@@ -1,9 +1,10 @@
 """Transport, logging, settings, server card, view resolution and read-only gate tests.
 
 Salvaged from the original suite (test_mcp.py, removed with the old tools in 0.5.0), with
-the same assertions adapted to the new tool names. Also home of the transport helper
-(MCPClientMixin, MCPToolTestCase) the tool tests use to call tools over the real HTTP
-endpoint.
+the same assertions adapted to the new tool names. Also home of the tool test scaffolding
+the tests/test_tools_*.py modules import: MCPClientMixin, MCPToolTestCase (tools over the real
+HTTP endpoint), WriteToolTestCase (MCP_READ_ONLY off, users with chosen roles) and the error
+texts NOT_FOUND, DENIED, READ_ONLY.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from typing import Any, ClassVar
 from unittest.mock import patch
 
 from asgiref.sync import async_to_sync, sync_to_async
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.test import Client, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -38,6 +41,17 @@ from ..tools._common import ACCESS
 from .oauth_helpers import _raw_api_token, grant_mcp
 
 MCP_URL = "/plugin/inventree-mcp/mcp/"
+
+#: The plugin's error texts (the SDK prefixes "Error executing tool <name>: ").
+NOT_FOUND = "not found (404): resource does not exist"
+DENIED = (
+    "permission denied (403): your MCP roles or your InvenTree permissions "
+    "do not allow this"
+)
+READ_ONLY = (
+    "This MCP server is running in read-only mode; write actions are disabled. "
+    "An administrator must disable the 'Read Only' plugin setting to allow them."
+)
 
 
 class MCPClientMixin:
@@ -135,6 +149,73 @@ class MCPToolTestCase(MCPClientMixin, InvenTreeTestCase):
         previous = plugin.get_setting(key)
         plugin.set_setting(key, value)
         self.addCleanup(plugin.set_setting, key, previous)
+
+
+class WriteToolTestCase(MCPToolTestCase):
+    """MCPToolTestCase with MCP_READ_ONLY off and helpers for the write tool tests.
+
+    cls.user (API token cls.api_token) holds the class's ``roles`` and every MCP role.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.set_setting("MCP_READ_ONLY", False)
+
+    def make_token(self, username: str, interactive: list[str], mcp: list[str]) -> str:
+        """An API token for a new user whose group has these interactive and MCP roles.
+
+        Roles in assignRole() / grant_mcp() syntax ("part.view", "all"); assignRole() saves
+        the rulesets (a queryset update would skip the permission sync).
+        """
+        group = Group.objects.create(name=f"{username}-group")
+        for role in interactive:
+            self.assignRole(role, group=group)
+        grant_mcp(group, *mcp)
+        user = get_user_model().objects.create_user(username=username)
+        user.groups.add(group)
+        return _raw_api_token(ApiToken.objects.create(user=user, name=username))
+
+    def error_as(self, token: str, name: str, arguments: dict[str, Any]) -> str:
+        """A failed tool call's error text, called with *token*."""
+        result = self.call_tool(name, arguments, HTTP_AUTHORIZATION=f"Token {token}")
+        self.assertTrue(result.get("isError"), result)
+        return result["content"][0]["text"]
+
+    def tool_text(self, name: str, arguments: dict[str, Any]) -> str:
+        """A successful tool call's plain text."""
+        result = self.call_tool(name, arguments)
+        self.assertFalse(result.get("isError"), result)
+        return result["content"][0]["text"]
+
+    def assert_denied_without_mcp_role(self, name, arguments, *, interactive, mcp):
+        """The tool answers 403 for a user lacking the MCP role, filter off and on.
+
+        The user holds the *interactive* roles and only the *mcp* MCP roles. Filter on: the
+        tool is also missing from that user's tools/list (and still listed for cls.user,
+        who needs every role of the tool). The filter is off again afterwards.
+        """
+        token = self.make_token(f"no-mcp-{name}", interactive, mcp)
+        self.assert_denied(token, name, arguments)
+
+    def assert_denied_without_inventree_role(self, name, arguments, *, interactive):
+        """The tool answers 403 for a user holding every MCP role but only the
+        *interactive* InvenTree roles, filter off and on (as assert_denied_without_mcp_role).
+        """
+        token = self.make_token(f"no-role-{name}", interactive, ["all"])
+        self.assert_denied(token, name, arguments)
+
+    def assert_denied(self, token: str, name: str, arguments: dict[str, Any]) -> None:
+        """*name* answers 403 for *token*'s user, filter off (listed) and on (hidden)."""
+        headers = {"HTTP_AUTHORIZATION": f"Token {token}"}
+        self.assertTrue(self.error_as(token, name, arguments).endswith(DENIED))
+        self.assertIn(name, self.list_tool_names(**headers))  # filter off: listed
+        self.set_setting("MCP_FILTER_TOOL_LIST", True)
+        try:
+            self.assertNotIn(name, self.list_tool_names(**headers))
+            self.assertTrue(self.error_as(token, name, arguments).endswith(DENIED))
+            self.assertIn(name, self.list_tool_names())  # the full-role user sees it
+        finally:
+            self.set_setting("MCP_FILTER_TOOL_LIST", False)
 
 
 @override_settings(PLUGIN_TESTING_SETUP=True)

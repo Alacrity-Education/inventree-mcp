@@ -38,7 +38,7 @@ from ..tools._common import (
     text,
     tool,
 )
-from .test_transport import MCPToolTestCase
+from .test_transport import MCPToolTestCase, WriteToolTestCase
 
 #: The read tools of T1, with their titles.
 READ_TOOLS = {
@@ -684,3 +684,137 @@ class VisibilityTest(InvenTreeTestCase):
         context.set_current_user(None)
         with self.assertRaises(PermissionError):
             await call_view(PartList, "GET", "/api/part/", query_params={"limit": 1})
+
+
+#: The 26 tools of the overview (section 4): title, readOnly, destructive, idempotent, openWorld.
+TOOL_TABLE = {
+    "search_parts": ("Search parts", True, False, True, False),
+    "get_part": ("Get part", True, False, True, False),
+    "list_parts": ("List parts", True, False, True, False),
+    "create_part": ("Create part", False, False, False, False),
+    "update_part": ("Update part", False, False, True, False),
+    "delete_part": ("Delete part", False, True, False, False),
+    "set_part_image": ("Set part image", False, False, True, False),
+    "search_part_images": ("Search part images", True, False, True, True),
+    "search_part_categories": ("Search part categories", True, False, True, False),
+    "list_part_categories": ("List part categories", True, False, True, False),
+    "create_part_category": ("Create part category", False, False, False, False),
+    "update_part_category": ("Update part category", False, False, True, False),
+    "delete_part_category": ("Delete part category", False, True, False, False),
+    "get_stock": ("List stock items", True, False, True, False),
+    "get_stock_item": ("Get stock item", True, False, True, False),
+    "add_stock": ("Add stock", False, False, False, False),
+    "stock_add_quantity": ("Add stock quantity", False, False, False, False),
+    "stock_remove_quantity": ("Remove stock quantity", False, True, False, False),
+    "stock_transfer": ("Transfer stock", False, False, False, False),
+    "delete_stock_item": ("Delete stock item", False, True, False, False),
+    "search_stock_locations": ("Search stock locations", True, False, True, False),
+    "get_stock_location": ("Get stock location", True, False, True, False),
+    "list_stock_locations": ("List stock locations", True, False, True, False),
+    "create_stock_location": ("Create stock location", False, False, False, False),
+    "update_stock_location": ("Update stock location", False, False, True, False),
+    "delete_stock_location": ("Delete stock location", False, True, False, False),
+}
+
+#: ACCESS as the overview's role/action column: view class, HTTP method, role, action.
+#: The three stock adjustments call StockAdd / StockRemove / StockTransfer but declare (and
+#: check first) StockList POST: InvenTree does not scope their own views (tools/stock.py).
+ACCESS_TABLE = {
+    "search_parts": ("PartList", "GET", "part", "view"),
+    "get_part": ("PartDetail", "GET", "part", "view"),
+    "list_parts": ("PartList", "GET", "part", "view"),
+    "create_part": ("PartList", "POST", "part", "add"),
+    "update_part": ("PartDetail", "PATCH", "part", "change"),
+    "delete_part": ("PartDetail", "DELETE", "part", "delete"),
+    "set_part_image": ("PartDetail", "PATCH", "part", "change"),
+    "search_part_categories": ("CategoryList", "GET", "part_category", "view"),
+    "list_part_categories": ("CategoryList", "GET", "part_category", "view"),
+    "create_part_category": ("CategoryList", "POST", "part_category", "add"),
+    "update_part_category": ("CategoryDetail", "PATCH", "part_category", "change"),
+    "delete_part_category": ("CategoryDetail", "DELETE", "part_category", "delete"),
+    "get_stock": ("StockList", "GET", "stock", "view"),
+    "get_stock_item": ("StockDetail", "GET", "stock", "view"),
+    "add_stock": ("StockList", "POST", "stock", "add"),
+    "stock_add_quantity": ("StockList", "POST", "stock", "add"),
+    "stock_remove_quantity": ("StockList", "POST", "stock", "add"),
+    "stock_transfer": ("StockList", "POST", "stock", "add"),
+    "delete_stock_item": ("StockDetail", "DELETE", "stock", "delete"),
+    "search_stock_locations": ("StockLocationList", "GET", "stock_location", "view"),
+    "get_stock_location": ("StockLocationDetail", "GET", "stock_location", "view"),
+    "list_stock_locations": ("StockLocationList", "GET", "stock_location", "view"),
+    "create_stock_location": ("StockLocationList", "POST", "stock_location", "add"),
+    "update_stock_location": ("StockLocationDetail", "PATCH", "stock_location", "change"),
+    "delete_stock_location": ("StockLocationDetail", "DELETE", "stock_location", "delete"),
+}
+
+#: The actions an InvenTree ruleset holds after granting one (RuleSet.save()).
+IMPLIED = {
+    "view": {"view"},
+    "change": {"view", "change"},
+    "add": {"view", "change", "add"},
+    "delete": {"view", "change", "delete"},
+}
+
+
+class ToolSetContractTest(WriteToolTestCase):
+    """tools/list is exactly the overview's 26 tools; ACCESS is its role/action column.
+
+    MCP_READ_ONLY is off (WriteToolTestCase): the MCP write scopes exist only then.
+    """
+
+    roles: ClassVar[list[str]] = ["part.view"]
+
+    def test_tools_list_is_exactly_the_26_tools(self):
+        tools = self.list_tools()
+        self.assertEqual(len(TOOL_TABLE), 26)
+        self.assertEqual(set(tools), set(TOOL_TABLE))
+        for name, (title, read_only, destructive, idempotent, open_world) in (
+            TOOL_TABLE.items()
+        ):
+            with self.subTest(tool=name):
+                entry = tools[name]
+                self.assertEqual(entry["title"], title)
+                self.assertEqual(
+                    entry["annotations"],
+                    {
+                        "title": title,
+                        "readOnlyHint": read_only,
+                        "destructiveHint": destructive,
+                        "idempotentHint": idempotent,
+                        "openWorldHint": open_world,
+                    },
+                )
+                self.assertTrue(entry["description"])
+                self.assertNotIn("outputSchema", entry)
+
+    def test_access_is_the_view_and_method_table(self):
+        self.assertEqual(
+            {name: (loader().__name__, method) for name, (loader, method) in ACCESS.items()},
+            {name: row[:2] for name, row in ACCESS_TABLE.items()},
+        )
+        self.assertEqual(set(TOOL_TABLE) - set(ACCESS), NO_ACCESS)
+
+    def test_access_is_the_role_and_action_table(self):
+        """A user granted one InvenTree role/action (and every MCP role) sees, with the
+        filter on, exactly the tools whose role/action that grant includes (plus
+        search_part_images).
+
+        InvenTree's RuleSet.save() implies view from change/add/delete and change from
+        add/delete (IMPLIED). So update_part shows up for part.change, but the three stock
+        adjustments only for stock.add (not stock.change), and the deletes only for delete.
+        """
+        self.set_setting("MCP_FILTER_TOOL_LIST", True)
+        for role in ("part", "part_category", "stock", "stock_location"):
+            for action, implied in IMPLIED.items():
+                with self.subTest(role=role, action=action):
+                    token = self.make_token(
+                        f"only-{role}-{action}", [f"{role}.{action}"], ["all"]
+                    )
+                    visible = self.list_tool_names(HTTP_AUTHORIZATION=f"Token {token}")
+                    expected = {
+                        name
+                        for name, row in ACCESS_TABLE.items()
+                        if row[2] == role and row[3] in implied
+                    }
+                    self.assertEqual(visible - NO_ACCESS, expected)
+                    self.assertTrue(NO_ACCESS <= visible)
