@@ -181,6 +181,15 @@ was verified and how.
 - The SDK (mcp 2.3.0) coerces `"1"` to 1 and `"true"` to True itself; `ToolAnnotations` fields are snake_case in Python.
 - `test_policy`'s request-host test now checks that a paged call succeeds (the `next` link is no longer returned).
 
+## 6b. Corrections recorded after T3
+
+- `add_stock` keeps the input name `serial` and sends it as `serial_numbers` (InvenTree 1.5.7 silently discards `serial`).
+- `delete_stock_location` must send `delete_stock_items: false, delete_sub_locations: false` (a bare DELETE is a 400 on
+  1.5.7); InvenTree then moves stock and sub-locations to the parent instead of refusing, so the Go sentence "the
+  location must be empty" is not enforced by InvenTree. The description stays verbatim.
+- `stock_remove_quantity` never fails below zero: InvenTree removes what is there and deletes the emptied item. The e2e
+  script must not expect an error for over-removal.
+
 ## 7. Acceptance
 
 - `tools/list` returns exactly the 26 names of section 4 with titles and annotations as specified.
